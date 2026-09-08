@@ -288,3 +288,41 @@ html[data-theme='dark'] .status-pill.blue { color: var(--blue); border-color: rg
 .detail-row dd > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .detail-row-copy code { flex: 1; }
 .detail-row-copy .icon-button { width: 24px; height: 24px; flex: 0 0 auto; }
+
+/* —— 总览统计视图切换栏 —— */
+.stats-view-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 4px 0 16px; flex-wrap: wrap; }
+.view-toggle { display: inline-flex; padding: 3px; gap: 3px; background: var(--surface-soft); border: 1px solid var(--line); border-radius: 9px; }
+.view-toggle button { border: none; background: transparent; color: var(--muted); font-size: 12px; font-weight: 600; padding: 6px 16px; border-radius: 7px; cursor: pointer; transition: background 150ms ease, color 150ms ease; }
+.view-toggle button:hover { color: var(--ink); }
+.view-toggle button.active { background: var(--surface-solid); color: var(--ink); box-shadow: var(--shadow); }
+.date-trigger { display: inline-flex; align-items: center; gap: 7px; min-height: 35px; padding: 0 13px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink-soft); font-size: 12px; font-weight: 600; cursor: pointer; transition: border-color 150ms ease, color 150ms ease, background 150ms ease; }
+.date-trigger:hover { border-color: var(--line-strong); color: var(--ink); background: var(--surface-hover); }
+.date-trigger.active { border-color: var(--blue); color: var(--blue); }
+.inline-empty-hint { display: flex; align-items: center; gap: 7px; padding: 9px 14px; margin: 0 0 16px; border: 1px dashed var(--line-strong); border-radius: var(--radius); color: var(--muted); font-size: 12px; }
+
+/* —— 日期选择弹层 —— */
+.date-picker-overlay { position: fixed; inset: 0; z-index: 1200; display: flex; align-items: center; justify-content: center; background: rgba(10, 10, 12, .5); backdrop-filter: blur(3px); animation: fade-in 160ms ease; }
+.date-picker { width: 302px; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-solid); box-shadow: var(--shadow); animation: pop-in 180ms ease; }
+.date-picker-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.date-picker-header strong { font-size: 14px; font-weight: 600; color: var(--ink); }
+.cal-nav { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border: 1px solid var(--line); border-radius: 7px; background: transparent; color: var(--ink-soft); cursor: pointer; transition: background 150ms ease, color 150ms ease, border-color 150ms ease; }
+.cal-nav:hover { background: var(--surface-hover); color: var(--ink); border-color: var(--line-strong); }
+.date-picker-weekdays { display: grid; grid-template-columns: repeat(7, 1fr); margin-bottom: 6px; }
+.date-picker-weekdays span { text-align: center; font-size: 11px; font-weight: 600; color: var(--subtle); padding: 4px 0; }
+.date-picker-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px; }
+.cal-cell { position: relative; display: inline-flex; flex-direction: column; align-items: center; justify-content: center; aspect-ratio: 1; border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--muted); font-size: 12.5px; cursor: pointer; transition: background 140ms ease, color 140ms ease, border-color 140ms ease; }
+.cal-cell.padding { cursor: default; }
+.cal-cell.has-data { color: var(--ink); font-weight: 600; }
+.cal-cell:not(.padding):not(:disabled):hover { background: var(--surface-hover); color: var(--ink); }
+.cal-cell.today { border-color: var(--blue); color: var(--blue); font-weight: 600; }
+.cal-cell.selected { background: var(--blue); border-color: var(--blue); color: #fff; font-weight: 600; }
+.cal-cell.selected .data-dot { background: #fff; }
+.cal-cell:disabled { color: var(--subtle); opacity: .45; cursor: not-allowed; }
+.data-dot { width: 4px; height: 4px; border-radius: 50%; background: var(--blue); margin-top: 2px; }
+.date-picker-footer { display: flex; gap: 8px; margin-top: 14px; padding-top: 13px; border-top: 1px solid var(--line); }
+.date-picker-footer button { flex: 1; padding: 7px 0; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--ink-soft); font-size: 12px; font-weight: 600; cursor: pointer; transition: background 150ms ease, color 150ms ease, border-color 150ms ease; }
+.date-picker-footer button:hover { background: var(--surface-hover); color: var(--ink); }
+.date-picker-footer button.active { background: var(--blue-soft); border-color: var(--blue); color: var(--blue); }
+
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes pop-in { from { opacity: 0; transform: translateY(8px) scale(.97); } to { opacity: 1; transform: translateY(0) scale(1); } }

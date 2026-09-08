@@ -1,4 +1,11 @@
+use chrono::{Local, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// 小时桶数量：8 个桶，每桶覆盖 3 小时（00/03/.../21），合计 24 小时。
+pub const HOUR_BUCKETS: usize = 8;
+/// 按天聚合数据的历史保留天数（滚动窗口）。
+pub const BY_DAY_KEEP_DAYS: usize = 90;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -138,6 +145,26 @@ impl Default for ServiceConfig {
     }
 }
 
+/// 生成空的小时桶（8 个桶，标签为 00/03/.../21）。
+fn empty_by_hour() -> Vec<HourStats> {
+    (0..HOUR_BUCKETS)
+        .map(|bucket| HourStats {
+            label: format!("{:02}", bucket * 3),
+            hit: 0,
+            miss: 0,
+        })
+        .collect()
+}
+
+/// 将 i64 差量累加到 u64，防止下溢/溢出。
+fn add_i64_to_u64(base: u64, delta: i64) -> u64 {
+    if delta >= 0 {
+        base.saturating_add(delta as u64)
+    } else {
+        base.saturating_sub((-delta) as u64)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct HourStats {
@@ -146,9 +173,70 @@ pub struct HourStats {
     pub miss: u64,
 }
 
+/// 单日聚合统计（也用作累计视图的数据结构）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DayStats {
+    pub request_count: u64,
+    pub total_tokens: u64,
+    pub cache_hit_tokens: u64,
+    pub credit: f64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    /// 当日所有成功/失败请求的延迟总和（用于计算平均延迟）。
+    pub total_latency_ms: u64,
+    pub by_hour: Vec<HourStats>,
+}
+
+impl DayStats {
+    /// 保证 by_hour 为固定 8 桶，反序列化旧数据或空数据时兜底。
+    pub fn ensure_by_hour(&mut self) {
+        if self.by_hour.len() != HOUR_BUCKETS {
+            self.by_hour = empty_by_hour();
+        }
+    }
+
+    /// 依据本地时区计算时间戳所属的小时桶（0..8）。
+    fn hour_bucket(ts_ms: i64) -> usize {
+        let hour = Local
+            .timestamp_millis_opt(ts_ms)
+            .single()
+            .map(|dt| dt.hour() as usize)
+            .unwrap_or(0);
+        (hour / 3).min(HOUR_BUCKETS - 1)
+    }
+
+    /// 累加一次"请求完成"：请求数、延迟、成败计数、小时桶。
+    fn add_completed(&mut self, log: &RequestLog) {
+        self.ensure_by_hour();
+        self.request_count = self.request_count.saturating_add(1);
+        self.total_latency_ms = self.total_latency_ms.saturating_add(log.latency_ms);
+        if log.success {
+            self.success_count = self.success_count.saturating_add(1);
+        } else {
+            self.failure_count = self.failure_count.saturating_add(1);
+        }
+        let bucket = Self::hour_bucket(log.timestamp);
+        if log.cache_hit {
+            self.by_hour[bucket].hit = self.by_hour[bucket].hit.saturating_add(1);
+        } else {
+            self.by_hour[bucket].miss = self.by_hour[bucket].miss.saturating_add(1);
+        }
+    }
+
+    /// 累加一次"用量"差量：token、缓存命中 token、credit。
+    fn add_usage_delta(&mut self, delta_tokens: i64, delta_cache_hit_tokens: i64, delta_credit: f64) {
+        self.ensure_by_hour();
+        self.total_tokens = add_i64_to_u64(self.total_tokens, delta_tokens);
+        self.cache_hit_tokens = add_i64_to_u64(self.cache_hit_tokens, delta_cache_hit_tokens);
+        self.credit += delta_credit;
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct UsageStats {
+    // —— "今天"快照（平铺字段，前端默认渲染），由 by_day[今天] 同步而来 ——
     pub request_count: u64,
     pub total_tokens: u64,
     pub cache_hit_tokens: u64,
@@ -157,6 +245,23 @@ pub struct UsageStats {
     pub success_count: u64,
     pub failure_count: u64,
     pub by_hour: Vec<HourStats>,
+    // —— 按天聚合：本地日期(yyyy-MM-dd) -> 当日数据 ——
+    pub by_day: BTreeMap<String, DayStats>,
+    // —— 累计所有天的总数据 ——
+    pub lifetime: DayStats,
+    // —— 旧版累计字段，仅用于从旧 state.json 迁移读取，序列化时不再写入 ——
+    #[serde(default, skip_serializing)]
+    pub lifetime_requests: u64,
+    #[serde(default, skip_serializing)]
+    pub lifetime_tokens: u64,
+    #[serde(default, skip_serializing)]
+    pub lifetime_cache_hit_tokens: u64,
+    #[serde(default, skip_serializing)]
+    pub lifetime_credit: f64,
+    #[serde(default, skip_serializing)]
+    pub lifetime_success: u64,
+    #[serde(default, skip_serializing)]
+    pub lifetime_failure: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -208,45 +313,127 @@ impl Default for AppState {
 }
 
 impl AppState {
-    pub fn rebuild_stats(&mut self) {
-        let mut stats = UsageStats {
-            by_hour: (0..8)
-                .map(|bucket| HourStats {
-                    label: format!("{:02}", bucket * 3),
-                    hit: 0,
-                    miss: 0,
-                })
-                .collect(),
-            ..UsageStats::default()
+    fn now_ms() -> i64 {
+        Local::now().timestamp_millis()
+    }
+
+    /// 本地时区今天 0 点的时间戳（毫秒）。
+    fn today_start_ms() -> i64 {
+        let today = Local::now().date_naive();
+        today
+            .and_hms_opt(0, 0, 0)
+            .and_then(|dt| Local.from_local_datetime(&dt).single())
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or(0)
+    }
+
+    /// 依据本地时区把毫秒时间戳映射为日期 key（yyyy-MM-dd）。
+    pub fn local_date_key(ts_ms: i64) -> String {
+        Local
+            .timestamp_millis_opt(ts_ms)
+            .single()
+            .map(|dt| dt.format("%Y-%m-%d").to_string())
+            .unwrap_or_default()
+    }
+
+    /// 只保留时间戳属于今天（本地时区）的请求日志，用于跨天惰性清零。
+    pub fn retain_today_logs(&mut self) {
+        let start = Self::today_start_ms();
+        self.logs.retain(|log| log.timestamp >= start);
+    }
+
+    /// 把 by_day[今天] 的聚合同步到平铺"今天"快照字段，供前端默认渲染。
+    pub fn sync_today_snapshot(&mut self) {
+        let key = Self::local_date_key(Self::now_ms());
+        let mut today = self.stats.by_day.get(&key).cloned().unwrap_or_default();
+        today.ensure_by_hour();
+        self.stats.request_count = today.request_count;
+        self.stats.total_tokens = today.total_tokens;
+        self.stats.cache_hit_tokens = today.cache_hit_tokens;
+        self.stats.credit = today.credit;
+        self.stats.success_count = today.success_count;
+        self.stats.failure_count = today.failure_count;
+        self.stats.by_hour = today.by_hour;
+        self.stats.average_latency_ms = if today.request_count > 0 {
+            today.total_latency_ms / today.request_count
+        } else {
+            0
         };
-        let mut total_latency = 0_u64;
-        for log in &self.logs {
-            stats.request_count = stats.request_count.saturating_add(1);
-            stats.total_tokens = stats
-                .total_tokens
-                .saturating_add(log.input_tokens.saturating_add(log.output_tokens));
-            if log.cache_hit {
-                stats.cache_hit_tokens = stats.cache_hit_tokens.saturating_add(log.input_tokens);
-            }
-            stats.credit += log.credit;
-            total_latency = total_latency.saturating_add(log.latency_ms);
-            if log.success {
-                stats.success_count = stats.success_count.saturating_add(1);
-            } else {
-                stats.failure_count = stats.failure_count.saturating_add(1);
-            }
-            let hour = ((log.timestamp.div_euclid(3_600_000)).rem_euclid(24)) as usize;
-            let bucket = (hour / 3).min(7);
-            if log.cache_hit {
-                stats.by_hour[bucket].hit = stats.by_hour[bucket].hit.saturating_add(1);
-            } else {
-                stats.by_hour[bucket].miss = stats.by_hour[bucket].miss.saturating_add(1);
+    }
+
+    /// 记录一次"请求完成"：累加请求数、延迟、成败、小时桶到 当日/累计，并同步今天快照。
+    pub fn record_completed(&mut self, log: &RequestLog) {
+        let key = Self::local_date_key(log.timestamp);
+        self.stats.by_day.entry(key).or_default().add_completed(log);
+        self.stats.lifetime.add_completed(log);
+        self.prune_old_days();
+        self.sync_today_snapshot();
+    }
+
+    /// 记录一次"用量"：按 (新值 - 旧值) 差量累加 token/缓存/credit 到 当日/累计，并同步今天快照。
+    pub fn record_usage(&mut self, log: &RequestLog, prev: &RequestLog) {
+        let new_tokens = log.input_tokens.saturating_add(log.output_tokens) as i64;
+        let prev_tokens = prev.input_tokens.saturating_add(prev.output_tokens) as i64;
+        let delta_tokens = new_tokens - prev_tokens;
+        let new_cache = if log.cache_hit { log.input_tokens } else { 0 } as i64;
+        let prev_cache = if prev.cache_hit { prev.input_tokens } else { 0 } as i64;
+        let delta_cache = new_cache - prev_cache;
+        let delta_credit = log.credit - prev.credit;
+        if delta_tokens == 0 && delta_cache == 0 && delta_credit.abs() < f64::EPSILON {
+            return;
+        }
+        let key = Self::local_date_key(log.timestamp);
+        self.stats
+            .by_day
+            .entry(key)
+            .or_default()
+            .add_usage_delta(delta_tokens, delta_cache, delta_credit);
+        self.stats
+            .lifetime
+            .add_usage_delta(delta_tokens, delta_cache, delta_credit);
+        self.prune_old_days();
+        self.sync_today_snapshot();
+    }
+
+    /// 滚动保留最近 BY_DAY_KEEP_DAYS 天的按天聚合数据。
+    fn prune_old_days(&mut self) {
+        let len = self.stats.by_day.len();
+        if len > BY_DAY_KEEP_DAYS {
+            let overflow = len - BY_DAY_KEEP_DAYS;
+            let keys: Vec<String> = self.stats.by_day.keys().take(overflow).cloned().collect();
+            for key in keys {
+                self.stats.by_day.remove(&key);
             }
         }
-        if stats.request_count > 0 {
-            stats.average_latency_ms = total_latency / stats.request_count;
+    }
+
+    /// 从旧版 lifetime_* 平铺字段迁移到新的 lifetime DayStats（一次性），并清零旧字段。
+    pub fn migrate_legacy(&mut self) {
+        let legacy_requests = self.stats.lifetime_requests;
+        let legacy_tokens = self.stats.lifetime_tokens;
+        let legacy_cache_hit = self.stats.lifetime_cache_hit_tokens;
+        let legacy_credit = self.stats.lifetime_credit;
+        let legacy_success = self.stats.lifetime_success;
+        let legacy_failure = self.stats.lifetime_failure;
+        if self.stats.lifetime.request_count == 0
+            && self.stats.lifetime.total_tokens == 0
+            && (legacy_requests > 0 || legacy_tokens > 0)
+        {
+            self.stats.lifetime.request_count = legacy_requests;
+            self.stats.lifetime.total_tokens = legacy_tokens;
+            self.stats.lifetime.cache_hit_tokens = legacy_cache_hit;
+            self.stats.lifetime.credit = legacy_credit;
+            self.stats.lifetime.success_count = legacy_success;
+            self.stats.lifetime.failure_count = legacy_failure;
         }
-        self.stats = stats;
+        self.stats.lifetime_requests = 0;
+        self.stats.lifetime_tokens = 0;
+        self.stats.lifetime_cache_hit_tokens = 0;
+        self.stats.lifetime_credit = 0.0;
+        self.stats.lifetime_success = 0;
+        self.stats.lifetime_failure = 0;
+        self.stats.lifetime.ensure_by_hour();
+        self.sync_today_snapshot();
     }
 
     pub fn sanitize_for_persistence(&mut self) {

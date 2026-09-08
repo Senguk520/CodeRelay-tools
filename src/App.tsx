@@ -2,15 +2,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import {
-  Activity, AlertTriangle, Ban, CalendarCheck, Check, ChevronDown, CircleHelp, Clipboard, Cloud,
+  Activity, AlertTriangle, Ban, CalendarCheck, CalendarDays, Check, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, Clipboard, Cloud,
   Copy, Database, Download, Eye, EyeOff, FileJson, Flame, FolderOpen, Gauge, Gift, Globe2, KeyRound,
   Layers3, LayoutDashboard, ListFilter, LockKeyhole, LogOut, Menu, Minus, MoreHorizontal,
   Network, Pause, Pencil, Play, Plus, RefreshCw, Search, Server, Settings2,
   ShieldCheck, SlidersHorizontal, Sparkles, Square, Terminal, Trash2, Upload,
   Users, X, Zap,
 } from 'lucide-react';
-import type { Account, ApiKey, AppState, CheckinResponse, CheckinStatusResponse, ModelInfo, OAuthCompleteResponse, PageId, RequestLog, ServiceConfig, ThemeMode } from './types';
-import { defaultState } from './types';
+import type { Account, ApiKey, AppState, CheckinResponse, CheckinStatusResponse, DayStats, ModelInfo, OAuthCompleteResponse, PageId, RequestLog, ServiceConfig, ThemeMode } from './types';
+import { defaultState, emptyDayStats } from './types';
 import { applyTheme } from './theme';
 import {
   cancelOAuth, checkinAccount, clearLogs, completeOAuth, exportAccounts, getCheckinStatus, getState, listModels, openExternal,
@@ -62,6 +62,21 @@ function formatDate(value: number | null | undefined) {
   return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(value);
 }
 function formatNumber(value: number) { return new Intl.NumberFormat('zh-CN').format(value); }
+function formatCompact(value: number) {
+  const units: Array<[number, string]> = [[1e9, 'B'], [1e8, 'Y'], [1e6, 'M'], [1e4, 'W'], [1e3, 'K']];
+  for (const [threshold, suffix] of units) {
+    if (value >= threshold) {
+      const n = value / threshold;
+      return `${n >= 100 ? Math.round(n) : n >= 10 ? n.toFixed(1) : n.toFixed(2)}${suffix}`;
+    }
+  }
+  return formatNumber(value);
+}
+// —— 日期工具：本地时区的"天"以 yyyy-MM-dd 字符串为 key ——
+function toDateKey(d: Date) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
+function todayKey() { return toDateKey(new Date()); }
+function parseDateKey(key: string) { const [y, m, d] = key.split('-').map(Number); return new Date(y || 1970, (m || 1) - 1, d || 1); }
+function formatDateLabel(d: Date) { return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`; }
 function maskKey(key: string) { return key.length <= 12 ? key : `${key.slice(0, 8)}••••••${key.slice(-4)}`; }
 
 async function copyText(value: string) {
@@ -282,22 +297,80 @@ export function App() {
 }
 
 function OverviewPage({ state, onNavigate, onRefresh, refreshing }: { state: AppState; onNavigate: (page: PageId) => void; onRefresh: () => void; refreshing: boolean }) {
+  const [viewDate, setViewDate] = useState<string>('today');
+  const [showCalendar, setShowCalendar] = useState(false);
   const available = state.accounts.filter((account) => account.status === 'available').length;
   const attention = state.accounts.filter((account) => account.status === 'needs_auth' || account.status === 'cooling').length;
-  const cacheRate = state.stats.totalTokens ? Math.round((state.stats.cacheHitTokens / state.stats.totalTokens) * 100) : 0;
-  const maxHourTotal = Math.max(1, ...state.stats.byHour.map((item) => item.hit + item.miss));
+  // 每日零点自动切回"今天"并刷新统计，实现按天重置。
+  useEffect(() => {
+    let timer: number;
+    const schedule = () => {
+      const now = new Date();
+      const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 2);
+      timer = window.setTimeout(() => { setViewDate('today'); onRefresh(); schedule(); }, next.getTime() - now.getTime());
+    };
+    schedule();
+    return () => window.clearTimeout(timer);
+  }, [onRefresh]);
+  // 依据当前视图（今天 / 某天 / 累计）归一化统计数据源。
+  const source = useMemo(() => {
+    if (viewDate === 'today') {
+      return { requestCount: state.stats.requestCount, totalTokens: state.stats.totalTokens, cacheHitTokens: state.stats.cacheHitTokens, credit: state.stats.credit, successCount: state.stats.successCount, failureCount: state.stats.failureCount, byHour: state.stats.byHour, averageLatencyMs: state.stats.averageLatencyMs };
+    }
+    const day = viewDate === 'lifetime' ? state.stats.lifetime : state.stats.byDay[viewDate];
+    const d: DayStats = day ?? emptyDayStats();
+    return { requestCount: d.requestCount, totalTokens: d.totalTokens, cacheHitTokens: d.cacheHitTokens, credit: d.credit, successCount: d.successCount, failureCount: d.failureCount, byHour: d.byHour && d.byHour.length ? d.byHour : emptyDayStats().byHour, averageLatencyMs: d.requestCount ? Math.round(d.totalLatencyMs / d.requestCount) : 0 };
+  }, [viewDate, state.stats]);
+  const isEmptyDay = viewDate !== 'today' && viewDate !== 'lifetime' && !state.stats.byDay[viewDate];
+  const cacheRate = source.totalTokens ? Math.round((source.cacheHitTokens / source.totalTokens) * 100) : 0;
+  const maxHourTotal = Math.max(1, ...source.byHour.map((item) => item.hit + item.miss));
+  const viewLabel = viewDate === 'today' ? `今天 · ${formatDateLabel(new Date())}` : viewDate === 'lifetime' ? '累计 · 全部数据' : formatDateLabel(parseDateKey(viewDate));
+  const chartTitle = viewDate === 'lifetime' ? '累计请求分布' : '过去 24 小时';
+  const chartHint = viewDate === 'lifetime' ? '每 3 小时聚合 · 全部数据' : '每 3 小时聚合 · 共 24 小时';
   return <>
     <div className="page-intro"><div><div className="eyebrow">工作台 / 运行概览</div><h1>保持请求链路清晰</h1><p>查看 CodeBuddy 账号池、本地 OpenAI 兼容服务和最近一次运行的关键状态。</p></div><div className="intro-actions"><button className="button ghost icon-only" onClick={onRefresh} disabled={refreshing} aria-label="刷新统计" title="刷新统计"><RefreshCw size={15} className={refreshing ? 'spin' : ''} /></button><button className="button ghost" onClick={() => onNavigate('accounts')}><Users size={15} />管理账号</button><button className="button ghost" onClick={() => onNavigate('service')}><Server size={15} />服务配置</button></div></div>
+    <div className="stats-view-bar">
+      <div className="view-toggle" role="tablist" aria-label="统计视图"><button className={viewDate === 'today' ? 'active' : ''} onClick={() => setViewDate('today')}>今天</button><button className={viewDate === 'lifetime' ? 'active' : ''} onClick={() => setViewDate('lifetime')}>累计</button></div>
+      <button className={`date-trigger ${viewDate !== 'today' && viewDate !== 'lifetime' ? 'active' : ''}`} onClick={() => setShowCalendar(true)} aria-label="选择日期"><CalendarDays size={14} /><span>{viewLabel}</span><ChevronDown size={13} /></button>
+    </div>
+    {isEmptyDay && <div className="inline-empty-hint"><CalendarDays size={14} />该日暂无请求数据，可选择其他日期或切换到累计视图。</div>}
     <div className="overview-grid">
       <section className={`hero-status panel ${state.running ? 'running' : ''}`}><div className="panel-topline"><span className="panel-kicker"><Server size={14} />反代服务</span><StatusPill tone={state.running ? 'success' : 'muted'}>{state.running ? '运行中' : '已停止'}</StatusPill></div><div className="hero-value">{state.running ? '服务在线' : '等待手动启动'}</div><p>{state.running ? `正在监听 ${state.config.bindHost}:${state.actualPort ?? state.config.port}` : state.lastError ?? '服务启动后将通过本地 OpenAI 兼容接口接收请求。'}</p><div className="hero-foot"><div><span>可用账号</span><strong>{available} / {state.accounts.length}</strong></div><div><span>需要关注</span><strong>{attention}</strong></div><button className="inline-link" onClick={() => onNavigate('service')}>查看服务配置 <span>→</span></button></div></section>
-      <section className="metric-card panel"><span className="metric-icon blue"><Activity size={17} /></span><span className="metric-label">总请求数</span><strong>{formatNumber(state.stats.requestCount)}</strong><span className="metric-trend"><small>来自本地请求日志</small></span></section>
-      <section className="metric-card panel"><span className="metric-icon purple"><Zap size={17} /></span><span className="metric-label">总 Token</span><strong>{formatNumber(state.stats.totalTokens)}</strong><span className="metric-trend"><small>输入 + 输出</small></span></section>
-      <section className="metric-card panel"><span className="metric-icon green"><Database size={17} /></span><span className="metric-label">缓存命中率</span><strong>{cacheRate}%</strong><span className="metric-trend"><small>{formatNumber(state.stats.cacheHitTokens)} tokens 命中</small></span></section>
-      <section className="metric-card panel"><span className="metric-icon orange"><Cloud size={17} /></span><span className="metric-label">Credit 消耗</span><strong>{state.stats.credit.toFixed(2)}</strong><span className="metric-trend"><small>本地统计快照</small></span></section>
+      <section className="metric-card panel"><span className="metric-icon blue"><Activity size={17} /></span><span className="metric-label">总请求数</span><strong>{formatCompact(source.requestCount)}</strong><span className="metric-trend"><small>{formatNumber(source.successCount)} 成功 · {formatNumber(source.failureCount)} 失败</small></span></section>
+      <section className="metric-card panel"><span className="metric-icon purple"><Zap size={17} /></span><span className="metric-label">总 Token</span><strong>{formatCompact(source.totalTokens)}</strong><span className="metric-trend"><small>输入 + 输出</small></span></section>
+      <section className="metric-card panel"><span className="metric-icon green"><Database size={17} /></span><span className="metric-label">缓存命中率</span><strong>{cacheRate}%</strong><span className="metric-trend"><small>{formatNumber(source.cacheHitTokens)} tokens 命中</small></span></section>
+      <section className="metric-card panel"><span className="metric-icon orange"><Cloud size={17} /></span><span className="metric-label">Credit 消耗</span><strong>{source.credit.toFixed(2)}</strong><span className="metric-trend"><small>本地统计快照</small></span></section>
     </div>
-    <div className="two-column-grid"><section className="panel chart-panel"><div className="panel-heading"><div><span className="panel-kicker">请求统计</span><h3>过去 24 小时</h3></div><span className="muted-text">每 3 小时聚合 · 共 24 小时</span></div><div className="chart-legend"><span><i className="legend-dot hit" />缓存命中</span><span><i className="legend-dot miss" />未命中</span><span className="chart-average">平均延迟 <strong>{state.stats.averageLatencyMs} ms</strong></span><span className="chart-axis-hint">最高 {maxHourTotal} 次</span></div><div className="bar-chart">{state.stats.byHour.map((item) => <div className="bar-column" key={item.label}><div className="bar-stack" title={`${item.label}:00 起 · 命中 ${item.hit} 次 · 未命中 ${item.miss} 次`}><span className="bar hit" style={{ height: `${(item.hit / maxHourTotal) * 100}%` }} /><span className="bar miss" style={{ height: `${(item.miss / maxHourTotal) * 100}%` }} /></div><span>{item.label}</span></div>)}</div></section><section className="panel schedule-panel"><div className="panel-heading"><div><span className="panel-kicker">调度状态</span><h3>账号池健康度</h3></div><button className="icon-button" aria-label="打开账号池" onClick={() => onNavigate('accounts')}><MoreHorizontal size={17} /></button></div><div className="health-score"><div className="score-ring"><strong>{state.accounts.length ? Math.round((available / state.accounts.length) * 100) : 0}</strong><span>%</span></div><div><strong>{available} 个账号可用</strong><p>调度策略：<b>{state.config.routingStrategy === 'auto' ? '自动' : state.config.routingStrategy}</b></p></div></div><div className="health-list"><div><span className="health-label"><i className="tiny-dot green-dot" />可用</span><strong>{available}</strong></div><div><span className="health-label"><i className="tiny-dot yellow-dot" />冷却中</span><strong>{state.accounts.filter((a) => a.status === 'cooling').length}</strong></div><div><span className="health-label"><i className="tiny-dot red-dot" />需处理</span><strong>{state.accounts.filter((a) => a.status === 'needs_auth').length}</strong></div></div><button className="full-link" onClick={() => onNavigate('accounts')}>打开账号池 <span>→</span></button></section></div>
+    <div className="two-column-grid"><section className="panel chart-panel"><div className="panel-heading"><div><span className="panel-kicker">请求统计</span><h3>{chartTitle}</h3></div><span className="muted-text">{chartHint}</span></div><div className="chart-legend"><span><i className="legend-dot hit" />缓存命中</span><span><i className="legend-dot miss" />未命中</span><span className="chart-average">平均延迟 <strong>{source.averageLatencyMs} ms</strong></span><span className="chart-axis-hint">最高 {maxHourTotal} 次</span></div><div className="bar-chart">{source.byHour.map((item) => <div className="bar-column" key={item.label}><div className="bar-stack" title={`${item.label}:00 起 · 命中 ${item.hit} 次 · 未命中 ${item.miss} 次`}><span className="bar hit" style={{ height: `${(item.hit / maxHourTotal) * 100}%` }} /><span className="bar miss" style={{ height: `${(item.miss / maxHourTotal) * 100}%` }} /></div><span>{item.label}</span></div>)}</div></section><section className="panel schedule-panel"><div className="panel-heading"><div><span className="panel-kicker">调度状态</span><h3>账号池健康度</h3></div><button className="icon-button" aria-label="打开账号池" onClick={() => onNavigate('accounts')}><MoreHorizontal size={17} /></button></div><div className="health-score"><div className="score-ring"><strong>{state.accounts.length ? Math.round((available / state.accounts.length) * 100) : 0}</strong><span>%</span></div><div><strong>{available} 个账号可用</strong><p>调度策略：<b>{state.config.routingStrategy === 'auto' ? '自动' : state.config.routingStrategy}</b></p></div></div><div className="health-list"><div><span className="health-label"><i className="tiny-dot green-dot" />可用</span><strong>{available}</strong></div><div><span className="health-label"><i className="tiny-dot yellow-dot" />冷却中</span><strong>{state.accounts.filter((a) => a.status === 'cooling').length}</strong></div><div><span className="health-label"><i className="tiny-dot red-dot" />需处理</span><strong>{state.accounts.filter((a) => a.status === 'needs_auth').length}</strong></div></div><button className="full-link" onClick={() => onNavigate('accounts')}>打开账号池 <span>→</span></button></section></div>
     <section className="panel activity-panel"><div className="panel-heading"><div><span className="panel-kicker">最近活动</span><h3>请求日志摘要</h3></div><button className="inline-link" onClick={() => onNavigate('logs')}>查看全部 <span>→</span></button></div><div className="mini-log-list">{state.logs.length ? state.logs.slice(0, 3).map((log) => <MiniLog key={log.requestId} log={log} accounts={state.accounts} />) : <div className="empty-inline">服务运行后，最近请求会显示在这里。</div>}</div></section>
+    {showCalendar && <DatePicker value={viewDate} byDay={state.stats.byDay} onSelect={(v) => { setViewDate(v); setShowCalendar(false); }} onClose={() => setShowCalendar(false)} />}
   </>;
+}
+
+// 深色日期选择弹层：高亮有数据的日期，今天特殊标记，支持"今天 / 累计"快捷切换。
+function DatePicker({ value, byDay, onSelect, onClose }: { value: string; byDay: Record<string, DayStats>; onSelect: (value: string) => void; onClose: () => void }) {
+  const today = todayKey();
+  const anchor = value !== 'today' && value !== 'lifetime' ? parseDateKey(value) : new Date();
+  const [cursor, setCursor] = useState(new Date(anchor.getFullYear(), anchor.getMonth(), 1));
+  const year = cursor.getFullYear();
+  const month = cursor.getMonth();
+  const firstWeekday = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const shiftMonth = (delta: number) => setCursor(new Date(year, month + delta, 1));
+  const cells: Array<{ key: string; day: number; dateKey?: string; hasData?: boolean; isToday?: boolean; isSelected?: boolean; disabled?: boolean }> = [];
+  for (let i = 0; i < firstWeekday; i += 1) cells.push({ key: `pad-${i}`, day: 0 });
+  for (let d = 1; d <= daysInMonth; d += 1) {
+    const dateKey = `${year}-${String(month + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    cells.push({ key: dateKey, day: d, dateKey, hasData: Boolean(byDay[dateKey] && byDay[dateKey].requestCount > 0), isToday: dateKey === today, isSelected: value === dateKey, disabled: dateKey > today });
+  }
+  return <div className="date-picker-overlay" onClick={onClose}>
+    <div className="date-picker" onClick={(e) => e.stopPropagation()}>
+      <div className="date-picker-header"><button className="cal-nav" aria-label="上个月" onClick={() => shiftMonth(-1)}><ChevronLeft size={15} /></button><strong>{year} 年 {month + 1} 月</strong><button className="cal-nav" aria-label="下个月" onClick={() => shiftMonth(1)}><ChevronRight size={15} /></button></div>
+      <div className="date-picker-weekdays">{['日', '一', '二', '三', '四', '五', '六'].map((w) => <span key={w}>{w}</span>)}</div>
+      <div className="date-picker-grid">{cells.map((cell) => cell.day === 0 ? <span key={cell.key} className="cal-cell padding" /> : <button key={cell.key} className={`cal-cell ${cell.hasData ? 'has-data' : ''} ${cell.isToday ? 'today' : ''} ${cell.isSelected ? 'selected' : ''}`} disabled={cell.disabled} onClick={() => cell.dateKey && onSelect(cell.dateKey === today ? 'today' : cell.dateKey)}>{cell.day}{cell.hasData && <i className="data-dot" />}</button>)}</div>
+      <div className="date-picker-footer"><button className={value === 'today' ? 'active' : ''} onClick={() => onSelect('today')}>今天</button><button className={value === 'lifetime' ? 'active' : ''} onClick={() => onSelect('lifetime')}>累计</button></div>
+    </div>
+  </div>;
 }
 
 function MiniLog({ log, accounts }: { log: RequestLog; accounts: Account[] }) { const account = accounts.find((item) => item.id === log.accountId); return <div className="mini-log"><span className={`log-status-icon ${log.success ? 'ok' : 'fail'}`}>{log.success ? <Check size={13} /> : <X size={13} />}</span><div className="mini-log-main"><strong>{log.model || '未指定模型'}</strong><span>{log.path || '—'} · {account?.email ?? (log.accountId || '未选择账号')}</span></div><span className="mini-log-time">{formatTime(log.timestamp)}</span><span className={`code-status ${log.success ? 'ok' : 'fail'}`}>{log.status || '—'}</span></div>; }
@@ -344,10 +417,10 @@ function LogsPage({ state, onClear, notify }: { state: AppState; onClear: () => 
     return <div className="table-row" key={log.requestId} onClick={() => setSelected(log)}><span className="time-cell">{formatDate(log.timestamp)}</span><div className="model-cell"><strong>{log.model || '—'}</strong><code>{log.method} {log.path}</code></div><span className="account-cell">{displayAccount}</span><span className={`code-status ${log.success ? 'ok' : 'fail'}`}>{log.status || '—'} {log.success ? '成功' : '失败'}</span><span>{log.latencyMs} ms</span><span className="token-cell">{formatNumber(log.inputTokens + log.outputTokens)}<small>{log.cacheHit ? '缓存命中' : '未命中'}</small></span><IconButton label="查看详情" onClick={() => setSelected(log)}><ChevronDown size={15} /></IconButton></div>;
   };
   return <>
-    <SectionHeader eyebrow="反代服务 / 可观测性" title="请求日志" description="查看最近 7 天的请求、账号调度、响应耗时和错误分类。" action={<div className="header-actions"><button className="button ghost" onClick={exportLogs}><Upload size={15} />导出当前筛选 JSON</button></div>} />
+    <SectionHeader eyebrow="反代服务 / 可观测性" title="请求日志" description="查看今天的请求、账号调度、响应耗时和错误分类（每日零点自动清零）。" action={<div className="header-actions"><button className="button ghost" onClick={exportLogs}><Upload size={15} />导出当前筛选 JSON</button></div>} />
     <div className="log-summary"><div><strong>{logs.length}</strong><span>当前结果</span></div><div><strong>{logs.filter((log) => log.success).length}</strong><span>成功</span></div><div><strong>{logs.filter((log) => !log.success).length}</strong><span>失败</span></div><div><strong>{state.stats.averageLatencyMs}ms</strong><span>平均延迟</span></div></div>
     <div className="panel table-panel"><div className="table-toolbar"><div className="search-box"><Search size={15} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索模型、账号、Key 或路径" /></div><div className="toolbar-right"><button className={`filter-button ${onlyErrors ? 'active' : ''}`} onClick={() => setOnlyErrors(!onlyErrors)}><AlertTriangle size={14} />仅看错误</button><button className="filter-button" onClick={onClear}><Trash2 size={14} />清理日志</button></div></div>
-      {logs.length ? <div className="data-table logs-table"><div className="table-head"><span>时间</span><span>模型 / 路径</span><span>账号</span><span>状态</span><span>耗时</span><span>Token</span><span /></div>{logs.map(renderLogRow)}</div> : <EmptyState icon={FileJson} title="没有匹配的请求" description="保留筛选条件，或清除筛选后查看最近 7 天的日志。" />}
+      {logs.length ? <div className="data-table logs-table"><div className="table-head"><span>时间</span><span>模型 / 路径</span><span>账号</span><span>状态</span><span>耗时</span><span>Token</span><span /></div>{logs.map(renderLogRow)}</div> : <EmptyState icon={FileJson} title="没有匹配的请求" description="保留筛选条件，或清除筛选后查看今天的日志。" />}
     </div>
     {selected && (() => {
       const account = state.accounts.find((item) => item.id === selected.accountId);

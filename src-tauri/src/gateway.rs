@@ -19,8 +19,6 @@ const STATE_FILE: &str = "state.json";
 const CREDENTIALS_FILE: &str = "credentials.json";
 const RUNTIME_DIR: &str = "sidecar-runtime";
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_REQUEST_LOGS: usize = 500;
-const MAX_LOG_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_PENDING_REQUESTS: usize = 4096;
 const MAX_STDERR_BYTES: usize = 16 * 1024;
 const STATE_CHANGED_EVENT: &str = "coderelay-state-changed";
@@ -244,9 +242,11 @@ fn load_credentials(app: &AppHandle) -> Result<HashMap<String, AccountCredential
 }
 
 pub fn initialize(app: &AppHandle, runtime: &RuntimeState) -> Result<(), String> {
-    let cutoff = now_ms().saturating_sub(MAX_LOG_AGE.as_millis() as i64);
     let mut state: AppState = load_json(&state_path(app)?);
-    state.logs.retain(|log| log.timestamp >= cutoff);
+    // 请求日志只保留当天（本地时区），跨天自动清零；统计与日志解耦，按天聚合持久化。
+    state.retain_today_logs();
+    state.logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    state.migrate_legacy();
     let mut credentials = load_credentials(app)?;
     let mut migrated = false;
 
@@ -280,7 +280,7 @@ pub fn initialize(app: &AppHandle, runtime: &RuntimeState) -> Result<(), String>
     state.running = false;
     state.config.enabled = false;
     state.actual_port = None;
-    state.rebuild_stats();
+    state.sync_today_snapshot();
     *locked(&runtime.inner.app, "应用")? = state.clone();
     *locked(&runtime.inner.credentials, "凭据")? = credentials.clone();
     if migrated {
@@ -869,6 +869,10 @@ fn ingest_event(app: &AppHandle, inner: &Arc<RuntimeInner>, value: &Value) {
                 ..RequestLog::default()
             };
             if let Ok(mut state) = inner.app.lock() {
+                // 跨天惰性清零：只保留今天的日志，再记录新请求。
+                state.retain_today_logs();
+                // 统计与日志解耦：增量累加请求数/延迟/成败/小时桶到当日与累计。
+                state.record_completed(&log);
                 if let Some(existing) = state
                     .logs
                     .iter_mut()
@@ -876,7 +880,7 @@ fn ingest_event(app: &AppHandle, inner: &Arc<RuntimeInner>, value: &Value) {
                 {
                     *existing = log;
                 } else {
-                    state.logs.push(log);
+                    state.logs.insert(0, log);
                 }
                 if chat_restricted && !account_id.is_empty() {
                     if let Some(account) = state
@@ -888,11 +892,6 @@ fn ingest_event(app: &AppHandle, inner: &Arc<RuntimeInner>, value: &Value) {
                         account.failures = account.failures.saturating_add(1);
                     }
                 }
-                if state.logs.len() > MAX_REQUEST_LOGS {
-                    let remove = state.logs.len() - MAX_REQUEST_LOGS;
-                    state.logs.drain(0..remove);
-                }
-                state.rebuild_stats();
                 changed = true;
             }
         }
@@ -907,22 +906,24 @@ fn ingest_event(app: &AppHandle, inner: &Arc<RuntimeInner>, value: &Value) {
             let cached = value_u64(usage, "cachedTokens");
             let credit = value_f64(usage, "credit");
             if let Ok(mut state) = inner.app.lock() {
-                if let Some(log) = state
-                    .logs
-                    .iter_mut()
-                    .find(|item| item.request_id == request_id)
-                {
-                    log.input_tokens = input;
-                    log.output_tokens = output;
-                    log.cache_hit = cached > 0;
-                    log.credit = credit;
-                    if let Some(status) = value.get("status").and_then(Value::as_u64) {
-                        log.status = status as u16;
+                if let Some(index) = state.logs.iter().position(|item| item.request_id == request_id) {
+                    // 先取旧值快照，更新后按"新值-旧值"差量累加 token/缓存/credit，避免重复计数。
+                    let prev = state.logs[index].clone();
+                    {
+                        let log = &mut state.logs[index];
+                        log.input_tokens = input;
+                        log.output_tokens = output;
+                        log.cache_hit = cached > 0;
+                        log.credit = credit;
+                        if let Some(status) = value.get("status").and_then(Value::as_u64) {
+                            log.status = status as u16;
+                        }
+                        if let Some(success) = value.get("success").and_then(Value::as_bool) {
+                            log.success = success;
+                        }
                     }
-                    if let Some(success) = value.get("success").and_then(Value::as_bool) {
-                        log.success = success;
-                    }
-                    state.rebuild_stats();
+                    let updated = state.logs[index].clone();
+                    state.record_usage(&updated, &prev);
                     changed = true;
                 }
             }
@@ -1230,7 +1231,11 @@ fn restart_if_running(app: &AppHandle, inner: &Arc<RuntimeInner>) -> Result<AppS
 
 #[tauri::command]
 pub fn get_app_state(runtime: State<'_, RuntimeState>) -> Result<AppState, String> {
-    Ok(locked(&runtime.inner.app, "应用")?.clone())
+    let mut state = locked(&runtime.inner.app, "应用")?;
+    // 读取时惰性跨天清零日志并同步"今天"快照，保证零点后统计自动归零。
+    state.retain_today_logs();
+    state.sync_today_snapshot();
+    Ok(state.clone())
 }
 
 // export_accounts 将指定账号（含凭据 token）导出为 JSON，供备份与跨机器迁移。
@@ -1409,8 +1414,8 @@ pub fn clear_request_logs(
     runtime: State<'_, RuntimeState>,
 ) -> Result<AppState, String> {
     let mut state = locked(&runtime.inner.app, "应用")?;
+    // 清理日志只清空请求日志列表，不影响总览统计数据（按天聚合与累计均保留）。
     state.logs.clear();
-    state.rebuild_stats();
     save_app_state(&app, &state)?;
     let result = state.clone();
     drop(state);

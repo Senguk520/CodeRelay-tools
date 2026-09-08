@@ -93,6 +93,24 @@ export interface RequestLog {
   error?: string;
 }
 
+export interface HourBucket {
+  label: string;
+  hit: number;
+  miss: number;
+}
+
+/** 单日聚合统计（也用作累计视图的数据结构）。 */
+export interface DayStats {
+  requestCount: number;
+  totalTokens: number;
+  cacheHitTokens: number;
+  credit: number;
+  successCount: number;
+  failureCount: number;
+  totalLatencyMs: number;
+  byHour: HourBucket[];
+}
+
 export interface Stats {
   requestCount: number;
   totalTokens: number;
@@ -101,7 +119,11 @@ export interface Stats {
   averageLatencyMs: number;
   successCount: number;
   failureCount: number;
-  byHour: Array<{ label: string; hit: number; miss: number }>;
+  byHour: HourBucket[];
+  /** 按天聚合：本地日期(yyyy-MM-dd) -> 当日数据。 */
+  byDay: Record<string, DayStats>;
+  /** 累计所有天的总数据。 */
+  lifetime: DayStats;
 }
 
 export interface OAuthStartResponse {
@@ -160,6 +182,24 @@ export const defaultConfig: ServiceConfig = {
   debugLogs: false,
 };
 
+function emptyByHour(): HourBucket[] {
+  return Array.from({ length: 8 }, (_, index) => ({ label: String(index * 3).padStart(2, '0'), hit: 0, miss: 0 }));
+}
+
+/** 创建一个空的单日聚合统计。 */
+export function emptyDayStats(): DayStats {
+  return {
+    requestCount: 0,
+    totalTokens: 0,
+    cacheHitTokens: 0,
+    credit: 0,
+    successCount: 0,
+    failureCount: 0,
+    totalLatencyMs: 0,
+    byHour: emptyByHour(),
+  };
+}
+
 export const defaultStats: Stats = {
   requestCount: 0,
   totalTokens: 0,
@@ -168,7 +208,9 @@ export const defaultStats: Stats = {
   averageLatencyMs: 0,
   successCount: 0,
   failureCount: 0,
-  byHour: Array.from({ length: 8 }, (_, index) => ({ label: String(index * 3).padStart(2, '0'), hit: 0, miss: 0 })),
+  byHour: emptyByHour(),
+  byDay: {},
+  lifetime: emptyDayStats(),
 };
 
 export const defaultState: AppState = {
