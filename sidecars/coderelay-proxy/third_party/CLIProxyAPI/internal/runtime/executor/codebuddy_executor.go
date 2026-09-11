@@ -246,12 +246,11 @@ func (e *CodebuddyExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 
 	// NOTE: normalizeCodebuddyToolMessages is intentionally NOT called here.
-	// It appends a synthetic user message when the body ends with a tool
-	// message, which would shift lastCodebuddyUserMessageIndex and break the
-	// deferred streaming preprocess below (image extraction and the
-	// description replacement both key off the last user message). It runs
-	// inside the stream goroutine, after the images have been swapped for
-	// their descriptions.
+	// It runs inside the stream goroutine below, immediately before
+	// codebuddyBackfillReadToolImages. The two must stay in that order: the
+	// backfill depends on the LAST user message (the upstream only adopts
+	// images carried by it), and normalization may append a synthetic user
+	// message when the body ends with a tool message.
 
 	// Clamp oversized max_tokens (Cursor sends 65536) to the model's declared
 	// MaxCompletionTokens ceiling so strict backend routes do not reject it.

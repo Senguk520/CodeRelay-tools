@@ -4,8 +4,8 @@
 original MIT license and copyright notice are retained in `LICENSE`.
 
 The outer `coderelay-proxy` package contains the CodeBuddy CN relay, request
-policy, account selection, model synchronization, vision routing and the
-newline-delimited JSON lifecycle event protocol consumed by the Tauri host.
+policy, account selection, model synchronization and the newline-delimited JSON
+lifecycle event protocol consumed by the Tauri host.
 
 The sidecar accepts:
 
