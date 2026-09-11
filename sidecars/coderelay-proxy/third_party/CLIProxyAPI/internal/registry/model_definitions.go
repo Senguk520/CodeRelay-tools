@@ -151,21 +151,55 @@ func CodebuddyModelMaxCompletionTokens(modelID string) int {
 	return CodebuddyMaxCompletionTokensDefault
 }
 
-// CodebuddyModelSupportsImages reports whether the given CodeBuddy model natively
-// accepts image input, as declared by the online model catalog's supportsImages
-// capability field (synced from the official backend endpoint, cached locally).
+// codebuddyVisionExcluded lists models the online catalog marks as
+// image-capable (supportsImages=true) but which verifiably reject image input
+// at inference time. They must report text-only so clients do not send images
+// the upstream would refuse with a "not a vision model" reply.
 //
-// This is the single source of truth for native vision capability: there are no
-// hard-coded per-model overrides. Models the catalog does not flag as
-// image-capable (including models absent from the catalog) report false, so the
-// vision-proxy layer routes their image inputs through the configured vision
-// model instead of passing images straight to a text-only upstream.
+// Measured 2026-09-11 against the live upstream (4 keys × 2 images, 7 requests,
+// every one refused: "作为 GLM 大语言模型…不具备处理视觉信息的能力").
+// See 《模型视觉能力实测与校正表.md》 §3.1.
+var codebuddyVisionExcluded = map[string]struct{}{
+	"glm-5v-turbo": {},
+}
+
+// codebuddyVisionIncluded lists models the online catalog does not mark as
+// image-capable (supportsImages=false or absent) but which verifiably accept
+// and read image input. They must report image support so clients keep sending
+// images instead of filtering them out client-side.
+//
+// Measured 2026-09-11 against the live upstream (4/4 keys read the test image
+// correctly, A/B confirmed). See 《模型视觉能力实测与校正表.md》 §3.2.
+var codebuddyVisionIncluded = map[string]struct{}{
+	"glm-5.1":            {},
+	"deepseek-v3-2-volc": {},
+}
+
+// CodebuddyModelSupportsImages reports whether the given CodeBuddy model natively
+// accepts image input. It consults, in order:
+//
+//  1. codebuddyVisionExcluded — catalog wrongly says image-capable; forced off.
+//  2. codebuddyVisionIncluded — catalog wrongly omits image capability; forced on.
+//  3. the online model catalog's supportsImages field (synced from the official
+//     backend endpoint, cached locally) — the capability source for everything
+//     else. Models absent from the catalog report false.
+//
+// The two override tables exist because the catalog is not a reliable capability
+// source by itself (2026-09-11 measurement found both false positives and false
+// negatives). Keep them minimal and dated; they are the only local overrides.
 //
 // Unknown or empty model IDs report false.
 func CodebuddyModelSupportsImages(modelID string) bool {
 	modelID = strings.TrimSpace(modelID)
 	if modelID == "" {
 		return false
+	}
+	key := strings.ToLower(modelID)
+	if _, ok := codebuddyVisionExcluded[key]; ok {
+		return false
+	}
+	if _, ok := codebuddyVisionIncluded[key]; ok {
+		return true
 	}
 	for _, m := range GetCodebuddyModels() {
 		if m != nil && strings.EqualFold(m.ID, modelID) {

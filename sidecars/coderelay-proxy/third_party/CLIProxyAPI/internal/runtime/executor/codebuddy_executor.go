@@ -13,7 +13,6 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codebuddy"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -94,46 +93,13 @@ func (e *CodebuddyExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	body = normalizeCodebuddyChatImageContent(body)
 
 	// Diagnostic: capture the exact shape of a CodeBuddy read-tool image workflow
-	// that the vision router does not recognize (problem-two investigation).
+	// that the image input detection does not recognize (problem-two investigation).
 	codebuddyDumpReadToolDiagnostic(body)
 
 	// Read-tool image backfill: when the client read an image via read/read_file
 	// and the tool result was reduced to a placeholder (base64 omitted), re-attach
-	// the image from the tool_calls filePath so the vision router recognizes it.
+	// the image from the tool_calls filePath so it reaches the upstream model.
 	body = codebuddyBackfillReadToolImages(body)
-
-	// Historical image rewrite: replace truncated historical image stubs with a
-	// text marker so text-only models do not choke on them (preprocess/routing).
-	body = e.rewriteCodebuddyHistoricalImagesForTextModel(body, baseModel)
-
-	// Vision proxy: transparently handle image input for non-vision models.
-	body, _ = e.applyCodebuddyVisionProxy(ctx, auth, body, baseModel, nil, reporter)
-
-	// Agentic vision: server-side tool-calling loop for text-only models to
-	// autonomously inspect images via the vision model. Native-vision models
-	// (and the vision engine itself) bypass the loop so their images are passed
-	// straight to the model instead of being routed to the sub-agent.
-	agenticModel := codebuddyEffectiveModel(body, baseModel)
-	if codebuddyAgenticVisionPlan(
-		e.cfg.CodebuddyVision.NormalizedVisionMode(),
-		e.cfg.CodebuddyVision.VisionModel(),
-		agenticModel,
-		codebuddyChatHasImageInput(body),
-		registry.CodebuddyModelSupportsImages(agenticModel),
-	) {
-		helps.DumpCodebuddyDebugBody("vision-reporter-trigger",
-			[]byte(fmt.Sprintf("path=Execute baseModel=%s visionModel=%s", baseModel, e.cfg.CodebuddyVision.VisionModel())))
-		internallogging.SetVisionSubagent(ctx, true)
-		visionReporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
-		defer visionReporter.TrackFailure(ctx, &err)
-		return e.executeCodebuddyVisionAgentic(ctx, auth, req, opts, body, baseModel, creds, baseURL, visionReporter)
-	}
-	// Text-only turn in agentic mode: strip any stale images re-sent by the
-	// client so they don't reach the text-only model and get filtered. Native
-	// vision models keep their images because they can read them directly.
-	if e.codebuddyVisionAgenticEnabled() && !codebuddyModelIsNativeVision(agenticModel, e.cfg.CodebuddyVision.VisionModel()) {
-		body = replaceCodebuddyImagesWithText(body, codebuddyHistoricalImageText)
-	}
 
 	// Prompt cache: inject a stable session-bound key so repeated turns in the
 	// same conversation hit the backend prefix cache (lower credit).
@@ -255,54 +221,13 @@ func (e *CodebuddyExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	body = normalizeCodebuddyChatImageContent(body)
 
 	// Diagnostic: capture the exact shape of a CodeBuddy read-tool image workflow
-	// that the vision router does not recognize (problem-two investigation).
+	// that the image input detection does not recognize (problem-two investigation).
 	codebuddyDumpReadToolDiagnostic(body)
 
 	// Read-tool image backfill: when the client read an image via read/read_file
 	// and the tool result was reduced to a placeholder (base64 omitted), re-attach
-	// the image from the tool_calls filePath so the vision router recognizes it.
+	// the image from the tool_calls filePath so it reaches the upstream model.
 	body = codebuddyBackfillReadToolImages(body)
-
-	// Historical image rewrite: replace truncated historical image stubs with a
-	// text marker so text-only models do not choke on them (preprocess/routing).
-	body = e.rewriteCodebuddyHistoricalImagesForTextModel(body, baseModel)
-
-	// Vision proxy: transparently handle image input for non-vision models.
-	// Routing is applied synchronously (cheap model swap). Preprocess is deferred
-	// into the stream goroutine below so the vision description can be forwarded
-	// to the client in real time (it takes seconds and must not block the first
-	// byte / trip the relay stream-open watchdog). When preprocess is needed we
-	// keep the original image-bearing body intact here and describe it later.
-	needsPreprocess := e.codebuddyVisionNeedsPreprocess(body, baseModel)
-	if !needsPreprocess {
-		body, _ = e.applyCodebuddyVisionProxy(ctx, auth, body, baseModel, nil, reporter)
-	}
-
-	// Agentic vision: server-side tool-calling loop for text-only models to
-	// autonomously inspect images via the vision model. Native-vision models
-	// (and the vision engine itself) bypass the loop so their images are passed
-	// straight to the model instead of being routed to the sub-agent.
-	agenticModel := codebuddyEffectiveModel(body, baseModel)
-	if codebuddyAgenticVisionPlan(
-		e.cfg.CodebuddyVision.NormalizedVisionMode(),
-		e.cfg.CodebuddyVision.VisionModel(),
-		agenticModel,
-		codebuddyChatHasImageInput(body),
-		registry.CodebuddyModelSupportsImages(agenticModel),
-	) {
-		helps.DumpCodebuddyDebugBody("vision-reporter-trigger",
-			[]byte(fmt.Sprintf("path=ExecuteStream baseModel=%s visionModel=%s", baseModel, e.cfg.CodebuddyVision.VisionModel())))
-		internallogging.SetVisionSubagent(ctx, true)
-		visionReporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
-		defer visionReporter.TrackFailure(ctx, &err)
-		return e.executeCodebuddyVisionAgenticStream(ctx, auth, req, opts, body, baseModel, creds, baseURL, visionReporter)
-	}
-	// Text-only turn in agentic mode: strip any stale images re-sent by the
-	// client so they don't reach the text-only model and get filtered. Native
-	// vision models keep their images because they can read them directly.
-	if e.codebuddyVisionAgenticEnabled() && !codebuddyModelIsNativeVision(agenticModel, e.cfg.CodebuddyVision.VisionModel()) {
-		body = replaceCodebuddyImagesWithText(body, codebuddyHistoricalImageText)
-	}
 
 	// Prompt cache: inject a stable session-bound key so repeated turns in the
 	// same conversation hit the backend prefix cache (lower credit).
@@ -355,53 +280,11 @@ func (e *CodebuddyExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 			return true
 		}
 
-		// Preprocess streaming: describe the images via the vision model first,
-		// forwarding each description delta to the client in real time, then
-		// rewrite the image parts into text and continue with the text-only model.
-		// The initial role chunk opens the stream immediately so the relay's
-		// stream-open watchdog does not trip during the multi-second vision call.
-		if needsPreprocess {
-			visionModel := e.cfg.CodebuddyVision.VisionModel()
-			initChunk := buildCodebuddyVisionChunk("", baseModel, 0, nil, "assistant")
-			if initChunk != nil && !emit(initChunk) {
-				return
-			}
-			descriptions, visionUsage, descErr := e.describeImagesWithVisionModel(ctx, auth, body, visionModel, e.cfg.CodebuddyVision.PreprocessPrompt, baseModel, emit)
-			if descErr != nil {
-				log.Warnf("codebuddy vision proxy: preprocess stream failed for %s (vision=%s): %v; omitting images", baseModel, visionModel, descErr)
-				body = replaceCodebuddyImagesWithText(body, codebuddyOmittedImageText)
-			} else {
-				log.Infof("codebuddy vision proxy: preprocessed %d image(s) for %s via %s", len(descriptions), baseModel, visionModel)
-				body = replaceCodebuddyImagesWithDescriptions(body, descriptions, codebuddyOmittedImageText)
-				// Report the vision model's usage as a separate additional-model
-				// record, aligned with the agentic path.
-				reporter.PublishAdditionalModelAlways(ctx, visionModel, visionUsage)
-			}
-			// Re-apply the stream forcing so the (rewritten) text-only body still
-			// carries stream=true / include_usage after the image swap.
-			var errSet error
-			body, errSet = sjson.SetBytes(body, "stream", true)
-			if errSet == nil {
-				body, errSet = sjson.SetBytes(body, "stream_options.include_usage", true)
-			}
-			if errSet != nil {
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Err: errSet}:
-				case <-ctx.Done():
-				}
-				return
-			}
-			// Separate the text-model stream translator state from the vision
-			// delta state so the client stream stays coherent.
-			param = nil
-		}
-
 		// Normalize tool-related message fields so the strict backend does not
-		// reject tool-calling rounds with 400 invalid_parameter_value. This must
-		// run AFTER the preprocess block above: it may append a synthetic user
-		// message when the body ends with a tool message, and doing so before
-		// the image extraction/replacement would shift the last-user-message
-		// boundary and hide the backfilled images from the vision call.
+		// reject tool-calling rounds with 400 invalid_parameter_value. It may
+		// append a synthetic user message when the body ends with a tool message;
+		// the read-tool backfill above keys off the last user message, so this
+		// must not run before it.
 		body, errNorm := normalizeCodebuddyToolMessages(body)
 		if errNorm != nil {
 			select {

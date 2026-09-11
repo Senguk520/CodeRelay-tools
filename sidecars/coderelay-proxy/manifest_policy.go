@@ -78,10 +78,6 @@ var (
 	streamIdleTimeout      = 60 * time.Second
 	imageStreamOpenTimeout = 10 * time.Second
 	imageStreamIdleTimeout = 60 * time.Second
-	// visionAgenticStreamIdleTimeout covers the codebuddy vision sub-agent
-	// loop: up to several rounds of text-model + vision-model upstream calls
-	// (each 10-30s), so the relay idle watchdog does not trip mid-loop.
-	visionAgenticStreamIdleTimeout = 300 * time.Second
 )
 
 type accountModelRule struct {
@@ -102,8 +98,6 @@ type manifest struct {
 	ImmediateSSEResponse       bool                `json:"immediateSseResponse"`
 	MaxConcurrentImageRequests int                 `json:"maxConcurrentImageRequests"`
 	DebugLogs                  *bool               `json:"debugLogs,omitempty"`
-	VisionMode                 string              `json:"visionMode"`
-	VisionModel                string              `json:"visionModel"`
 
 	apiKeyByValue     map[string]*apiKeySpec
 	accountByID       map[string]*accountSpec
@@ -397,7 +391,6 @@ type requestDiagnosticPayload struct {
 	Path                    string                     `json:"path,omitempty"`
 	RequestKind             string                     `json:"requestKind,omitempty"`
 	Model                   string                     `json:"model,omitempty"`
-	VisionSubagent          bool                       `json:"visionSubagent,omitempty"`
 	APIKeyID                string                     `json:"apiKeyId,omitempty"`
 	APIKeyLabel             string                     `json:"apiKeyLabel,omitempty"`
 	Transport               string                     `json:"transport,omitempty"`
@@ -979,7 +972,7 @@ func (p *requestPolicy) middleware() gin.HandlerFunc {
 			if isCodexClientModelsRequest(c.Request) {
 				c.JSON(http.StatusOK, buildCodexClientModelsResponse(models, spec, contextWindowsForAPIKey(p.manifest, spec)))
 			} else {
-				c.JSON(http.StatusOK, buildModelsResponse(models, p.manifest.visionProxyEnabled()))
+				c.JSON(http.StatusOK, buildModelsResponse(models))
 			}
 			c.Abort()
 			return
@@ -1138,13 +1131,12 @@ func (p *requestPolicy) emitRequestCompleted(c *gin.Context, requestID string, s
 		RequestID:     requestID,
 		Method:        c.Request.Method,
 		Path:          requestPath(c.Request),
-		RequestKind:    requestKind,
-		Model:          model,
-		VisionSubagent: internallogging.GetVisionSubagent(c.Request.Context()),
-		APIKeyID:       stringFromAPIKey(spec, "id"),
-		APIKeyLabel:    stringFromAPIKey(spec, "label"),
-		Transport:      diagnosticTransport(c.Request),
-		Status:         status,
+		RequestKind:   requestKind,
+		Model:         model,
+		APIKeyID:      stringFromAPIKey(spec, "id"),
+		APIKeyLabel:   stringFromAPIKey(spec, "label"),
+		Transport:     diagnosticTransport(c.Request),
+		Status:        status,
 		LatencyMS:     latencyMS,
 		CompletedAtMS: completedAtMS,
 		Aborted:       c.IsAborted(),
@@ -1248,15 +1240,16 @@ func isCodexClientModelsRequest(r *http.Request) bool {
 // carries `input_modalities` so clients (e.g. Cursor) can detect vision-capable
 // models instead of defaulting to text-only and filtering images client-side.
 //
-// A model reports image capability when either:
-//  1. the backend natively supports images for it (registry.CodebuddyModelSupportsImages), or
-//  2. the vision-proxy layer is active and will transparently describe/handle
-//     images for it (preprocess/routing via hy3-preview).
-func buildModelsResponse(models []string, visionProxyEnabled bool) gin.H {
+// A model reports image capability when the backend natively supports images
+// for it (registry.CodebuddyModelSupportsImages, backed by the online catalog
+// plus the measured capability overrides in the registry). Models without
+// native image support report text-only so clients do not send images the
+// upstream would reject.
+func buildModelsResponse(models []string) gin.H {
 	data := make([]gin.H, 0, len(models))
 	for _, model := range models {
 		modalities := []any{"text"}
-		if internalregistry.CodebuddyModelSupportsImages(model) || visionProxyEnabled {
+		if internalregistry.CodebuddyModelSupportsImages(model) {
 			modalities = []any{"text", "image"}
 		}
 		data = append(data, gin.H{
@@ -1797,41 +1790,6 @@ func canonicalModelForClientModel(m *manifest, spec *apiKeySpec, model string) s
 		}
 	}
 	return resolveSupportedModelAlias(m, withoutPrefix)
-}
-
-// requestHasVisionInput reports whether a request body carries image input
-// (OpenAI image_url parts or Responses input_image parts). It is used by the
-// stream watchdog to extend the idle timeout for vision sub-agent loops.
-func requestHasVisionInput(body []byte) bool {
-	if len(body) == 0 || !json.Valid(body) {
-		return false
-	}
-	var payload any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return false
-	}
-	return valueHasVisionInput(payload)
-}
-
-func valueHasVisionInput(value any) bool {
-	switch typed := value.(type) {
-	case map[string]any:
-		if typ, _ := typed["type"].(string); strings.EqualFold(strings.TrimSpace(typ), "input_image") || strings.EqualFold(strings.TrimSpace(typ), "image_url") {
-			return true
-		}
-		for _, child := range typed {
-			if valueHasVisionInput(child) {
-				return true
-			}
-		}
-	case []any:
-		for _, child := range typed {
-			if valueHasVisionInput(child) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func stripModelPrefix(model string, spec *apiKeySpec) string {

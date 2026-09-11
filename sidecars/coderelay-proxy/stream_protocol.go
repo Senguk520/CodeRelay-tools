@@ -62,15 +62,6 @@ func (s *relayServer) streamTimeoutsForRequest(r *http.Request, body []byte, mod
 		profile.open = durationFromConfigMillis(s.cfg.Streaming.StreamOpenTimeoutMS, profile.open)
 		profile.idle = durationFromConfigMillis(s.cfg.Streaming.StreamIdleTimeoutMS, profile.idle)
 	}
-	// Requests carrying vision input are handled by the codebuddy vision
-	// sub-agent loop, which performs multiple rounds of upstream calls before
-	// emitting content. Give them a much longer idle timeout so the relay
-	// watchdog does not cancel mid-loop.
-	if requestHasVisionInput(body) {
-		if profile.idle < visionAgenticStreamIdleTimeout {
-			profile.idle = visionAgenticStreamIdleTimeout
-		}
-	}
 	if !isImageGenerationRequest(r, body, model) {
 		return profile
 	}
@@ -158,12 +149,6 @@ func relayContext(c *gin.Context) context.Context {
 	if c == nil || c.Request == nil {
 		return context.Background()
 	}
-	// Attach the vision sub-agent holder to the request context so the
-	// downstream executor's SetVisionSubagent and the request-completed
-	// diagnostic's GetVisionSubagent observe the same holder instance. Without
-	// this, both sides would hold distinct (or missing) holders and the
-	// request_completed event's visionSubagent flag would always be false.
-	c.Request = c.Request.WithContext(internallogging.WithVisionSubagentHolder(c.Request.Context()))
 	endpoint := c.Request.Method
 	if c.Request.URL != nil {
 		endpoint += " " + c.Request.URL.Path
