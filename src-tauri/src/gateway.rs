@@ -458,20 +458,6 @@ fn prepare_runtime_files(
     if api_keys.is_empty() {
         return Err("没有启用的 API Key，请先创建以 sk- 开头的 Key".to_string());
     }
-    let vision_mode = if state.config.vision_tool_enabled {
-        let mode = state.config.vision_mode.trim();
-        match mode {
-            "routing" | "preprocess" | "agentic" => mode,
-            _ => "preprocess",
-        }
-    } else {
-        "off"
-    };
-    let vision_model = if state.config.vision_model.trim().is_empty() {
-        "hy4-preview".to_string()
-    } else {
-        state.config.vision_model.trim().to_string()
-    };
     let config = json!({
         "host": state.config.bind_host,
         "port": state.config.port,
@@ -493,7 +479,6 @@ fn prepare_runtime_files(
         },
         "image-generation-mode": state.config.image_generation_mode,
         "max-concurrent-image-requests": 1,
-        "codebuddy-vision": { "mode": vision_mode, "model": vision_model, "max-tool-rounds": 3 },
     });
     let manifest_keys: Vec<Value> = state
         .keys
@@ -525,8 +510,6 @@ fn prepare_runtime_files(
         "debugLogs": state.config.debug_logs,
         "imageGenerationMode": state.config.image_generation_mode,
         "imageModels": ["codebuddy-image-1"],
-        "visionMode": vision_mode,
-        "visionModel": vision_model,
     });
     atomic_write(
         &files.config_path,
