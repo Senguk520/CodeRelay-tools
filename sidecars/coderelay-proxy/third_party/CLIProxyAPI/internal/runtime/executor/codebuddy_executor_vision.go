@@ -408,15 +408,9 @@ func (e *CodebuddyExecutor) rewriteCodebuddyHistoricalImagesForTextModel(body []
 	if mode != config.CodebuddyVisionModePreprocess && mode != config.CodebuddyVisionModeRouting {
 		return body
 	}
-	currentModel := strings.TrimSpace(gjson.GetBytes(body, "model").String())
-	if currentModel == "" {
-		currentModel = strings.TrimSpace(baseModel)
-	}
+	currentModel := codebuddyEffectiveModel(body, baseModel)
 	// The vision engine itself and native-vision models keep history intact.
-	if strings.EqualFold(currentModel, strings.TrimSpace(visionCfg.VisionModel())) {
-		return body
-	}
-	if registry.CodebuddyModelSupportsImages(currentModel) {
+	if codebuddyModelIsNativeVision(currentModel, visionCfg.VisionModel()) {
 		return body
 	}
 	body = replaceCodebuddyHistoricalImagesWithText(body, codebuddyHistoricalImageText)
@@ -467,6 +461,49 @@ func replaceCodebuddyHistoricalImagesWithText(body []byte, text string) []byte {
 	return out
 }
 
+// codebuddyEffectiveModel resolves the model a request will actually be sent to:
+// the body's "model" field when present, otherwise the executor's base model.
+// Centralizing the fallback keeps every vision-proxy decision (preprocess,
+// routing, agentic, historical rewrite) agreeing on the same model.
+func codebuddyEffectiveModel(body []byte, baseModel string) string {
+	currentModel := strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	if currentModel == "" {
+		currentModel = strings.TrimSpace(baseModel)
+	}
+	return currentModel
+}
+
+// codebuddyModelIsNativeVision reports whether a model handles image input
+// natively and therefore must bypass every vision-proxy intervention: either the
+// configured vision engine itself (avoids recursion) or a model the online
+// catalog marks as image-capable.
+func codebuddyModelIsNativeVision(currentModel, visionModel string) bool {
+	if strings.EqualFold(strings.TrimSpace(currentModel), strings.TrimSpace(visionModel)) {
+		return true
+	}
+	return registry.CodebuddyModelSupportsImages(currentModel)
+}
+
+// codebuddyAgenticVisionPlan reports whether the request should be handled by the
+// agentic vision loop (injecting the inspect_image tool for the text-only model
+// to call the vision engine). It is a pure function so the decision stays
+// unit-testable. The loop runs only when agentic mode is active, the request
+// carries an image, and the target model neither is the vision engine itself nor
+// natively accepts images — native-vision models get their images passed
+// straight through instead.
+func codebuddyAgenticVisionPlan(mode, visionModel, currentModel string, hasImage, currentSupportsImages bool) bool {
+	if mode != config.CodebuddyVisionModeAgentic || !hasImage {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(currentModel), strings.TrimSpace(visionModel)) {
+		return false
+	}
+	if currentSupportsImages {
+		return false
+	}
+	return true
+}
+
 // codebuddyVisionNeedsPreprocess reports whether the request should be handled
 // by the preprocess strategy (describe images first, then continue with the
 // original text-only model). It mirrors the routing decision of
@@ -481,16 +518,9 @@ func (e *CodebuddyExecutor) codebuddyVisionNeedsPreprocess(body []byte, baseMode
 	if !codebuddyChatHasImageInput(body) {
 		return false
 	}
-	visionModel := visionCfg.VisionModel()
-	currentModel := strings.TrimSpace(gjson.GetBytes(body, "model").String())
-	if currentModel == "" {
-		currentModel = strings.TrimSpace(baseModel)
-	}
+	currentModel := codebuddyEffectiveModel(body, baseModel)
 	// Never re-route the vision engine itself, and leave native image models alone.
-	if strings.EqualFold(strings.TrimSpace(currentModel), strings.TrimSpace(visionModel)) {
-		return false
-	}
-	if registry.CodebuddyModelSupportsImages(currentModel) {
+	if codebuddyModelIsNativeVision(currentModel, visionCfg.VisionModel()) {
 		return false
 	}
 	return true
@@ -542,10 +572,7 @@ func (e *CodebuddyExecutor) applyCodebuddyVisionProxy(ctx context.Context, auth 
 	}
 
 	visionModel := visionCfg.VisionModel()
-	currentModel := strings.TrimSpace(gjson.GetBytes(body, "model").String())
-	if currentModel == "" {
-		currentModel = strings.TrimSpace(baseModel)
-	}
+	currentModel := codebuddyEffectiveModel(body, baseModel)
 
 	action := codebuddyVisionPlan(mode, visionModel, currentModel, true, registry.CodebuddyModelSupportsImages(currentModel))
 	switch action {

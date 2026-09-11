@@ -130,31 +130,6 @@ func GetCodebuddyModels() []*ModelInfo {
 	return WithCodebuddyBuiltins(cloneModelInfos(getModels().Codebuddy))
 }
 
-// codebuddyVisionBackendWhitelist lists CodeBuddy models whose official app.asar
-// supportsImages flag is false but which the live backend verifiably routes to a
-// vision sub-model. They are treated as vision-capable so the vision-proxy layer
-// does not re-route them.
-//
-// NOTE (2026-08-21): deepseek-v4-flash / deepseek-v4-pro were removed from this
-// list — live testing through the CLIProxy relay showed the backend returns a
-// "this model does not support image input" refusal text for them (the images
-// reach the text model unchanged instead of being routed to a vision sub-model).
-// They now fall through to the vision-proxy layer (preprocess via hy3-preview).
-var codebuddyVisionBackendWhitelist = map[string]struct{}{
-	"glm-5.1": {},
-	"glm-5.2": {},
-}
-
-// codebuddyVisionBlacklist lists CodeBuddy models whose backend supportsImages
-// flag is true but which verifiably reject image input at inference time (the
-// backend returns a "this model does not support image input" refusal text).
-// They are treated as text-only so the vision-proxy layer routes them through
-// the configured vision model (hy3-preview) instead of passing images through.
-var codebuddyVisionBlacklist = map[string]struct{}{
-	"deepseek-v4-pro":   {},
-	"deepseek-v4-flash": {},
-}
-
 // CodebuddyMaxCompletionTokensDefault is the fallback max completion token
 // ceiling shared by CodeBuddy models when a specific value is unknown. The
 // synced catalog and the static models.json fallback both declare 32768 for
@@ -176,27 +151,21 @@ func CodebuddyModelMaxCompletionTokens(modelID string) int {
 	return CodebuddyMaxCompletionTokensDefault
 }
 
-// CodebuddyModelSupportsImages reports whether the given CodeBuddy model accepts
-// image input. It consults, in order:
-//  1. The measured blacklist (models the backend flags as vision-capable but
-//     which verifiably reject image input, e.g. deepseek-v4-pro/flash).
-//  2. The measured backend whitelist (models the live backend verifiably routes
-//     to a vision sub-model despite app.asar marking them text-only).
-//  3. The official client's app.asar supportsImages flag (or the static
-//     models.json fallback when the client is not installed).
+// CodebuddyModelSupportsImages reports whether the given CodeBuddy model natively
+// accepts image input, as declared by the online model catalog's supportsImages
+// capability field (synced from the official backend endpoint, cached locally).
+//
+// This is the single source of truth for native vision capability: there are no
+// hard-coded per-model overrides. Models the catalog does not flag as
+// image-capable (including models absent from the catalog) report false, so the
+// vision-proxy layer routes their image inputs through the configured vision
+// model instead of passing images straight to a text-only upstream.
 //
 // Unknown or empty model IDs report false.
 func CodebuddyModelSupportsImages(modelID string) bool {
 	modelID = strings.TrimSpace(modelID)
 	if modelID == "" {
 		return false
-	}
-	key := strings.ToLower(modelID)
-	if _, ok := codebuddyVisionBlacklist[key]; ok {
-		return false
-	}
-	if _, ok := codebuddyVisionBackendWhitelist[key]; ok {
-		return true
 	}
 	for _, m := range GetCodebuddyModels() {
 		if m != nil && strings.EqualFold(m.ID, modelID) {

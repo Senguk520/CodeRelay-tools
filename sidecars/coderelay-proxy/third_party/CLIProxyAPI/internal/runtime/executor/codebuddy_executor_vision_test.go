@@ -231,6 +231,103 @@ func TestCodebuddyVisionPlan(t *testing.T) {
 	}
 }
 
+// --- agentic vision plan (decision) ----------------------------------------
+
+// TestCodebuddyAgenticVisionPlan pins the agentic-loop gate: the loop runs only
+// for text-only models that carry an image. Native-vision models and the vision
+// engine itself must bypass it entirely (their images go straight through).
+func TestCodebuddyAgenticVisionPlan(t *testing.T) {
+	tests := []struct {
+		name        string
+		mode        string
+		visionModel string
+		model       string
+		hasImage    bool
+		supportsImg bool
+		want        bool
+	}{
+		{
+			name:        "text-only model with image runs agentic loop",
+			mode:        config.CodebuddyVisionModeAgentic,
+			visionModel: "hy4-preview",
+			model:       "deepseek-v4.1-flash",
+			hasImage:    true,
+			want:        true,
+		},
+		{
+			// 核心回归：原生视觉模型带图必须直通，不得进入子代理循环。
+			name:        "native vision model with image bypasses agentic loop",
+			mode:        config.CodebuddyVisionModeAgentic,
+			visionModel: "hy4-preview",
+			model:       "glm-5.3-flash",
+			hasImage:    true,
+			supportsImg: true,
+			want:        false,
+		},
+		{
+			name:        "vision engine itself bypasses agentic loop (no recursion)",
+			mode:        config.CodebuddyVisionModeAgentic,
+			visionModel: "hy4-preview",
+			model:       "hy4-preview",
+			hasImage:    true,
+			want:        false,
+		},
+		{
+			name:        "text-only turn does not start agentic loop",
+			mode:        config.CodebuddyVisionModeAgentic,
+			visionModel: "hy4-preview",
+			model:       "deepseek-v4.1-flash",
+			hasImage:    false,
+			want:        false,
+		},
+		{
+			name:        "non-agentic mode never runs agentic loop",
+			mode:        config.CodebuddyVisionModePreprocess,
+			visionModel: "hy4-preview",
+			model:       "deepseek-v4.1-flash",
+			hasImage:    true,
+			want:        false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := codebuddyAgenticVisionPlan(tt.mode, tt.visionModel, tt.model, tt.hasImage, tt.supportsImg)
+			if got != tt.want {
+				t.Fatalf("codebuddyAgenticVisionPlan() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCodebuddyEffectiveModel verifies body.model takes precedence and falls back
+// to the executor's base model only when the body omits it.
+func TestCodebuddyEffectiveModel(t *testing.T) {
+	if got := codebuddyEffectiveModel([]byte(`{"model":"glm-5.3-flash"}`), "deepseek-v4.1-flash"); got != "glm-5.3-flash" {
+		t.Fatalf("body model should win, got %q", got)
+	}
+	if got := codebuddyEffectiveModel([]byte(`{}`), "deepseek-v4.1-flash"); got != "deepseek-v4.1-flash" {
+		t.Fatalf("empty body model should fall back to baseModel, got %q", got)
+	}
+	if got := codebuddyEffectiveModel([]byte(`{"model":"  "}`), " deepseek-v4.1-flash "); got != "deepseek-v4.1-flash" {
+		t.Fatalf("whitespace model should fall back and be trimmed, got %q", got)
+	}
+}
+
+// TestCodebuddyModelIsNativeVision covers the recursion guard (the vision engine
+// itself is always native). Catalog-backed capability is covered by the registry
+// package tests.
+func TestCodebuddyModelIsNativeVision(t *testing.T) {
+	if !codebuddyModelIsNativeVision("hy4-preview", "hy4-preview") {
+		t.Fatal("the vision engine itself must be treated as native vision")
+	}
+	if !codebuddyModelIsNativeVision("HY4-PREVIEW", " hy4-preview ") {
+		t.Fatal("vision-model comparison must be case-insensitive and trimmed")
+	}
+	if codebuddyModelIsNativeVision("zzz-not-a-real-model", "hy4-preview") {
+		t.Fatal("a model absent from the catalog must not be treated as native vision")
+	}
+}
+
 // --- agentic vision: image extraction & tool injection ---------------------
 
 func TestExtractCodebuddyImagesForAgentic(t *testing.T) {

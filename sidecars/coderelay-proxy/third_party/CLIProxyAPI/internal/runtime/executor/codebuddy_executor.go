@@ -110,18 +110,28 @@ func (e *CodebuddyExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	body, _ = e.applyCodebuddyVisionProxy(ctx, auth, body, baseModel, nil, reporter)
 
 	// Agentic vision: server-side tool-calling loop for text-only models to
-	// autonomously inspect images via the vision model.
-	if e.codebuddyVisionAgenticEnabled() {
-		if codebuddyChatHasImageInput(body) {
-			helps.DumpCodebuddyDebugBody("vision-reporter-trigger",
-				[]byte(fmt.Sprintf("path=Execute baseModel=%s visionModel=%s", baseModel, e.cfg.CodebuddyVision.VisionModel())))
-			internallogging.SetVisionSubagent(ctx, true)
-			visionReporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
-			defer visionReporter.TrackFailure(ctx, &err)
-			return e.executeCodebuddyVisionAgentic(ctx, auth, req, opts, body, baseModel, creds, baseURL, visionReporter)
-		}
-		// Text-only turn in agentic mode: strip any stale images re-sent by the
-		// client so they don't reach the text-only model and get filtered.
+	// autonomously inspect images via the vision model. Native-vision models
+	// (and the vision engine itself) bypass the loop so their images are passed
+	// straight to the model instead of being routed to the sub-agent.
+	agenticModel := codebuddyEffectiveModel(body, baseModel)
+	if codebuddyAgenticVisionPlan(
+		e.cfg.CodebuddyVision.NormalizedVisionMode(),
+		e.cfg.CodebuddyVision.VisionModel(),
+		agenticModel,
+		codebuddyChatHasImageInput(body),
+		registry.CodebuddyModelSupportsImages(agenticModel),
+	) {
+		helps.DumpCodebuddyDebugBody("vision-reporter-trigger",
+			[]byte(fmt.Sprintf("path=Execute baseModel=%s visionModel=%s", baseModel, e.cfg.CodebuddyVision.VisionModel())))
+		internallogging.SetVisionSubagent(ctx, true)
+		visionReporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
+		defer visionReporter.TrackFailure(ctx, &err)
+		return e.executeCodebuddyVisionAgentic(ctx, auth, req, opts, body, baseModel, creds, baseURL, visionReporter)
+	}
+	// Text-only turn in agentic mode: strip any stale images re-sent by the
+	// client so they don't reach the text-only model and get filtered. Native
+	// vision models keep their images because they can read them directly.
+	if e.codebuddyVisionAgenticEnabled() && !codebuddyModelIsNativeVision(agenticModel, e.cfg.CodebuddyVision.VisionModel()) {
 		body = replaceCodebuddyImagesWithText(body, codebuddyHistoricalImageText)
 	}
 
@@ -269,18 +279,28 @@ func (e *CodebuddyExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	}
 
 	// Agentic vision: server-side tool-calling loop for text-only models to
-	// autonomously inspect images via the vision model.
-	if e.codebuddyVisionAgenticEnabled() {
-		if codebuddyChatHasImageInput(body) {
-			helps.DumpCodebuddyDebugBody("vision-reporter-trigger",
-				[]byte(fmt.Sprintf("path=ExecuteStream baseModel=%s visionModel=%s", baseModel, e.cfg.CodebuddyVision.VisionModel())))
-			internallogging.SetVisionSubagent(ctx, true)
-			visionReporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
-			defer visionReporter.TrackFailure(ctx, &err)
-			return e.executeCodebuddyVisionAgenticStream(ctx, auth, req, opts, body, baseModel, creds, baseURL, visionReporter)
-		}
-		// Text-only turn in agentic mode: strip any stale images re-sent by the
-		// client so they don't reach the text-only model and get filtered.
+	// autonomously inspect images via the vision model. Native-vision models
+	// (and the vision engine itself) bypass the loop so their images are passed
+	// straight to the model instead of being routed to the sub-agent.
+	agenticModel := codebuddyEffectiveModel(body, baseModel)
+	if codebuddyAgenticVisionPlan(
+		e.cfg.CodebuddyVision.NormalizedVisionMode(),
+		e.cfg.CodebuddyVision.VisionModel(),
+		agenticModel,
+		codebuddyChatHasImageInput(body),
+		registry.CodebuddyModelSupportsImages(agenticModel),
+	) {
+		helps.DumpCodebuddyDebugBody("vision-reporter-trigger",
+			[]byte(fmt.Sprintf("path=ExecuteStream baseModel=%s visionModel=%s", baseModel, e.cfg.CodebuddyVision.VisionModel())))
+		internallogging.SetVisionSubagent(ctx, true)
+		visionReporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
+		defer visionReporter.TrackFailure(ctx, &err)
+		return e.executeCodebuddyVisionAgenticStream(ctx, auth, req, opts, body, baseModel, creds, baseURL, visionReporter)
+	}
+	// Text-only turn in agentic mode: strip any stale images re-sent by the
+	// client so they don't reach the text-only model and get filtered. Native
+	// vision models keep their images because they can read them directly.
+	if e.codebuddyVisionAgenticEnabled() && !codebuddyModelIsNativeVision(agenticModel, e.cfg.CodebuddyVision.VisionModel()) {
 		body = replaceCodebuddyImagesWithText(body, codebuddyHistoricalImageText)
 	}
 
