@@ -96,11 +96,6 @@ func (e *CodebuddyExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	// that the image input detection does not recognize (problem-two investigation).
 	codebuddyDumpReadToolDiagnostic(body)
 
-	// Read-tool image backfill: when the client read an image via read/read_file
-	// and the tool result was reduced to a placeholder (base64 omitted), re-attach
-	// the image from the tool_calls filePath so it reaches the upstream model.
-	body = codebuddyBackfillReadToolImages(body)
-
 	// Prompt cache: inject a stable session-bound key so repeated turns in the
 	// same conversation hit the backend prefix cache (lower credit).
 	body = applyCodebuddyPromptCache(body, codebuddyExecutionSessionID(req, opts))
@@ -125,6 +120,15 @@ func (e *CodebuddyExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	if err != nil {
 		return resp, err
 	}
+
+	// Read-tool image backfill: when the client read an image via read/read_file
+	// and the tool result was reduced to a placeholder (base64 omitted), re-attach
+	// the image from the tool_calls filePath so it reaches the upstream model.
+	// It MUST run after normalizeCodebuddyToolMessages: that pass appends a
+	// synthetic user message when the body ends with a tool message, and the
+	// upstream only adopts images carried by the LAST user message. Backfilling
+	// first would hide the image behind that synthetic message.
+	body = codebuddyBackfillReadToolImages(body)
 
 	// Clamp oversized max_tokens (Cursor sends 65536) to the model's declared
 	// MaxCompletionTokens ceiling so strict backend routes do not reject it.
@@ -224,11 +228,6 @@ func (e *CodebuddyExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	// that the image input detection does not recognize (problem-two investigation).
 	codebuddyDumpReadToolDiagnostic(body)
 
-	// Read-tool image backfill: when the client read an image via read/read_file
-	// and the tool result was reduced to a placeholder (base64 omitted), re-attach
-	// the image from the tool_calls filePath so it reaches the upstream model.
-	body = codebuddyBackfillReadToolImages(body)
-
 	// Prompt cache: inject a stable session-bound key so repeated turns in the
 	// same conversation hit the backend prefix cache (lower credit).
 	body = applyCodebuddyPromptCache(body, codebuddyExecutionSessionID(req, opts))
@@ -282,9 +281,7 @@ func (e *CodebuddyExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 
 		// Normalize tool-related message fields so the strict backend does not
 		// reject tool-calling rounds with 400 invalid_parameter_value. It may
-		// append a synthetic user message when the body ends with a tool message;
-		// the read-tool backfill above keys off the last user message, so this
-		// must not run before it.
+		// append a synthetic user message when the body ends with a tool message.
 		body, errNorm := normalizeCodebuddyToolMessages(body)
 		if errNorm != nil {
 			select {
@@ -293,6 +290,13 @@ func (e *CodebuddyExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 			}
 			return
 		}
+
+		// Read-tool image backfill: re-attach an image the client read via
+		// read/read_file but whose tool result was reduced to a placeholder.
+		// It MUST run after the normalization above: that pass appends a
+		// synthetic user message when the body ends with a tool message, and the
+		// upstream only adopts images carried by the LAST user message.
+		body = codebuddyBackfillReadToolImages(body)
 
 		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if errReq != nil {

@@ -45,6 +45,75 @@ func lastCodebuddyUserMessageIndex(messages []gjson.Result) int {
 	return -1
 }
 
+// codebuddyContinuationReminderMarkers identify IDE-injected user messages that
+// only nudge the model to continue after a tool result. CodeBuddy IDE appends
+// `<system_reminder>The tool call completed.</system_reminder>` as a role=user
+// message after every tool result; it carries no real user input and must not be
+// treated as the start of a new turn.
+var codebuddyContinuationReminderMarkers = []string{
+	"<system_reminder>",
+	"the tool call completed",
+}
+
+// codebuddyTurnStartUserMessageIndex returns the index of the user message that
+// starts the CURRENT turn, skipping trailing IDE-injected continuation
+// reminders.
+//
+// CodeBuddy IDE appends a `<system_reminder>` user message after every tool
+// result, so that reminder becomes the last user message and the assistant's
+// read tool_call of the very same turn ends up BEFORE it. A scan that treats
+// "at/after the last user message" as the current turn would then classify the
+// in-flight read as historical and never backfill its image — the exact reason
+// deepseek-v4-pro reported "I cannot see the image" (2026-09-11). Falling back
+// to the last *substantive* user message fixes that while still excluding tool
+// reads from genuinely earlier turns. Returns lastCodebuddyUserMessageIndex
+// (possibly -1) when every user message is a reminder.
+func codebuddyTurnStartUserMessageIndex(messages []gjson.Result) int {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Get("role").String() != "user" {
+			continue
+		}
+		if isCodebuddyContinuationReminder(messages[i]) {
+			continue
+		}
+		return i
+	}
+	return lastCodebuddyUserMessageIndex(messages)
+}
+
+// isCodebuddyContinuationReminder reports whether a user message is an
+// IDE-injected continuation nudge rather than real user input.
+func isCodebuddyContinuationReminder(msg gjson.Result) bool {
+	text := strings.ToLower(strings.TrimSpace(codebuddyMessageText(msg.Get("content"))))
+	if text == "" {
+		return false
+	}
+	for _, marker := range codebuddyContinuationReminderMarkers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// codebuddyMessageText flattens a message content (plain string or OpenAI
+// content-part array) into its concatenated text.
+func codebuddyMessageText(content gjson.Result) string {
+	if !content.Exists() {
+		return ""
+	}
+	if content.IsArray() {
+		parts := make([]string, 0, len(content.Array()))
+		for _, part := range content.Array() {
+			if text := strings.TrimSpace(part.Get("text").String()); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return content.String()
+}
+
 // codebuddyImageStubMaxPayloadChars is the threshold below which a data-URL
 // image part is considered a truncated stub rather than a real image. Clients
 // (CodeBuddy IDE, Cursor) truncate historical images to ~80-char stubs
@@ -241,13 +310,21 @@ func codebuddyBackfillReadToolImages(body []byte) []byte {
 	}
 
 	// Collect read-tool image filePaths whose role=tool result is a placeholder.
-	// Only tool reads from the CURRENT turn (at/after the last user message)
-	// qualify: historical tool reads were already backfilled in their own turn,
-	// and re-attaching them to every later question injects stale, unrelated
-	// images (2026-09-05 Cursor incident: an anime picture the agent read two
-	// turns earlier kept being re-attached whenever the user asked about a
-	// different, freshly pasted photo).
-	paths := collectCodebuddyReadImagePaths(arr, lastUserIdx)
+	// Only tool reads from the CURRENT turn qualify: historical tool reads were
+	// already backfilled in their own turn, and re-attaching them to every later
+	// question injects stale, unrelated images (2026-09-05 Cursor incident: an
+	// anime picture the agent read two turns earlier kept being re-attached
+	// whenever the user asked about a different, freshly pasted photo).
+	//
+	// The turn start is the last SUBSTANTIVE user message, not the last user
+	// message: CodeBuddy IDE appends a `<system_reminder>` continuation as a
+	// user message after each tool result, which would otherwise push the
+	// in-flight read before the last user message and hide it as "historical".
+	turnStartIdx := codebuddyTurnStartUserMessageIndex(arr)
+	if turnStartIdx < 0 {
+		return body
+	}
+	paths := collectCodebuddyReadImagePaths(arr, turnStartIdx)
 	if len(paths) == 0 {
 		return body
 	}

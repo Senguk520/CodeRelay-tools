@@ -343,3 +343,117 @@ func TestIsCodebuddyImagePlaceholder(t *testing.T) {
 		}
 	}
 }
+
+// buildCodebuddyTrailingReminderBody models the EXACT shape CodeBuddy IDE sends
+// during an agent loop: after every tool result the IDE appends a role=user
+// `<system_reminder>The tool call completed.</system_reminder>` message. That
+// trailing reminder becomes the last user message, so a scan that treats
+// "at/after the last user message" as the current turn classifies the
+// assistant's read tool_call of the very same turn as historical.
+func buildCodebuddyTrailingReminderBody(path string) string {
+	args, _ := json.Marshal(map[string]string{"filePath": path})
+	placeholder := "[Image already analyzed in an earlier step; base64 content omitted to save memory. Path: " + path + ".]"
+	body := map[string]any{
+		"model": "deepseek-v4-pro",
+		"messages": []any{
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "@photo.png 图片在这里"}}},
+			map[string]any{
+				"role":    "assistant",
+				"content": nil,
+				"tool_calls": []any{
+					map[string]any{
+						"id":   "call_1",
+						"type": "function",
+						"function": map[string]any{
+							"name":      "read",
+							"arguments": string(args),
+						},
+					},
+				},
+			},
+			map[string]any{"role": "tool", "tool_call_id": "call_1", "content": placeholder},
+			map[string]any{"role": "user", "content": "<system_reminder>The tool call completed.</system_reminder>"},
+		},
+	}
+	b, _ := json.Marshal(body)
+	return string(b)
+}
+
+// TestCodebuddyBackfillReadToolImages_TrailingSystemReminderTurn is the
+// regression for the 2026-09-11 deepseek-v4-pro report: CodeBuddy IDE appends a
+// `<system_reminder>` user message after every tool result, so the read pair of
+// the CURRENT turn sits before the last user message. The backfill used to skip
+// it as historical and never attach the image, which is why the model answered
+// "I cannot see the image". The image must land on the LAST user message — the
+// only one the upstream adopts.
+func TestCodebuddyBackfillReadToolImages_TrailingSystemReminderTurn(t *testing.T) {
+	dir := t.TempDir()
+	img := writeTestPNG(t, dir, "photo.png")
+	in := buildCodebuddyTrailingReminderBody(img)
+
+	out := codebuddyBackfillReadToolImages([]byte(in))
+	if string(out) == in {
+		t.Fatalf("backfill did not fire for a trailing system_reminder turn; body=%s", out)
+	}
+
+	msgs := gjson.GetBytes(out, "messages").Array()
+	last := msgs[len(msgs)-1]
+	if last.Get("role").String() != "user" {
+		t.Fatalf("last message role = %q, want user", last.Get("role").String())
+	}
+	content := last.Get("content")
+	if !content.IsArray() {
+		t.Fatalf("last user content should be an array after backfill, got %s", content.Raw)
+	}
+	imgURL := ""
+	for _, part := range content.Array() {
+		if part.Get("type").String() == "image_url" {
+			imgURL = part.Get("image_url.url").String()
+		}
+	}
+	if imgURL == "" {
+		t.Fatalf("no image_url part on the last user message: %s", content.Raw)
+	}
+	// The asking user message must not be polluted with the image: the upstream
+	// would ignore it and the model would stay blind.
+	if ask := gjson.GetBytes(out, "messages.0.content"); ask.IsArray() {
+		for _, part := range ask.Array() {
+			if part.Get("type").String() == "image_url" {
+				t.Fatalf("image injected into the asking user message instead of the last one: %s", out)
+			}
+		}
+	}
+}
+
+// TestCodebuddyBackfillReadToolImages_AfterNormalizeContinuation pins the
+// production order normalize -> backfill. normalizeCodebuddyToolMessages appends
+// a synthetic user message when the body ends with a tool message; the backfill
+// must run AFTER it so the image lands on that new last user message instead of
+// being hidden behind it (the upstream only adopts images on the last user
+// message).
+func TestCodebuddyBackfillReadToolImages_AfterNormalizeContinuation(t *testing.T) {
+	dir := t.TempDir()
+	img := writeTestPNG(t, dir, "photo.png")
+	in := []byte(buildCurrentTurnReadToolImageBody(img)) // ends with a tool message
+
+	norm, err := normalizeCodebuddyToolMessages(in)
+	if err != nil {
+		t.Fatalf("normalizeCodebuddyToolMessages: %v", err)
+	}
+	out := codebuddyBackfillReadToolImages(norm)
+
+	msgs := gjson.GetBytes(out, "messages").Array()
+	last := msgs[len(msgs)-1]
+	if last.Get("role").String() != "user" {
+		t.Fatalf("last message role = %q, want user", last.Get("role").String())
+	}
+	found := false
+	for _, part := range last.Get("content").Array() {
+		if part.Get("type").String() == "image_url" && part.Get("image_url.url").String() != "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("image_url missing from the last user message after normalize+backfill: %s", out)
+	}
+}
