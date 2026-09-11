@@ -921,6 +921,15 @@ fn ingest_event(app: &AppHandle, inner: &Arc<RuntimeInner>, value: &Value) {
                         if let Some(success) = value.get("success").and_then(Value::as_bool) {
                             log.success = success;
                         }
+                        let usage_error = value
+                            .get("errorMessage")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|message| !message.is_empty())
+                            .map(str::to_string);
+                        if usage_error.is_some() {
+                            log.error = usage_error;
+                        }
                     }
                     let updated = state.logs[index].clone();
                     state.record_usage(&updated, &prev);
