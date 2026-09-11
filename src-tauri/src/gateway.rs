@@ -1136,11 +1136,16 @@ fn start_service_locked(app: &AppHandle, inner: &Arc<RuntimeInner>) -> Result<Ap
         .arg("--parent-pid")
         .arg(std::process::id().to_string())
         .current_dir(&files.root)
-        .env("CODEBUDDY_DEBUG_BODY", "1")
-        .env("CODEBUDDY_DEBUG_BODY_DIR", files.root.join("debug-log").to_string_lossy().as_ref())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // 请求体转储（debug-log/codebuddy_debug.log）只在「调试日志」开启时启用，
+    // 避免正常使用下持续写入诊断 dump 导致日志无限增长。
+    if state.config.debug_logs {
+        command
+            .env("CODEBUDDY_DEBUG_BODY", "1")
+            .env("CODEBUDDY_DEBUG_BODY_DIR", files.root.join("debug-log").to_string_lossy().as_ref());
+    }
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
