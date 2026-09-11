@@ -135,12 +135,6 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 			return resp, err
 		}
 	}
-	// Historical image rewrite: replace truncated historical image stubs with a
-	// text marker so text-only models do not choke on them.
-	translated = e.rewriteOpenAICompatHistoricalImages(translated, baseModel)
-	// Vision proxy: transparently handle image input for non-vision models on the
-	// OpenAI-compatible (third-party relay) path, mirroring the CodeBuddy executor.
-	translated, _ = e.applyOpenAICompatVisionProxy(ctx, auth, translated, baseModel, nil, reporter)
 	if opts.Alt == "responses/compact" {
 		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
 			translated = updated
@@ -361,17 +355,6 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	translated = helps.SetBoolIfDifferent(translated, "stream_options.include_usage", true)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
-	// Historical image rewrite: replace truncated historical image stubs with a
-	// text marker so text-only models do not choke on them.
-	translated = e.rewriteOpenAICompatHistoricalImages(translated, baseModel)
-
-	// Vision proxy: detect whether this request needs preprocess (describe images
-	// via the vision model first, then continue with the text-only model). When
-	// needed, we keep the image-bearing body intact here and describe it inside
-	// the stream goroutine so the description can be forwarded to the client in
-	// real time without tripping the relay stream-open watchdog.
-	needsPreprocess := e.openAICompatVisionNeedsPreprocess(translated, baseModel)
-
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
@@ -384,50 +367,6 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				}
 			}
 		}()
-
-		// Preprocess streaming: describe the images via the vision model first,
-		// forwarding each description delta to the client in real time, then
-		// rewrite the image parts into text and continue with the text-only
-		// model. The initial role chunk opens the stream immediately so the
-		// relay's stream-open watchdog does not trip during the multi-second
-		// vision call.
-		if needsPreprocess {
-			visionModel := e.cfg.CodebuddyVision.VisionModel()
-			emit := func(line []byte) bool {
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: line}:
-					return true
-				case <-ctx.Done():
-					return false
-				}
-			}
-			initChunk := buildCodebuddyVisionChunk("", baseModel, 0, nil, "assistant")
-			if initChunk != nil && !emit(initChunk) {
-				return
-			}
-			descriptions, visionUsage, descErr := e.describeOpenAICompatImages(ctx, auth, translated, visionModel, e.cfg.CodebuddyVision.PreprocessPrompt, baseModel, emit)
-			if descErr != nil {
-				log.Warnf("openai compat vision proxy: preprocess stream failed for %s (vision=%s): %v; omitting images", baseModel, visionModel, descErr)
-				translated = replaceCodebuddyImagesWithText(translated, codebuddyOmittedImageText)
-			} else {
-				log.Infof("openai compat vision proxy: preprocessed %d image(s) for %s via %s", len(descriptions), baseModel, visionModel)
-				translated = replaceCodebuddyImagesWithDescriptions(translated, descriptions, codebuddyOmittedImageText)
-				reporter.PublishAdditionalModelAlways(ctx, visionModel, visionUsage)
-			}
-			// Re-apply stream forcing on the (rewritten) text-only body.
-			var errSet error
-			translated, errSet = sjson.SetBytes(translated, "stream", true)
-			if errSet == nil {
-				translated, errSet = sjson.SetBytes(translated, "stream_options.include_usage", true)
-			}
-			if errSet != nil {
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Err: errSet}:
-				case <-ctx.Done():
-				}
-				return
-			}
-		}
 
 		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 		if errReq != nil {

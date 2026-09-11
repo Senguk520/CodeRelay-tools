@@ -114,7 +114,6 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		APIKey:              apiKey,
 		RequestID:           requestID,
 		ReasoningEffort:     reasoningEffort,
-		VisionSubagent:      record.VisionSubagent,
 		ServiceTier:         serviceTier,
 		ResponseServiceTier: responseServiceTier,
 	})
@@ -137,7 +136,6 @@ type queuedUsageDetail struct {
 	APIKey              string                   `json:"api_key"`
 	RequestID           string                   `json:"request_id"`
 	ReasoningEffort     string                   `json:"reasoning_effort"`
-	VisionSubagent      bool                     `json:"vision_subagent"`
 	ServiceTier         string                   `json:"service_tier"`
 	ResponseServiceTier string                   `json:"response_service_tier,omitempty"`
 }

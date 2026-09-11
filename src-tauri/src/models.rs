@@ -118,9 +118,6 @@ pub struct ServiceConfig {
     pub max_retries: u8,
     pub routing_strategy: String,
     pub session_affinity: bool,
-    pub vision_tool_enabled: bool,
-    pub vision_mode: String,
-    pub vision_model: String,
     pub image_generation_mode: String,
     pub debug_logs: bool,
 }
@@ -136,9 +133,6 @@ impl Default for ServiceConfig {
             max_retries: 2,
             routing_strategy: "auto".to_string(),
             session_affinity: true,
-            vision_tool_enabled: true,
-            vision_mode: "preprocess".to_string(),
-            vision_model: "hy4-preview".to_string(),
             image_generation_mode: "enabled".to_string(),
             debug_logs: false,
         }
@@ -230,6 +224,34 @@ impl DayStats {
         self.total_tokens = add_i64_to_u64(self.total_tokens, delta_tokens);
         self.cache_hit_tokens = add_i64_to_u64(self.cache_hit_tokens, delta_cache_hit_tokens);
         self.credit += delta_credit;
+    }
+
+    /// 缓存命中状态在 usage 事件中才确定（晚于 request_completed 到达）。
+    /// 完成时 cache_hit 恒为 false（小时桶先按 miss 计数），
+    /// 命中状态变化时把小时桶中的一次请求从 miss 挪到 hit（或反向）。
+    fn reclassify_hour_hit(&mut self, ts_ms: i64, hit: bool) {
+        self.ensure_by_hour();
+        let bucket = Self::hour_bucket(ts_ms);
+        if hit {
+            self.by_hour[bucket].miss = self.by_hour[bucket].miss.saturating_sub(1);
+            self.by_hour[bucket].hit = self.by_hour[bucket].hit.saturating_add(1);
+        } else {
+            self.by_hour[bucket].hit = self.by_hour[bucket].hit.saturating_sub(1);
+            self.by_hour[bucket].miss = self.by_hour[bucket].miss.saturating_add(1);
+        }
+    }
+
+    /// 成败状态在 usage 事件中才最终确定（流式请求 HTTP 200 开流后仍可能失败）。
+    /// 完成时按 HTTP 状态先记成功，usage 事件发现失败时把一次计数从成功挪到失败（或反向）。
+    fn reclassify_success(&mut self, success: bool) {
+        self.ensure_by_hour();
+        if success {
+            self.failure_count = self.failure_count.saturating_sub(1);
+            self.success_count = self.success_count.saturating_add(1);
+        } else {
+            self.success_count = self.success_count.saturating_sub(1);
+            self.failure_count = self.failure_count.saturating_add(1);
+        }
     }
 }
 
@@ -371,6 +393,8 @@ impl AppState {
     }
 
     /// 记录一次"用量"：按 (新值 - 旧值) 差量累加 token/缓存/credit 到 当日/累计，并同步今天快照。
+    /// request_completed 先于 usage 到达：完成时 cache_hit 恒为 false（小时桶先记 miss），
+    /// 因此命中状态变化时还需同步修正小时桶的 hit/miss 计数。
     pub fn record_usage(&mut self, log: &RequestLog, prev: &RequestLog) {
         let new_tokens = log.input_tokens.saturating_add(log.output_tokens) as i64;
         let prev_tokens = prev.input_tokens.saturating_add(prev.output_tokens) as i64;
@@ -379,10 +403,39 @@ impl AppState {
         let prev_cache = if prev.cache_hit { prev.input_tokens } else { 0 } as i64;
         let delta_cache = new_cache - prev_cache;
         let delta_credit = log.credit - prev.credit;
-        if delta_tokens == 0 && delta_cache == 0 && delta_credit.abs() < f64::EPSILON {
+        let key = Self::local_date_key(log.timestamp);
+        let hit_changed = log.cache_hit != prev.cache_hit;
+        if hit_changed {
+            self.stats
+                .by_day
+                .entry(key.clone())
+                .or_default()
+                .reclassify_hour_hit(log.timestamp, log.cache_hit);
+            self.stats
+                .lifetime
+                .reclassify_hour_hit(log.timestamp, log.cache_hit);
+        }
+        // usage 事件可能携带最终成败结果（流式请求中途失败时 request_completed 仍为 200）。
+        // 成败变化时同步修正当日/累计的成功与失败计数。
+        let success_changed = log.success != prev.success;
+        if success_changed {
+            self.stats
+                .by_day
+                .entry(key.clone())
+                .or_default()
+                .reclassify_success(log.success);
+            self.stats
+                .lifetime
+                .reclassify_success(log.success);
+        }
+        if delta_tokens == 0
+            && delta_cache == 0
+            && delta_credit.abs() < f64::EPSILON
+            && !hit_changed
+            && !success_changed
+        {
             return;
         }
-        let key = Self::local_date_key(log.timestamp);
         self.stats
             .by_day
             .entry(key)

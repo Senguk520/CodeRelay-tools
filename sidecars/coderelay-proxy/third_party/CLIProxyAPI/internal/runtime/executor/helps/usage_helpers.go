@@ -42,7 +42,6 @@ type UsageReporter struct {
 	ttftStart       time.Time
 	ttftSet         bool
 	once            sync.Once
-	visionSubagent  bool
 }
 
 // Model returns the model label this reporter will publish.
@@ -51,14 +50,6 @@ func (r *UsageReporter) Model() string {
 		return ""
 	}
 	return r.model
-}
-
-// MarkVisionSubagent flags this reporter's record as handled by the pure-text
-// vision sub-agent loop, so the UI can render a "视" badge next to the model.
-func (r *UsageReporter) MarkVisionSubagent() {
-	if r != nil {
-		r.visionSubagent = true
-	}
 }
 
 type usageExecutor interface {
@@ -141,37 +132,6 @@ func (r *UsageReporter) PublishAdditionalModel(ctx context.Context, model string
 		return
 	}
 	r.publishRecord(ctx, record)
-}
-
-// PublishAdditionalModelAlways is like PublishAdditionalModel but also publishes
-// a record when the detail has all-zero token usage. It is used for the vision
-// sub-model path: the sub-model's usage may parse to all-zero (e.g. when the
-// upstream omits or renames token fields), but the request itself still happened
-// and must remain visible in the request log as a distinct additional-model
-// record alongside the base model.
-func (r *UsageReporter) PublishAdditionalModelAlways(ctx context.Context, model string, detail usage.Detail) {
-	record, ok := r.buildAdditionalModelRecordAlways(model, detail)
-	if !ok {
-		return
-	}
-	r.publishRecord(ctx, record)
-}
-
-// buildAdditionalModelRecordAlways is buildAdditionalModelRecord with an
-// all-zero-token fallback: it returns a record even when the detail carries no
-// token figures, so the additional-model request is never silently dropped.
-func (r *UsageReporter) buildAdditionalModelRecordAlways(model string, detail usage.Detail) (usage.Record, bool) {
-	record, ok := r.buildAdditionalModelRecord(model, detail)
-	if ok {
-		return record, true
-	}
-	if r == nil || strings.TrimSpace(model) == "" {
-		return usage.Record{}, false
-	}
-	// Fall back to an all-zero record so the vision sub-model's request is
-	// still recorded even without token figures.
-	var noFailure usage.Failure
-	return r.buildRecordForModel(model, normalizeUsageDetailTotal(usage.Detail{}, r.provider, r.executorType), false, noFailure), true
 }
 
 func (r *UsageReporter) SetTranslatedReasoningEffort(payload []byte, format string) {
@@ -344,7 +304,6 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		ServiceTier:         r.serviceTier,
 		ResponseServiceTier: strings.TrimSpace(detail.ResponseServiceTier),
 		Generate:            usage.GenerateFlag(r.generate),
-		VisionSubagent:      r.visionSubagent,
 		RequestedAt:         r.requestedAt,
 		Latency:             r.latency(),
 		TTFT:                r.ttftDuration(),

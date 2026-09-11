@@ -255,7 +255,7 @@ func TestCodexClientModelsResponseShape(t *testing.T) {
 }
 
 func TestCodebuddyModelsResponseReportsInputModalities(t *testing.T) {
-	models := []string{"hy3", "hy3-preview", "deepseek-v4-pro", "deepseek-v4-flash", "hunyuan-2.0-instruct"}
+	models := []string{"hy3", "hy3-preview", "deepseek-v4-pro", "deepseek-v4-flash", "hunyuan-2.0-instruct", "glm-5v-turbo"}
 
 	modalitiesFor := func(response gin.H, modelID string) []any {
 		data, ok := response["data"].([]gin.H)
@@ -281,22 +281,20 @@ func TestCodebuddyModelsResponseReportsInputModalities(t *testing.T) {
 		}
 	}
 
-	// 情况1：vision-proxy 启用（默认 preprocess）——所有模型都报 image，
-	// 因为反代能透明处理纯文本模型的图片（描述后回填）。
-	enabled := buildModelsResponse(models, true)
-	for _, m := range models {
-		assertModalities(enabled, m, []any{"text", "image"})
-	}
-
-	// 情况2：vision-proxy 关闭——仅后端原生支持视觉的模型报 image。
-	// hy3/hy3-preview（app.asar supportsImages）报 image；
-	// deepseek（已移出白名单，后端返回拒绝）与 hunyuan（假视觉）报 text。
-	disabled := buildModelsResponse(models, false)
-	assertModalities(disabled, "hy3", []any{"text", "image"})
-	assertModalities(disabled, "hy3-preview", []any{"text", "image"})
-	assertModalities(disabled, "deepseek-v4-pro", []any{"text"})
-	assertModalities(disabled, "deepseek-v4-flash", []any{"text"})
-	assertModalities(disabled, "hunyuan-2.0-instruct", []any{"text"})
+	// 图片能力判定 = 在线清单 supportsImages + registry 里的实测校正表
+	// （排除 glm-5v-turbo，补入 glm-5.1 / deepseek-v3-2-volc）。
+	// 单测环境下 codebuddySynced 为空、回退静态 models.json：
+	// hy3/hy3-preview 在静态目录中含 supportsImages，报 image；
+	// deepseek（静态目录未标记图片能力）与 hunyuan（无图片能力）报 text；
+	// glm-5v-turbo 由校正表强制排除，即使目录误标也报 text。
+	// 注意：运行态同步到在线清单后，deepseek-v4.x 会被标记为图片能力 → 报 image。
+	response := buildModelsResponse(models)
+	assertModalities(response, "hy3", []any{"text", "image"})
+	assertModalities(response, "hy3-preview", []any{"text", "image"})
+	assertModalities(response, "deepseek-v4-pro", []any{"text"})
+	assertModalities(response, "deepseek-v4-flash", []any{"text"})
+	assertModalities(response, "hunyuan-2.0-instruct", []any{"text"})
+	assertModalities(response, "glm-5v-turbo", []any{"text"})
 }
 
 func TestCodexClientModelsResponsePreserves56Template(t *testing.T) {
@@ -443,23 +441,6 @@ func TestCodexClientModelsResponseDoesNotInjectFastMode(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestRequestVisionDetectionIgnoresToolSchemaFieldNames(t *testing.T) {
-	body := []byte(`{
-		"model":"deepseek-v4-pro",
-		"tools":[{
-			"type":"function",
-			"name":"inspect_url",
-			"parameters":{
-				"type":"object",
-				"properties":{"image_url":{"type":"string"}}
-			}
-		}]
-	}`)
-	if requestHasVisionInput(body) {
-		t.Fatal("tool schema field names must not be treated as image input")
 	}
 }
 

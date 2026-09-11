@@ -256,33 +256,3 @@ func TestUsageReporterBuildAdditionalModelRecordSkipsZeroTokens(t *testing.T) {
 	}
 }
 
-func TestUsageReporterBuildAdditionalModelRecordAlwaysKeepsZeroTokens(t *testing.T) {
-	reporter := &UsageReporter{
-		provider:    "codebuddy",
-		model:       "deepseek-v4-pro",
-		requestedAt: time.Now(),
-	}
-
-	// All-zero token usage must still produce a record for the vision sub-model
-	// path, so the request remains visible in the request log.
-	record, ok := reporter.buildAdditionalModelRecordAlways("hy3-preview", usage.Detail{})
-	if !ok {
-		t.Fatalf("expected all-zero token usage to still produce a record")
-	}
-	if record.Model != "hy3-preview" {
-		t.Fatalf("record model = %q, want %q", record.Model, "hy3-preview")
-	}
-	if record.Provider != "codebuddy" {
-		t.Fatalf("record provider = %q, want %q", record.Provider, "codebuddy")
-	}
-
-	// Non-zero usage still records normally.
-	if _, ok := reporter.buildAdditionalModelRecordAlways("hy3-preview", usage.Detail{InputTokens: 2}); !ok {
-		t.Fatalf("expected non-zero token usage to be recorded")
-	}
-
-	// Empty model still dropped (nothing meaningful to record).
-	if _, ok := reporter.buildAdditionalModelRecordAlways("   ", usage.Detail{InputTokens: 2}); ok {
-		t.Fatalf("expected empty model to be skipped")
-	}
-}

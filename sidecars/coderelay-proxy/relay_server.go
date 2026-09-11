@@ -574,7 +574,7 @@ func (s *relayServer) handleModels(c *gin.Context) {
 		c.JSON(http.StatusOK, buildCodexClientModelsResponse(models, spec, contextWindowsForAPIKey(s.manifest, spec)))
 		return
 	}
-	c.JSON(http.StatusOK, buildModelsResponse(models, s.manifest.visionProxyEnabled()))
+	c.JSON(http.StatusOK, buildModelsResponse(models))
 }
 
 func (s *relayServer) handleResponses(c *gin.Context) {

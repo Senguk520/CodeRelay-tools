@@ -84,28 +84,4 @@ func TestCodebuddyEffectiveStatus_SuccessUntouched(t *testing.T) {
 	}
 }
 
-// --- agentic tool_choice reset ---------------------------------------------
 
-func TestInjectCodebuddyInspectTool_ResetsStaleToolChoice(t *testing.T) {
-	body := []byte(`{"model":"deepseek-v4-pro","tool_choice":{"type":"function","function":{"name":"read_file"}},"messages":[{"role":"user","content":"hi"}]}`)
-	out := injectCodebuddyInspectTool(body, 1)
-	if got := gjson.GetBytes(out, "tool_choice").String(); got != "auto" {
-		t.Fatalf("tool_choice = %q, want %q; out=%s", got, "auto", out)
-	}
-}
-
-func TestInjectCodebuddyInspectTool_ResetsRequiredToolChoice(t *testing.T) {
-	body := []byte(`{"model":"deepseek-v4-pro","tool_choice":"required","messages":[{"role":"user","content":"hi"}]}`)
-	out := injectCodebuddyInspectTool(body, 1)
-	if got := gjson.GetBytes(out, "tool_choice").String(); got != "auto" {
-		t.Fatalf("tool_choice = %q, want %q; out=%s", got, "auto", out)
-	}
-}
-
-func TestInjectCodebuddyInspectTool_AddsToolChoiceWhenAbsent(t *testing.T) {
-	body := []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`)
-	out := injectCodebuddyInspectTool(body, 1)
-	if got := gjson.GetBytes(out, "tool_choice").String(); got != "auto" {
-		t.Fatalf("tool_choice = %q, want %q; out=%s", got, "auto", out)
-	}
-}

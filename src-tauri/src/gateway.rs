@@ -458,20 +458,6 @@ fn prepare_runtime_files(
     if api_keys.is_empty() {
         return Err("没有启用的 API Key，请先创建以 sk- 开头的 Key".to_string());
     }
-    let vision_mode = if state.config.vision_tool_enabled {
-        let mode = state.config.vision_mode.trim();
-        match mode {
-            "routing" | "preprocess" | "agentic" => mode,
-            _ => "preprocess",
-        }
-    } else {
-        "off"
-    };
-    let vision_model = if state.config.vision_model.trim().is_empty() {
-        "hy4-preview".to_string()
-    } else {
-        state.config.vision_model.trim().to_string()
-    };
     let config = json!({
         "host": state.config.bind_host,
         "port": state.config.port,
@@ -493,7 +479,6 @@ fn prepare_runtime_files(
         },
         "image-generation-mode": state.config.image_generation_mode,
         "max-concurrent-image-requests": 1,
-        "codebuddy-vision": { "mode": vision_mode, "model": vision_model, "max-tool-rounds": 3 },
     });
     let manifest_keys: Vec<Value> = state
         .keys
@@ -525,8 +510,6 @@ fn prepare_runtime_files(
         "debugLogs": state.config.debug_logs,
         "imageGenerationMode": state.config.image_generation_mode,
         "imageModels": ["codebuddy-image-1"],
-        "visionMode": vision_mode,
-        "visionModel": vision_model,
     });
     atomic_write(
         &files.config_path,
@@ -921,6 +904,15 @@ fn ingest_event(app: &AppHandle, inner: &Arc<RuntimeInner>, value: &Value) {
                         if let Some(success) = value.get("success").and_then(Value::as_bool) {
                             log.success = success;
                         }
+                        let usage_error = value
+                            .get("errorMessage")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|message| !message.is_empty())
+                            .map(str::to_string);
+                        if usage_error.is_some() {
+                            log.error = usage_error;
+                        }
                     }
                     let updated = state.logs[index].clone();
                     state.record_usage(&updated, &prev);
@@ -1144,11 +1136,16 @@ fn start_service_locked(app: &AppHandle, inner: &Arc<RuntimeInner>) -> Result<Ap
         .arg("--parent-pid")
         .arg(std::process::id().to_string())
         .current_dir(&files.root)
-        .env("CODEBUDDY_DEBUG_BODY", "1")
-        .env("CODEBUDDY_DEBUG_BODY_DIR", files.root.join("debug-log").to_string_lossy().as_ref())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // 请求体转储（debug-log/codebuddy_debug.log）只在「调试日志」开启时启用，
+    // 避免正常使用下持续写入诊断 dump 导致日志无限增长。
+    if state.config.debug_logs {
+        command
+            .env("CODEBUDDY_DEBUG_BODY", "1")
+            .env("CODEBUDDY_DEBUG_BODY_DIR", files.root.join("debug-log").to_string_lossy().as_ref());
+    }
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;

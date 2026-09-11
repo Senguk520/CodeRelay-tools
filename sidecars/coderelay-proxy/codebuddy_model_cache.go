@@ -19,7 +19,7 @@ const codebuddyModelCacheFilename = "codebuddy_models_cache.json"
 // codebuddyModelCache is the persisted form of the CodeBuddy model catalog.
 // Models are stored in full (not just IDs) so capability fields such as
 // SupportsImages / ContextLength / MaxCompletionTokens survive a reload, which
-// vision-proxy routing and max_tokens clamping depend on.
+// max_tokens clamping and image-capability checks depend on.
 type codebuddyModelCache struct {
 	Version  int                           `json:"version"`
 	SyncedAt string                        `json:"syncedAt,omitempty"`
