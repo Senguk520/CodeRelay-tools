@@ -18,7 +18,7 @@ name: CodeRelay CodeQL config
 # .github/workflows/codeql.yml, step "Build Go sidecar", which moves the
 # vendored snapshot out of the workspace before building. Do not remove that
 # step believing this file already covers it — it does not.
-# See docs/codeql-vendored-go-exclusion.md for the evidence.
+# (Mechanism: github/codeql, go/extractor/extractor.go — `excludedDirs`.)
 #
 # third_party/CLIProxyAPI is a vendored snapshot of an upstream project
 # (see sidecars/coderelay-proxy/UPSTREAM.md). Findings inside it are triaged

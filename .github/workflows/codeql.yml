@@ -89,7 +89,9 @@ jobs:
       # out of the workspace before building puts it in exactly that category,
       # while the replace directive keeps it available to the compiler.
       #
-      # Rationale and sources: docs/codeql-vendored-go-exclusion.md
+      # Mechanism reference: github/codeql, go/extractor/extractor.go — its
+      # `excludedDirs` slice is seeded with a `..` pattern, which is what makes
+      # out-of-root dependencies get skipped.
       - name: Build Go sidecar
         if: matrix.language == 'go'
         working-directory: sidecars/coderelay-proxy
