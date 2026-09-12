@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # Go has to be installed BEFORE `codeql-action/init`, because init injects
       # its own `go` wrapper (the go-tracing shim) so it can record which files
@@ -46,7 +46,7 @@ jobs:
       # build any of it" (exit code 32).
       - name: Set up Go
         if: matrix.language == 'go'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: sidecars/coderelay-proxy/go.mod
           cache-dependency-path: sidecars/coderelay-proxy/go.sum
@@ -60,10 +60,33 @@ jobs:
 
       # The repo has no go.mod at its root; the sidecar is its own module and
       # pulls the vendored CLIProxyAPI copy in through a replace directive.
+      #
+      # `paths-ignore` in the CodeQL config does NOT apply to Go. That option is
+      # limited to interpreted languages, or to compiled languages analysed
+      # without a build (C/C++, C#, Java, Rust). Go is built here, so per the
+      # CodeQL docs the exclusion has to happen in this build step instead.
+      #
+      # The CodeQL Go extractor decides what to extract by measuring each
+      # package's directory against the source root: anything that resolves to a
+      # path beginning with `..` is reported as "Skipping dependency package"
+      # and left out of the database. That is why ordinary module cache
+      # dependencies never show up as alerts here. Moving the vendored snapshot
+      # out of the workspace before building puts it in exactly that category,
+      # while the replace directive keeps it available to the compiler.
+      #
+      # Rationale and sources: docs/codeql-vendored-go-exclusion.md
       - name: Build Go sidecar
         if: matrix.language == 'go'
         working-directory: sidecars/coderelay-proxy
-        run: go build ./...
+        run: |
+          set -euo pipefail
+          # $RUNNER_TEMP and the workspace share a filesystem on GitHub-hosted
+          # runners, so this is a directory rename, not a copy of 1293 files.
+          EXT="$RUNNER_TEMP/coderelay-ext"
+          mkdir -p "$EXT"
+          mv third_party/CLIProxyAPI "$EXT/CLIProxyAPI"
+          go mod edit -replace github.com/router-for-me/CLIProxyAPI/v7="$EXT/CLIProxyAPI"
+          go build ./...
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4

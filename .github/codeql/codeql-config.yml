@@ -1,13 +1,28 @@
 name: CodeRelay CodeQL config
 
+# SCOPE OF THE LISTS BELOW
+# ------------------------
+# `paths` / `paths-ignore` only apply to languages analysed WITHOUT a build:
+# the interpreted ones (Python, Ruby, JavaScript/TypeScript), plus the compiled
+# ones supported by `build-mode: none` (C/C++, C#, Java, Rust).
+# GitHub Docs: "For analysis where code is built, if you want to limit code
+# scanning to specific directories in your project, you must specify
+# appropriate build steps in the workflow."
+#
+# In this repository that means:
+#   * javascript-typescript runs with `build-mode: none`  -> the lists APPLY.
+#   * go runs with `build-mode: manual`                   -> the lists DO NOT APPLY.
+#
+# So the `third_party` entries below do nothing for Go, despite appearances.
+# Excluding third_party/CLIProxyAPI from the Go analysis is done in
+# .github/workflows/codeql.yml, step "Build Go sidecar", which moves the
+# vendored snapshot out of the workspace before building. Do not remove that
+# step believing this file already covers it — it does not.
+# See docs/codeql-vendored-go-exclusion.md for the evidence.
+#
 # third_party/CLIProxyAPI is a vendored snapshot of an upstream project
 # (see sidecars/coderelay-proxy/UPSTREAM.md). Findings inside it are triaged
-# against upstream rather than this repository, so the path is excluded to keep
-# code scanning focused on first-party code.
-#
-# Note: this only filters results. The vendored sources are still compiled,
-# because sidecars/coderelay-proxy/go.mod replaces the CLIProxyAPI module with
-# the local copy under third_party/.
+# against upstream rather than this repository.
 paths-ignore:
   - third_party
   - "**/third_party/**"
