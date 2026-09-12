@@ -1,0 +1,18 @@
+name: CodeRelay CodeQL config
+
+# third_party/CLIProxyAPI is a vendored snapshot of an upstream project
+# (see sidecars/coderelay-proxy/UPSTREAM.md). Findings inside it are triaged
+# against upstream rather than this repository, so the path is excluded to keep
+# code scanning focused on first-party code.
+#
+# Note: this only filters results. The vendored sources are still compiled,
+# because sidecars/coderelay-proxy/go.mod replaces the CLIProxyAPI module with
+# the local copy under third_party/.
+paths-ignore:
+  - third_party
+  - "**/third_party/**"
+  - node_modules
+  - "**/node_modules/**"
+  - dist
+  - "**/dist/**"
+  - "**/target/**"
