@@ -207,20 +207,46 @@ go mod edit -replace github.com/router-for-me/CLIProxyAPI/v7="$EXT/CLIProxyAPI"
 
 ## 9. 关于配置文件里 `paths-ignore` 的处置
 
-`codeql-config.yml` 中的 `paths-ignore` **不应删除**，但其中 `third_party` 条目对 Go 是死代码：
+`codeql-config.yml` 中的 `paths-ignore` **不应删除**。关键认知是：**同一条目对不同语言的有效性完全不同。**
 
-| 条目 | 对 Go | 对 JavaScript/TypeScript |
-| --- | --- | --- |
-| `third_party` / `**/third_party/**` | 无效（Go 走 manual 构建） | 有效（JS/TS 走 `build-mode: none`），但本仓库前端源码不在该路径下，属防御性保留 |
-| `node_modules` / `**/node_modules/**` | 无效 | **有效且必要** |
-| `dist` / `**/dist/**` | 无效 | **有效且必要** |
-| `**/target/**` | 无效 | 有效（Rust 不在 CodeQL 支持范围内，属防御性保留） |
+| 条目 | 对 Go | 对 Rust | 对 JavaScript/TypeScript |
+| --- | --- | --- | --- |
+| `third_party` / `**/third_party/**` | 无效（Go 必须编译） | **有效且必要**（排除 vendored 的 `examples/plugin/*/rust/`） | 有效，但前端源码不在该路径下，属防御性保留 |
+| `node_modules` / `**/node_modules/**` | 无效 | 无效 | **有效且必要** |
+| `dist` / `**/dist/**` | 无效 | 无效 | **有效且必要** |
+| `**/target/**` | 无效 | 有效（`target/` 是 Cargo 构建产物目录） | 有效 |
 
 因此配置文件里必须留下注释，说明 Go 的排除发生在构建步骤，避免后续维护者看到 `third_party` 条目仍在就误以为机制还在生效、进而删除构建步骤里的移动逻辑。
 
 ---
 
-## 10. 引用来源
+## 10. 补充：Rust 是另一回事，`paths-ignore` 对它是有效的
+
+`sidecars/coderelay-proxy/third_party/CLIProxyAPI/examples/plugin/*/rust/src/lib.rs`（15 个文件）里是 vendored 的 Rust 代码，它产生的是另一类告警 —— 14 条 `Access of invalid pointer`。
+
+**Rust 不需要第 4 节那套移动目录的手法。** 依据：
+
+- CodeQL 的支持语言列表中包含 Rust（variants: Rust editions 2021 与 2024；extensions: `.rs`、`Cargo.toml`）。
+- Rust 属于支持 `build-mode: none` 的语言组（C/C++、C#、Java、Rust）。
+
+正因为它是「不构建即可分析」的语言，`paths-ignore` 对它**直接生效** —— 这正是第 2 节那条官方规则的**正面情形**。所以 vendored 的 Rust 代码由配置文件排除，而不是靠移动文件。
+
+**但必须显式声明 `language: rust`。** 这是本仓库踩过的坑：早期 workflow 的 matrix 里只有 `go` 与 `javascript-typescript`，并附了一句「Rust (src-tauri/) is not a CodeQL-supported language」（**该说法是错的**）。从 default setup 切换到 advanced setup 之后，Rust 再没有被分析过，于是既有 Rust 告警成了**孤儿**：没有任何分析会重新评估它们，**已经修好的也永远停在 open**。
+
+workflow 里的正确写法：
+
+```yaml
+          - language: rust
+            build-mode: none
+```
+
+无需额外安装 `rustup` / `cargo`：GitHub 托管的 `ubuntu-latest` 已预装 Rust 工具链，`codeql-action` 自己的 Rust 测试 workflow（`.github/workflows/__rust.yml`）也不含任何工具链准备步骤。CodeQL 要求工具链不是 nightly —— 本仓库无 `rust-toolchain.toml`，不存在这个风险。
+
+> **与第 4 节的对照**：Go 因为必须编译，配置层的 `paths-ignore` 完全无效；Rust 因为免构建，配置层直接有效。判断某个语言该用哪种机制，只需回答一个问题 —— **它是「不构建即可分析」的语言吗？**
+
+---
+
+## 11. 引用来源
 
 | 编号 | 内容 | 来源 |
 | --- | --- | --- |

@@ -28,10 +28,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Rust (src-tauri/) is not a CodeQL-supported language.
           - language: go
             build-mode: manual
           - language: javascript-typescript
+            build-mode: none
+          # Rust (src-tauri/) IS supported by CodeQL, and runs with build-mode:
+          # none — no build step and no extra toolchain setup are needed.
+          #
+          # It matters here for two reasons. First, switching from default setup
+          # to advanced setup silently dropped Rust coverage, which left the
+          # existing Rust alerts orphaned: with no Rust analysis running, nothing
+          # ever re-evaluates them, so fixed findings stay open forever.
+          #
+          # Second, Rust is the one case where `paths-ignore` in the CodeQL
+          # config actually works. That option applies to languages analysed
+          # without a build, and Rust is in that group (C/C++, C#, Java, Rust) —
+          # unlike Go, which is built and therefore needs the build-step
+          # exclusion described below. So the vendored Rust examples under
+          # third_party are filtered by the config file, not by moving files.
+          - language: rust
             build-mode: none
 
     steps:
