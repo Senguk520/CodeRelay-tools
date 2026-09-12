@@ -242,6 +242,8 @@ workflow 里的正确写法：
 
 无需额外安装 `rustup` / `cargo`：GitHub 托管的 `ubuntu-latest` 已预装 Rust 工具链，`codeql-action` 自己的 Rust 测试 workflow（`.github/workflows/__rust.yml`）也不含任何工具链准备步骤。CodeQL 要求工具链不是 nightly —— 本仓库无 `rust-toolchain.toml`，不存在这个风险。
 
+**补回 Rust 覆盖的直接后果**（预期行为，非回归）：该分析一上线就在首方代码里报出一条新告警 `#262`（`src-tauri/src/codebuddy_oauth.rs`）。它与此前的 `#256` 其实是**同一条语句** —— 修 `#256` 时插入的 `transport_error` 函数使行号由 208 漂移到 224。经复核为保守污点传播导致的误报（Token 经 `.bearer_auth()` 进入 HTTP 头，而 `reqwest::Error` 的 `Display` 只含 URL、不含请求头），已按误报关闭。这说明补回覆盖会立刻显现此前被搁置的发现 —— 这是恢复覆盖的目的，不是它带来的麻烦。
+
 > **与第 4 节的对照**：Go 因为必须编译，配置层的 `paths-ignore` 完全无效；Rust 因为免构建，配置层直接有效。判断某个语言该用哪种机制，只需回答一个问题 —— **它是「不构建即可分析」的语言吗？**
 
 ---
