@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/htmlsanitize"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -219,6 +221,26 @@ func (s *OAuthServer) handleCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/success", http.StatusFound)
 }
 
+// defaultPlatformURL is used when the callback carries no usable platform_url.
+const defaultPlatformURL = "https://platform.openai.com"
+
+// sanitizePlatformURL keeps the platform_url query parameter from turning the
+// success page into a script sink: only absolute http/https URLs without
+// embedded credentials are accepted, and everything else falls back to the
+// default console. The returned value is still HTML-escaped before it is
+// substituted, so an attribute breakout is not possible either.
+func sanitizePlatformURL(raw string) string {
+	parsed, errParse := url.Parse(strings.TrimSpace(raw))
+	if errParse != nil {
+		return defaultPlatformURL
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if (scheme != "http" && scheme != "https") || parsed.Host == "" || parsed.User != nil {
+		return defaultPlatformURL
+	}
+	return parsed.String()
+}
+
 // handleSuccess handles the success page endpoint.
 // It serves a user-friendly HTML page indicating that authentication was successful.
 //
@@ -234,10 +256,7 @@ func (s *OAuthServer) handleSuccess(w http.ResponseWriter, r *http.Request) {
 	// Parse query parameters for customization
 	query := r.URL.Query()
 	setupRequired := query.Get("setup_required") == "true"
-	platformURL := query.Get("platform_url")
-	if platformURL == "" {
-		platformURL = "https://platform.openai.com"
-	}
+	platformURL := sanitizePlatformURL(query.Get("platform_url"))
 
 	// Generate success page HTML with dynamic content
 	successHTML := s.generateSuccessHTML(setupRequired, platformURL)
@@ -261,12 +280,15 @@ func (s *OAuthServer) handleSuccess(w http.ResponseWriter, r *http.Request) {
 func (s *OAuthServer) generateSuccessHTML(setupRequired bool, platformURL string) string {
 	html := LoginSuccessHtml
 
+	// Escape the URL before it lands inside the href attribute.
+	escapedPlatformURL := htmlsanitize.String(platformURL)
+
 	// Replace platform URL placeholder
-	html = strings.Replace(html, "{{PLATFORM_URL}}", platformURL, -1)
+	html = strings.Replace(html, "{{PLATFORM_URL}}", escapedPlatformURL, -1)
 
 	// Add setup notice if required
 	if setupRequired {
-		setupNotice := strings.Replace(SetupNoticeHtml, "{{PLATFORM_URL}}", platformURL, -1)
+		setupNotice := strings.Replace(SetupNoticeHtml, "{{PLATFORM_URL}}", escapedPlatformURL, -1)
 		html = strings.Replace(html, "{{SETUP_NOTICE}}", setupNotice, 1)
 	} else {
 		html = strings.Replace(html, "{{SETUP_NOTICE}}", "", 1)

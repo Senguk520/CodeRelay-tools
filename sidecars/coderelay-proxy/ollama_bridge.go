@@ -229,7 +229,7 @@ func ollamaMessageContentToOpenAI(message map[string]any) any {
 	if len(images) == 0 {
 		return text
 	}
-	parts := make([]any, 0, len(images)+1)
+	parts := make([]any, 0, len(images))
 	if text != "" {
 		parts = append(parts, map[string]any{"type": "text", "text": text})
 	}

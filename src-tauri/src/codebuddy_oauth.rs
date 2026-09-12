@@ -204,8 +204,24 @@ fn billing_request(client: &Client, path: &str, access_token: &str, uid: Option<
     request
 }
 
+/// 把传输层错误收敛为固定文案：不回显 URL、请求头与响应体，
+/// 避免 Bearer Token 或查询参数顺着错误信息流入界面与持久化日志。
+fn transport_error(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        "网络请求超时".to_string()
+    } else if error.is_connect() {
+        "连接服务端失败".to_string()
+    } else if error.is_redirect() {
+        "重定向次数过多".to_string()
+    } else if error.is_body() || error.is_decode() {
+        "响应内容读取失败".to_string()
+    } else {
+        "网络请求失败".to_string()
+    }
+}
+
 async fn send_billing(request: reqwest::RequestBuilder, body: Value, label: &str) -> Result<Value, String> {
-    let response = request.json(&body).send().await.map_err(|error| format!("请求{label}失败：{error}"))?;
+    let response = request.json(&body).send().await.map_err(|error| format!("请求{label}失败：{}", transport_error(&error)))?;
     let status = response.status();
     let body: Value = response.json().await.map_err(|error| format!("解析{label}响应失败：{error}"))?;
     if !status.is_success() {

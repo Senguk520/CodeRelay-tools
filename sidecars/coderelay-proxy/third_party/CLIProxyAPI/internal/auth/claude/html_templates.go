@@ -166,7 +166,7 @@ const LoginSuccessHtml = `<!DOCTYPE html>
             <button class="button button-primary" onclick="window.close()">
                 <span>Close Window</span>
             </button>
-            <a href="{{PLATFORM_URL}}" target="_blank" class="button button-secondary">
+            <a href="{{PLATFORM_URL}}" target="_blank" rel="noopener noreferrer" class="button button-secondary">
                 <span>Open Platform</span>
                 <span>↗</span>
             </a>
@@ -214,5 +214,5 @@ const LoginSuccessHtml = `<!DOCTYPE html>
 const SetupNoticeHtml = `
         <div class="setup-notice">
             <h3>Additional Setup Required</h3>
-            <p>To complete your setup, please visit the <a href="{{PLATFORM_URL}}" target="_blank">Claude</a> to configure your account.</p>
+            <p>To complete your setup, please visit the <a href="{{PLATFORM_URL}}" target="_blank" rel="noopener noreferrer">Claude</a> to configure your account.</p>
         </div>`

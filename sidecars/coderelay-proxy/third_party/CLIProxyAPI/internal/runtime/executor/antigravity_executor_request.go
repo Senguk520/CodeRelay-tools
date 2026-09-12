@@ -444,20 +444,39 @@ var antigravityBaseURLFallbackOrder = func(auth *cliproxyauth.Auth) []string {
 	}
 }
 
+// normalizeAntigravityBaseURL accepts only absolute http/https endpoints, so a
+// configured base_url cannot turn the executor into a client for another
+// scheme. An unusable value yields an empty string, which makes the caller fall
+// back to the built-in endpoints.
+func normalizeAntigravityBaseURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	parsed, errParse := url.Parse(trimmed)
+	if errParse != nil {
+		return ""
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if (scheme != "http" && scheme != "https") || parsed.Host == "" {
+		return ""
+	}
+	return strings.TrimSuffix(trimmed, "/")
+}
+
 func resolveCustomAntigravityBaseURL(auth *cliproxyauth.Auth) string {
 	if auth == nil {
 		return ""
 	}
 	if auth.Attributes != nil {
-		if v := strings.TrimSpace(auth.Attributes["base_url"]); v != "" {
-			return strings.TrimSuffix(v, "/")
+		if base := normalizeAntigravityBaseURL(auth.Attributes["base_url"]); base != "" {
+			return base
 		}
 	}
 	if auth.Metadata != nil {
 		if v, ok := auth.Metadata["base_url"].(string); ok {
-			v = strings.TrimSpace(v)
-			if v != "" {
-				return strings.TrimSuffix(v, "/")
+			if base := normalizeAntigravityBaseURL(v); base != "" {
+				return base
 			}
 		}
 	}

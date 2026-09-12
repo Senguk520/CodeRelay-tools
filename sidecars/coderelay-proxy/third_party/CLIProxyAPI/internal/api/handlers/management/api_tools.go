@@ -120,6 +120,17 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
+	// This endpoint deliberately lets a management caller target an arbitrary
+	// upstream endpoint, so the scheme is pinned to the two the HTTP client can
+	// actually speak. Anything else (file:, gopher:, ...) is rejected here
+	// instead of being handed to the transport.
+	switch strings.ToLower(parsedURL.Scheme) {
+	case "http", "https":
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported url scheme"})
+		return
+	}
+
 	requestProxyURL := strings.TrimSpace(body.ProxyURL)
 	if requestProxyURL != "" {
 		if _, errParseProxy := proxyutil.Parse(requestProxyURL); errParseProxy != nil {
