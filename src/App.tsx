@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties, ReactNode } from 'react';
+import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import {
   Activity, AlertTriangle, Ban, CalendarCheck, CalendarDays, Check, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, Clipboard, Cloud,
@@ -281,7 +281,7 @@ export function App() {
         {page === 'service' && <ServicePage state={state} onSave={(config) => void runAction(() => saveConfig(config), '服务配置已保存；服务运行时需重新启动后生效', 'save')} notify={notify} />}
         {page === 'keys' && <KeysPage state={state} onAdd={() => { setEditingKey(null); setShowKeyModal(true); }} onEdit={(key) => { setEditingKey(key); setShowKeyModal(true); }} onSave={(keys) => void runAction(() => saveKeys(keys), 'API Key 已更新', 'save')} notify={notify} />}
         {page === 'logs' && <LogsPage state={state} onClear={() => void runAction(clearLogs, '请求日志已清理', 'save')} notify={notify} />}
-        {page === 'accounts' && <AccountsPage state={state} onAdd={() => { setAccountModalMode('browser'); setShowAccountModal(true); }} onImport={() => { setAccountModalMode('file'); setShowAccountModal(true); }} onSave={(accounts) => void runAction(() => saveAccounts(accounts), '账号列表已更新', 'save')} onRefresh={handleRefreshAccount} onRefreshAll={handleRefreshAll} onCheckin={() => setShowCheckinModal(true)} notify={notify} />}
+        {page === 'accounts' && <AccountsPage state={state} blocked={busy !== null} onAdd={() => { setAccountModalMode('browser'); setShowAccountModal(true); }} onImport={() => { setAccountModalMode('file'); setShowAccountModal(true); }} onSave={(accounts) => void runAction(() => saveAccounts(accounts), '账号列表已更新', 'save')} onRefresh={handleRefreshAccount} onRefreshAll={handleRefreshAll} onCheckin={() => setShowCheckinModal(true)} notify={notify} />}
         {page === 'models' && <ModelsPage state={state} notify={notify} />}
         {page === 'settings' && <SettingsPage onReset={resetLocalState} notify={notify} />}
       </div></div>
@@ -401,7 +401,9 @@ function KeysPage({ state, onAdd, onEdit, onSave, notify }: { state: AppState; o
     const scopeAccounts = key.accountIds ? state.accounts.filter((account) => key.accountIds!.includes(account.id)) : state.accounts.filter((account) => account.status === 'available');
     return { sum: scopeAccounts.reduce((total, account) => total + (account.quota || 0), 0), count: scopeAccounts.length };
   };
-  return <><SectionHeader eyebrow="反代服务 / 访问控制" title="API Key" description="创建客户端访问凭据，并限制它们可以使用的账号和模型范围。" action={<button className="button primary" onClick={onAdd}><Plus size={15} />创建 Key</button>} /><div className="summary-row"><Summary label="全部 Key" value={state.keys.length.toString()} /><Summary label="已启用" value={state.keys.filter((key) => key.enabled).length.toString()} tone="success" /><Summary label="账号范围" value={state.keys.filter((key) => key.accountIds).length ? '已配置' : '全部账号'} /></div><div className="panel table-panel"><div className="table-toolbar"><div className="toolbar-title"><KeyRound size={17} /><strong>客户端凭据</strong><span>{state.keys.length} 个</span></div><span className="muted-text">完整 Key 默认显示，可直接复制</span></div>{state.keys.length ? <div className="data-table key-table"><div className="table-head"><span>名称</span><span>Key</span><span>账号范围</span><span>最近使用</span><span>状态</span><span /></div>{state.keys.map((key) => <div className="table-row" key={key.id}><div className="key-name"><span className="key-avatar"><KeyRound size={14} /></span><div><strong>{key.name}</strong><small>创建于 {formatDate(key.createdAt)}</small></div></div><div className="key-value"><code>{visible.includes(key.id) ? key.key : maskKey(key.key)}</code><IconButton label={visible.includes(key.id) ? '隐藏 Key' : '显示 Key'} onClick={() => toggle(key.id)}>{visible.includes(key.id) ? <EyeOff size={15} /> : <Eye size={15} />}</IconButton><IconButton label="复制 Key" onClick={() => { void copyText(key.key).then(() => notify('API Key 已复制')); }}><Copy size={15} /></IconButton></div><span className="key-scope"><span>{key.accountIds ? `${key.accountIds.length} 个指定账号` : <span className="all-scope"><Globe2 size={13} />全部账号</span>}</span><small className={creditFor(key).sum <= 0 && creditFor(key).count > 0 ? 'key-credit zero' : 'key-credit'}>剩余 {formatNumber(creditFor(key).sum)} credit</small></span><span className="muted-text">{formatDate(key.lastUsed)}</span><label className="switch-small"><input type="checkbox" checked={key.enabled} onChange={(e) => update(key, { enabled: e.target.checked })} /><span /></label><div className="row-actions"><IconButton label="调整账号范围" onClick={() => onEdit(key)}><Pencil size={15} /></IconButton><IconButton label="删除 Key" danger onClick={() => remove(key)}><Trash2 size={15} /></IconButton></div></div>)}</div> : <EmptyState icon={KeyRound} title="还没有 API Key" description="创建一个 Key 后，客户端才能访问本地反代服务。" action={<button className="button primary" onClick={onAdd}><Plus size={15} />创建第一个 Key</button>} />}</div><div className="security-footnote"><span><ShieldCheck size={15} />Key 只用于本机反代鉴权，删除前会要求确认。</span></div></>;
+  // 指定账号按账号池顺序展示，便于和账号池顺序对照。
+  const scopeAccountsFor = (key: ApiKey) => key.accountIds ? state.accounts.filter((account) => key.accountIds!.includes(account.id)) : [];
+  return <><SectionHeader eyebrow="反代服务 / 访问控制" title="API Key" description="创建客户端访问凭据，并限制它们可以使用的账号和模型范围。" action={<button className="button primary" onClick={onAdd}><Plus size={15} />创建 Key</button>} /><div className="summary-row"><Summary label="全部 Key" value={state.keys.length.toString()} /><Summary label="已启用" value={state.keys.filter((key) => key.enabled).length.toString()} tone="success" /><Summary label="账号范围" value={state.keys.filter((key) => key.accountIds).length ? '已配置' : '全部账号'} /></div><div className="panel table-panel"><div className="table-toolbar"><div className="toolbar-title"><KeyRound size={17} /><strong>客户端凭据</strong><span>{state.keys.length} 个</span></div><span className="muted-text">完整 Key 默认显示，可直接复制</span></div>{state.keys.length ? <div className="data-table key-table"><div className="table-head"><span>名称</span><span>Key</span><span>账号范围</span><span>最近使用</span><span>状态</span><span /></div>{state.keys.map((key) => <div className="table-row" key={key.id}><div className="key-name"><span className="key-avatar"><KeyRound size={14} /></span><div><strong>{key.name}</strong><small>创建于 {formatDate(key.createdAt)}</small></div></div><div className="key-value"><code>{visible.includes(key.id) ? key.key : maskKey(key.key)}</code><IconButton label={visible.includes(key.id) ? '隐藏 Key' : '显示 Key'} onClick={() => toggle(key.id)}>{visible.includes(key.id) ? <EyeOff size={15} /> : <Eye size={15} />}</IconButton><IconButton label="复制 Key" onClick={() => { void copyText(key.key).then(() => notify('API Key 已复制')); }}><Copy size={15} /></IconButton></div><span className="key-scope" title={key.accountIds ? `指定账号（按账号池顺序）：${scopeAccountsFor(key).map((account) => account.email).join('、') || '（账号已不存在）'}` : '使用账号池中的全部可用账号'}><span>{key.accountIds ? `${key.accountIds.length} 个指定账号` : <span className="all-scope"><Globe2 size={13} />全部账号</span>}</span><small className={creditFor(key).sum <= 0 && creditFor(key).count > 0 ? 'key-credit zero' : 'key-credit'}>剩余 {formatNumber(creditFor(key).sum)} credit</small></span><span className="muted-text">{formatDate(key.lastUsed)}</span><label className="switch-small"><input type="checkbox" checked={key.enabled} onChange={(e) => update(key, { enabled: e.target.checked })} /><span /></label><div className="row-actions"><IconButton label="调整账号范围" onClick={() => onEdit(key)}><Pencil size={15} /></IconButton><IconButton label="删除 Key" danger onClick={() => remove(key)}><Trash2 size={15} /></IconButton></div></div>)}</div> : <EmptyState icon={KeyRound} title="还没有 API Key" description="创建一个 Key 后，客户端才能访问本地反代服务。" action={<button className="button primary" onClick={onAdd}><Plus size={15} />创建第一个 Key</button>} />}</div><div className="security-footnote"><span><ShieldCheck size={15} />Key 只用于本机反代鉴权，删除前会要求确认。</span></div></>;
 }
 function Summary({ label, value, tone }: { label: string; value: string; tone?: 'success' }) { return <div className="summary-card"><span>{label}</span><strong className={tone}>{value}</strong></div>; }
 
@@ -462,7 +464,66 @@ function LogsPage({ state, onClear, notify }: { state: AppState; onClear: () => 
   </>;
 }
 
-function AccountsPage({ state, onAdd, onImport, onSave, onRefresh, onRefreshAll, onCheckin, notify }: { state: AppState; onAdd: () => void; onImport: () => void; onSave: (accounts: Account[]) => void; onRefresh: (account: Account) => Promise<void>; onRefreshAll: () => Promise<void>; onCheckin: () => void; notify: NoticeHandler }) {
+// 账号池长按拖拽：长按等待、抖动容差、边缘自动滚动、落位弹簧与动量投影参数。
+const ACCOUNT_DRAG_HOLD_MS = 300;
+const ACCOUNT_DRAG_TOLERANCE = 8;
+const ACCOUNT_DRAG_SCROLL_EDGE = 56;
+const ACCOUNT_DRAG_SCROLL_SPEED = 12;
+const ACCOUNT_DRAG_RESPONSE = 0.4;
+const ACCOUNT_DRAG_PROJECTION = 99;
+
+// 顺序落库：停手后合并提交一次，避免连续多次拖拽各触发一次 sidecar 重建；
+// 保存落地后若后端顺序仍不一致（失败/被覆盖），再给一小段宽限才交还本地顺序。
+const ACCOUNT_ORDER_SAVE_DEBOUNCE = 1000;
+const ACCOUNT_ORDER_RELEASE_GRACE = 1500;
+
+// 一次拖拽的可变状态：位置采样用于计算松手速度，host 用于拖到边缘时自动滚动。
+type AccountDragState = {
+  id: string;
+  pointerId: number;
+  startY: number;
+  pointerY: number;
+  dy: number;
+  step: number;
+  maxIndex: number;
+  fromIndex: number;
+  toIndex: number;
+  active: boolean;
+  timer: number | null;
+  raf: number | null;
+  samples: { y: number; t: number }[];
+  host: HTMLElement | null;
+};
+
+// 从目标元素向上找最近的可滚动容器，供拖拽到边缘时自动滚动。
+function findScrollHost(element: HTMLElement | null): HTMLElement | null {
+  let node = element?.parentElement ?? null;
+  while (node) {
+    const overflowY = window.getComputedStyle(node).overflowY;
+    if ((overflowY === 'auto' || overflowY === 'scroll') && node.scrollHeight > node.clientHeight + 1) return node;
+    node = node.parentElement;
+  }
+  return null;
+}
+
+// 松手速度（px/s）：取最近 120ms 的位置采样，用于动量投影与弹簧初速度。
+function releaseVelocity(samples: { y: number; t: number }[]): number {
+  if (samples.length < 2) return 0;
+  const last = samples[samples.length - 1];
+  const first = samples.find((sample) => last.t - sample.t <= 120) ?? samples[0];
+  const elapsed = last.t - first.t;
+  if (elapsed <= 0) return 0;
+  return Math.max(-2000, Math.min(2000, ((last.y - first.y) / elapsed) * 1000));
+}
+
+// 把「可见子集的新顺序」映射回全量数组：隐藏账号保持原绝对位置，可见账号按 newVisibleOrder 依次填充。
+function reorderVisibleAccounts(all: Account[], visibleIds: Set<string>, newVisibleOrder: string[]): Account[] {
+  const byId = new Map(all.map((account) => [account.id, account]));
+  let cursor = 0;
+  return all.map((account) => (visibleIds.has(account.id) ? byId.get(newVisibleOrder[cursor++]) ?? account : account));
+}
+
+function AccountsPage({ state, blocked, onAdd, onImport, onSave, onRefresh, onRefreshAll, onCheckin, notify }: { state: AppState; blocked: boolean; onAdd: () => void; onImport: () => void; onSave: (accounts: Account[]) => void; onRefresh: (account: Account) => Promise<void>; onRefreshAll: () => Promise<void>; onCheckin: () => void; notify: NoticeHandler }) {
   const [query, setQuery] = useState('');
   const [region, setRegion] = useState<'all' | 'cn'>('all');
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
@@ -482,12 +543,279 @@ function AccountsPage({ state, onAdd, onImport, onSave, onRefresh, onRefreshAll,
   const remove = (account: Account) => {
     const bindings = state.keys.filter((key) => key.accountIds?.includes(account.id));
     const bindingText = bindings.length ? `\n\n绑定的 API Key：${bindings.map((key) => key.name).join('、')}。删除后这些 Key 不会自动停用，但将无法使用该账号。` : '';
-    if (window.confirm(`确认删除账号“${account.email}”？${bindingText}`)) onSave(state.accounts.filter((item) => item.id !== account.id));
+    if (window.confirm(`确认删除账号“${account.email}”？${bindingText}`)) {
+      // 挂起的顺序与删除合并成一次提交，避免顺序先提交又被旧列表覆盖。
+      const pending = cancelOrderSave();
+      onSave(orderedAccounts(pending ?? orderOverride).filter((item) => item.id !== account.id));
+    }
   };
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const allVisibleSelected = accounts.length > 0 && accounts.every((account) => selected.has(account.id));
   const toggleSelect = (id: string) => setSelected((prev) => { const next = new Set(prev); next.has(id) ? next.delete(id) : next.add(id); return next; });
   const toggleSelectAll = () => setSelected(allVisibleSelected ? new Set() : new Set(accounts.map((account) => account.id)));
+  // —— 长按拖拽排序：按下即刻反馈，长按 300ms 浮起，上下移动，松手带动量落位 ——
+  const [pressingId, setPressingId] = useState<string | null>(null);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dragView, setDragView] = useState<{ dy: number; fromIndex: number; toIndex: number; step: number } | null>(null);
+  // 落位后的本地顺序：先按新顺序渲染，后端状态回来后自动交还。
+  const [orderOverride, setOrderOverride] = useState<string[] | null>(null);
+  const dragRef = useRef<AccountDragState | null>(null);
+  const landingRafRef = useRef<number | null>(null);
+  // 结束拖拽的回调交给 DOM 事件调用，避免事件监听随渲染重建。
+  const finishDragRef = useRef<(commit: boolean) => void>(() => undefined);
+  // 拖拽回调需要读取最新数据，但不希望因此重建 window 事件监听。
+  const latestRef = useRef({ display: accounts, all: state.accounts, onSave });
+
+  const displayAccounts = useMemo(() => {
+    if (!orderOverride) return accounts;
+    const byId = new Map(accounts.map((account) => [account.id, account]));
+    const ordered = orderOverride.map((id) => byId.get(id)).filter((account): account is Account => Boolean(account));
+    // 覆盖期间新出现的账号（不在覆盖列表内）按原相对位置补在后面，避免整段顺序被回退。
+    const rest = accounts.filter((account) => !orderOverride.includes(account.id));
+    return rest.length ? [...ordered, ...rest] : ordered;
+  }, [accounts, orderOverride]);
+  // 提交重排必须按「当前渲染顺序」计算，否则本地顺序覆盖期间会与显示错位。
+  latestRef.current = { display: displayAccounts, all: state.accounts, onSave };
+
+  // —— 顺序持久化：停手后合并提交一次，未落地前一直持有本地顺序 ——
+  // 若有动作在途（启动/停止/保存），runAction 会忽略新请求，所以先挂起、等它结束再补交。
+  const pendingOrderRef = useRef<{ ids: string[]; timer: number | null } | null>(null);
+  const blockedRef = useRef(blocked);
+  blockedRef.current = blocked;
+  const flushOrderSaveRef = useRef<(force?: boolean) => void>(() => undefined);
+
+  // 把本地顺序铺回后端最新账号列表：已删除的忽略，新出现的保持原位。
+  const orderedAccounts = (ids: string[] | null): Account[] => {
+    const all = latestRef.current.all;
+    if (!ids || !ids.length) return all;
+    const present = new Set(all.map((account) => account.id));
+    const desired = ids.filter((id) => present.has(id));
+    if (!desired.length) return all;
+    return reorderVisibleAccounts(all, new Set(desired), desired);
+  };
+
+  const flushOrderSave = (force = false) => {
+    const pending = pendingOrderRef.current;
+    if (!pending) return;
+    if (!force && blockedRef.current) return; // 保留挂起，等动作结束后补交
+    if (pending.timer != null) window.clearTimeout(pending.timer);
+    pendingOrderRef.current = null;
+    const current = latestRef.current.all;
+    const next = orderedAccounts(pending.ids);
+    // 顺序与后端一致时不提交，省掉一次无谓的 sidecar 重建。
+    if (next.every((account, index) => account.id === current[index]?.id)) return;
+    latestRef.current.onSave(next);
+  };
+  flushOrderSaveRef.current = flushOrderSave;
+
+  const queueOrderSave = (ids: string[]) => {
+    const pending = pendingOrderRef.current;
+    if (pending?.timer != null) window.clearTimeout(pending.timer);
+    pendingOrderRef.current = { ids, timer: null };
+    if (blockedRef.current) return;
+    pendingOrderRef.current.timer = window.setTimeout(() => flushOrderSaveRef.current(), ACCOUNT_ORDER_SAVE_DEBOUNCE);
+  };
+
+  const cancelOrderSave = (): string[] | null => {
+    const pending = pendingOrderRef.current;
+    if (pending?.timer != null) window.clearTimeout(pending.timer);
+    pendingOrderRef.current = null;
+    return pending?.ids ?? null;
+  };
+
+  // 在途动作结束后补交挂起的顺序（连续拖拽期间正好撞上启动/停止/保存时）。
+  useEffect(() => {
+    if (blocked) return;
+    const pending = pendingOrderRef.current;
+    if (!pending || pending.timer != null) return;
+    pending.timer = window.setTimeout(() => flushOrderSaveRef.current(), ACCOUNT_ORDER_SAVE_DEBOUNCE);
+    return () => { if (pending.timer != null) window.clearTimeout(pending.timer); };
+  }, [blocked]);
+
+  useEffect(() => {
+    if (!orderOverride) return;
+    const incoming = state.accounts.filter((account) => orderOverride.includes(account.id)).map((account) => account.id);
+    if (incoming.length === orderOverride.length && incoming.every((id, index) => id === orderOverride[index])) { setOrderOverride(null); return; }
+    // 顺序还在排队/提交中就不交还，否则会在 sidecar 重启完成前闪回旧顺序。
+    if (pendingOrderRef.current || blockedRef.current) return;
+    const timer = window.setTimeout(() => setOrderOverride(null), ACCOUNT_ORDER_RELEASE_GRACE);
+    return () => window.clearTimeout(timer);
+  }, [orderOverride, state.accounts, blocked]);
+
+  // 离开账号页或关闭窗口时兜底提交，避免最后一次拖拽只停在本地。
+  useEffect(() => () => flushOrderSaveRef.current(true), []);
+  useEffect(() => {
+    const flush = () => flushOrderSaveRef.current(true);
+    window.addEventListener('pagehide', flush);
+    window.addEventListener('beforeunload', flush);
+    return () => {
+      window.removeEventListener('pagehide', flush);
+      window.removeEventListener('beforeunload', flush);
+    };
+  }, []);
+
+  // 把当前指针位置换算成偏移与目标槽位；超出首/末行时收紧在边界（表格面板会裁切，不做回弹）。
+  const syncDragView = (drag: AccountDragState) => {
+    const minDy = -drag.fromIndex * drag.step;
+    const maxDy = (drag.maxIndex - drag.fromIndex) * drag.step;
+    const dy = Math.max(minDy, Math.min(maxDy, drag.pointerY - drag.startY));
+    drag.dy = dy;
+    drag.toIndex = Math.max(0, Math.min(drag.maxIndex, drag.fromIndex + Math.round(dy / drag.step)));
+    setDragView({ dy, fromIndex: drag.fromIndex, toIndex: drag.toIndex, step: drag.step });
+  };
+
+  // 落位：从「松手偏移 + 松手速度」续接的临界阻尼弹簧，无过冲、不跳位（apple-design §4/§5）。
+  const landToSlot = (drag: AccountDragState, residual: number, velocity: number) => {
+    const omega = (2 * Math.PI) / ACCOUNT_DRAG_RESPONSE;
+    let offset = residual;
+    let speed = velocity;
+    let previous = performance.now();
+    const frame = (now: number) => {
+      const delta = Math.min(0.032, Math.max(0.001, (now - previous) / 1000));
+      previous = now;
+      speed += (-omega * omega * offset - 2 * omega * speed) * delta;
+      offset += speed * delta;
+      if (Math.abs(offset) < 0.5 && Math.abs(speed) < 20) {
+        landingRafRef.current = null;
+        setDraggingId(null);
+        setDragView(null);
+        return;
+      }
+      setDragView({ dy: offset, fromIndex: drag.toIndex, toIndex: drag.toIndex, step: drag.step });
+      landingRafRef.current = window.requestAnimationFrame(frame);
+    };
+    if (landingRafRef.current !== null) window.cancelAnimationFrame(landingRafRef.current);
+    landingRafRef.current = window.requestAnimationFrame(frame);
+  };
+
+  const finishDrag = (commit: boolean) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    if (drag.timer !== null) window.clearTimeout(drag.timer);
+    dragRef.current = null;
+    setPressingId(null);
+    if (!commit || !drag.active) { setDraggingId(null); setDragView(null); return; }
+    const { display } = latestRef.current;
+    const visibleIds = display.map((account) => account.id);
+    // 动量投影（apple-design §6）：按松手速度估算落点，向上/下快甩可多跨几个槽位。
+    const velocity = releaseVelocity(drag.samples);
+    const projection = Math.max(-2 * drag.step, Math.min(2 * drag.step, (velocity / 1000) * ACCOUNT_DRAG_PROJECTION));
+    drag.toIndex = Math.max(0, Math.min(drag.maxIndex, drag.fromIndex + Math.round((drag.dy + projection) / drag.step)));
+    if (drag.fromIndex === drag.toIndex) { setDraggingId(null); setDragView(null); return; }
+    const nextIds = [...visibleIds];
+    const [moved] = nextIds.splice(drag.fromIndex, 1);
+    nextIds.splice(drag.toIndex, 0, moved);
+    // 换序后该行的自然位置已移动 (toIndex - fromIndex) 行，用残余偏移衔接落位。
+    const residual = drag.dy - (drag.toIndex - drag.fromIndex) * drag.step;
+    setOrderOverride(nextIds);
+    setDragView({ dy: residual, fromIndex: drag.toIndex, toIndex: drag.toIndex, step: drag.step });
+    landToSlot(drag, residual, velocity);
+    // 松手先只更新本地顺序，停手 1s 后合并提交一次（连续拖拽只触发一次 sidecar 重建）。
+    queueOrderSave(nextIds);
+  };
+  finishDragRef.current = finishDrag;
+
+  useEffect(() => {
+    if (!draggingId) return;
+    const track = (drag: AccountDragState, y: number) => {
+      drag.samples.push({ y, t: performance.now() });
+      if (drag.samples.length > 6) drag.samples.shift();
+    };
+    const onMove = (event: PointerEvent) => {
+      const drag = dragRef.current;
+      if (!drag || !drag.active || event.pointerId !== drag.pointerId) return;
+      drag.pointerY = event.clientY;
+      track(drag, event.clientY);
+      syncDragView(drag);
+    };
+    const onEnd = (event: PointerEvent) => {
+      const drag = dragRef.current;
+      if (!drag || !drag.active || event.pointerId !== drag.pointerId) return;
+      finishDragRef.current(true);
+    };
+    // 指针被系统收回时按取消处理，避免停在半路。
+    const onCancel = (event: PointerEvent) => {
+      const drag = dragRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      finishDragRef.current(false);
+    };
+    // 拖到列表上/下边缘时自动滚动，并把滚动量补偿进 startY 保持 1:1 跟手。
+    const tick = () => {
+      const drag = dragRef.current;
+      if (!drag || !drag.active) return;
+      const host = drag.host;
+      if (host) {
+        const rect = host.getBoundingClientRect();
+        const above = (rect.top + ACCOUNT_DRAG_SCROLL_EDGE - drag.pointerY) / ACCOUNT_DRAG_SCROLL_EDGE;
+        const below = (drag.pointerY - (rect.bottom - ACCOUNT_DRAG_SCROLL_EDGE)) / ACCOUNT_DRAG_SCROLL_EDGE;
+        const delta = above > 0 ? -ACCOUNT_DRAG_SCROLL_SPEED * Math.min(1, above) : below > 0 ? ACCOUNT_DRAG_SCROLL_SPEED * Math.min(1, below) : 0;
+        if (delta) {
+          const before = host.scrollTop;
+          host.scrollTop = before + delta;
+          const moved = host.scrollTop - before;
+          if (moved) { drag.startY -= moved; syncDragView(drag); }
+        }
+      }
+      drag.raf = window.requestAnimationFrame(tick);
+    };
+    window.addEventListener('pointermove', onMove, { passive: true });
+    window.addEventListener('pointerup', onEnd);
+    window.addEventListener('pointercancel', onCancel);
+    const current = dragRef.current;
+    if (current) current.raf = window.requestAnimationFrame(tick);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onEnd);
+      window.removeEventListener('pointercancel', onCancel);
+      if (current?.raf != null) window.cancelAnimationFrame(current.raf);
+    };
+  }, [draggingId]);
+
+  useEffect(() => () => { if (landingRafRef.current !== null) window.cancelAnimationFrame(landingRafRef.current); }, []);
+
+  const handlePressStart = (event: ReactPointerEvent<HTMLDivElement>, account: Account, index: number) => {
+    if (event.button !== 0 || draggingId) return;
+    if ((event.target as HTMLElement).closest('input,button,a,select,textarea,label,[data-no-drag]')) return;
+    const row = event.currentTarget;
+    const rect = row.getBoundingClientRect();
+    // 相邻行的实际行距即一次换位的位移量（行高已含 1px 分隔线）。
+    const nextRow = row.nextElementSibling as HTMLElement | null;
+    const step = nextRow ? Math.abs(nextRow.getBoundingClientRect().top - rect.top) : rect.height;
+    // 按下即刻反馈，长按满 300ms 才真正浮起（apple-design §1）。
+    setPressingId(account.id);
+    dragRef.current = {
+      id: account.id, pointerId: event.pointerId, startY: event.clientY, pointerY: event.clientY, dy: 0, step,
+      maxIndex: Math.max(0, accounts.length - 1), fromIndex: index, toIndex: index, active: false, raf: null,
+      host: findScrollHost(row), samples: [{ y: event.clientY, t: performance.now() }],
+      timer: window.setTimeout(() => {
+        const current = dragRef.current;
+        if (!current || current.pointerId !== event.pointerId) return;
+        current.active = true;
+        current.timer = null;
+        // 速度采样从浮起那一刻重算，避免把长按期间的静止计入速度。
+        current.samples = [{ y: current.pointerY, t: performance.now() }];
+        try { row.setPointerCapture(event.pointerId); } catch { /* 指针已释放，忽略 */ }
+        setPressingId(null);
+        setDraggingId(account.id);
+        setDragView({ dy: 0, fromIndex: index, toIndex: index, step });
+      }, ACCOUNT_DRAG_HOLD_MS),
+    };
+  };
+
+  const cancelPress = () => {
+    const drag = dragRef.current;
+    if (!drag || drag.active) return;
+    if (drag.timer !== null) window.clearTimeout(drag.timer);
+    dragRef.current = null;
+    setPressingId(null);
+  };
+
+  const handlePressMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.active || drag.pointerId !== event.pointerId) return;
+    if (Math.abs(event.clientY - drag.startY) > ACCOUNT_DRAG_TOLERANCE) cancelPress();
+  };
+
   // 清洗文件名中的非法字符与空白，避免保存失败。
   const sanitizeFileName = (value: string) => value.replace(/[\\/:*?"<>|\s]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 120);
   // 单账号导出文件名：email + uid 前 8 位，去重拼接后清洗。
@@ -507,7 +835,17 @@ function AccountsPage({ state, onAdd, onImport, onSave, onRefresh, onRefreshAll,
   };
   const exportOne = (account: Account) => { void doExport([account.id], accountFileName(account)); };
   const exportSelected = () => { if (selected.size) void doExport([...selected], batchFileName(selected.size)); };
-  return <><SectionHeader eyebrow="CodeBuddy / 资源池" title="账号池" description="管理用于请求调度的 CodeBuddy 中国站账号，查看健康状态、额度和绑定关系。" action={<div className="header-actions"><button className="button ghost" onClick={exportSelected} disabled={selected.size === 0}><Download size={15} />{selected.size ? `导出所选 (${selected.size})` : '导出所选'}</button><button className="button ghost" onClick={() => { void runRefreshAll(); }} disabled={refreshBusy || !state.accounts.length}><RefreshCw size={15} className={refreshingAll ? 'spin' : ''} />{refreshingAll ? '刷新中…' : '全部刷新'}</button><button className="button ghost" onClick={onImport}><Upload size={15} />导入配置</button><button className="button primary" onClick={onAdd}><Plus size={15} />添加账号</button></div>} /><div className="account-overview"><div className="account-overview-main"><div className="account-count"><strong>{state.accounts.length}</strong><span>个账号</span></div><div className="account-health-bar"><span style={{ width: `${state.accounts.length ? state.accounts.filter((a) => a.status === 'available').length / state.accounts.length * 100 : 0}%` }} /></div><span className="health-caption">{state.accounts.filter((a) => a.status === 'available').length} 个可用 · {state.accounts.filter((a) => a.status !== 'available').length} 个需要关注</span></div></div><div className="panel table-panel"><div className="table-toolbar"><div className="search-box"><Search size={15} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索邮箱或账号名称" /></div><div className="toolbar-right"><div className="segmented"><button className={region === 'all' ? 'active' : ''} onClick={() => setRegion('all')}>全部</button><button className={region === 'cn' ? 'active' : ''} onClick={() => setRegion('cn')}>中国站</button></div><button className="button ghost icon-only-sm" onClick={onCheckin} disabled={!state.accounts.length} aria-label="每日签到" title="每日签到"><CalendarCheck size={15} /></button></div></div>{accounts.length ? <div className="data-table accounts-table"><div className="table-head"><span><input type="checkbox" className="check-box" checked={allVisibleSelected} onChange={toggleSelectAll} aria-label="全选账号" /></span><span>账号</span><span>套餐</span><span>健康状态</span><span>额度</span><span>最近使用</span><span>标签</span><span /></div>{accounts.map((account) => <div className="table-row" key={account.id}><div className="row-check"><input type="checkbox" className="check-box" checked={selected.has(account.id)} onChange={() => toggleSelect(account.id)} aria-label={`选择账号 ${account.email}`} /></div><div className="account-name"><span className="account-avatar">{account.email.slice(0, 1).toUpperCase()}</span><div><strong>{account.email}</strong><small>CodeBuddy 中国站</small></div></div><span className={`plan-badge plan-${account.plan.toLowerCase()}`}>{account.plan || '未知'}</span><StatusPill tone={statusClass[account.status]}>{statusLabels[account.status]}</StatusPill><div className="quota-cell"><div className="quota-line"><span>{formatNumber(account.quota)}</span><small>/ {formatNumber(account.quotaTotal)}</small></div><div className="quota-bar"><span style={{ width: `${Math.min(100, account.quota / Math.max(1, account.quotaTotal) * 100)}%` }} /></div></div><span className="muted-text">{formatDate(account.lastUsed)}</span><div className="tag-list">{account.tags.map((tag) => <span key={tag}>{tag}</span>)}</div><div className="row-actions"><IconButton label="导出账号" onClick={() => exportOne(account)}><Download size={15} /></IconButton><IconButton label={refreshingId === account.id ? '正在刷新额度' : '刷新额度'} onClick={() => { void runRefresh(account); }} disabled={refreshBusy}><RefreshCw size={15} className={refreshingId === account.id ? 'spin' : ''} /></IconButton><IconButton label="删除账号" danger onClick={() => remove(account)}><Trash2 size={15} /></IconButton></div></div>)}</div> : <EmptyState icon={Users} title="还没有 CodeBuddy 账号" description="添加账号后，CodeRelay 才能为请求选择上游凭据。" action={<button className="button primary" onClick={onAdd}><Plus size={15} />添加第一个账号</button>} />}</div><div className="account-footnote"><span><ShieldCheck size={15} />Token 仅在桌面端凭据文件中保存，页面不回显完整凭据。</span></div></>;
+  return <><SectionHeader eyebrow="CodeBuddy / 资源池" title="账号池" description="管理用于请求调度的 CodeBuddy 中国站账号，查看健康状态、额度和绑定关系。" action={<div className="header-actions"><button className="button ghost" onClick={exportSelected} disabled={selected.size === 0}><Download size={15} />{selected.size ? `导出所选 (${selected.size})` : '导出所选'}</button><button className="button ghost" onClick={() => { void runRefreshAll(); }} disabled={refreshBusy || !state.accounts.length}><RefreshCw size={15} className={refreshingAll ? 'spin' : ''} />{refreshingAll ? '刷新中…' : '全部刷新'}</button><button className="button ghost" onClick={onImport}><Upload size={15} />导入配置</button><button className="button primary" onClick={onAdd}><Plus size={15} />添加账号</button></div>} /><div className="account-overview"><div className="account-overview-main"><div className="account-count"><strong>{state.accounts.length}</strong><span>个账号</span></div><div className="account-health-bar"><span style={{ width: `${state.accounts.length ? state.accounts.filter((a) => a.status === 'available').length / state.accounts.length * 100 : 0}%` }} /></div><span className="health-caption">{state.accounts.filter((a) => a.status === 'available').length} 个可用 · {state.accounts.filter((a) => a.status !== 'available').length} 个需要关注</span></div></div><div className="panel table-panel"><div className="table-toolbar"><div className="search-box"><Search size={15} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索邮箱或账号名称" /></div><div className="toolbar-right"><div className="segmented"><button className={region === 'all' ? 'active' : ''} onClick={() => setRegion('all')}>全部</button><button className={region === 'cn' ? 'active' : ''} onClick={() => setRegion('cn')}>中国站</button></div><button className="button ghost icon-only-sm" onClick={onCheckin} disabled={!state.accounts.length} aria-label="每日签到" title="每日签到"><CalendarCheck size={15} /></button></div></div>{accounts.length ? <div className={`data-table accounts-table${draggingId ? ' is-dragging' : ''}`}><div className="table-head"><span><input type="checkbox" className="check-box" checked={allVisibleSelected} onChange={toggleSelectAll} aria-label="全选账号" /></span><span>账号</span><span>套餐</span><span>健康状态</span><span>额度</span><span>最近使用</span><span>标签</span><span /></div>{displayAccounts.map((account, index) => {
+            const isDragging = draggingId === account.id;
+            const isPressing = pressingId === account.id && !isDragging;
+            const shift = dragView && !isDragging
+              ? dragView.fromIndex < index && index <= dragView.toIndex ? -dragView.step
+                : dragView.toIndex <= index && index < dragView.fromIndex ? dragView.step : 0
+              : 0;
+            const rowStyle: CSSProperties = isDragging
+              ? { transform: `translateY(${dragView?.dy ?? 0}px) scale(1.02)` }
+              : shift ? { transform: `translateY(${shift}px)` } : {};
+            return <div className={`table-row${isPressing ? ' drag-pressing' : ''}${isDragging ? ' drag-active' : ''}${shift ? ' drag-shift' : ''}`} style={rowStyle} key={account.id} title="长按可拖动排序" onPointerDown={(event) => handlePressStart(event, account, index)} onPointerMove={handlePressMove} onPointerUp={() => finishDragRef.current(true)} onPointerCancel={() => finishDragRef.current(false)} onPointerLeave={cancelPress}><div className="row-check"><input type="checkbox" className="check-box" checked={selected.has(account.id)} onChange={() => toggleSelect(account.id)} aria-label={`选择账号 ${account.email}`} /></div><div className="account-name"><span className="account-avatar">{account.email.slice(0, 1).toUpperCase()}</span><div><strong>{account.email}</strong><small>CodeBuddy 中国站</small></div></div><span className={`plan-badge plan-${account.plan.toLowerCase()}`}>{account.plan || '未知'}</span><StatusPill tone={statusClass[account.status]}>{statusLabels[account.status]}</StatusPill><div className="quota-cell"><div className="quota-line"><span>{formatNumber(account.quota)}</span><small>/ {formatNumber(account.quotaTotal)}</small></div><div className="quota-bar"><span style={{ width: `${Math.min(100, account.quota / Math.max(1, account.quotaTotal) * 100)}%` }} /></div></div><span className="muted-text">{formatDate(account.lastUsed)}</span><div className="tag-list">{account.tags.map((tag) => <span key={tag}>{tag}</span>)}</div><div className="row-actions"><IconButton label="导出账号" onClick={() => exportOne(account)}><Download size={15} /></IconButton><IconButton label={refreshingId === account.id ? '正在刷新额度' : '刷新额度'} onClick={() => { void runRefresh(account); }} disabled={refreshBusy}><RefreshCw size={15} className={refreshingId === account.id ? 'spin' : ''} /></IconButton><IconButton label="删除账号" danger onClick={() => remove(account)}><Trash2 size={15} /></IconButton></div></div>; })}</div> : <EmptyState icon={Users} title="还没有 CodeBuddy 账号" description="添加账号后，CodeRelay 才能为请求选择上游凭据。" action={<button className="button primary" onClick={onAdd}><Plus size={15} />添加第一个账号</button>} />}</div><div className="account-footnote"><span><ShieldCheck size={15} />Token 仅在桌面端凭据文件中保存，页面不回显完整凭据。</span></div></>;
 }
 
 type CheckinUiState = 'loading' | 'available' | 'claimed' | 'inactive' | 'error';
@@ -874,7 +1212,8 @@ function KeyModal({ accounts, existingKey, onClose, onSave }: { accounts: Accoun
     onSave({
       ...(existingKey ?? { id: `key-${Date.now()}`, key: `sk-coderelay-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`, enabled: true, models: [], createdAt: Date.now(), lastUsed: null }),
       name: name.trim() || '未命名 Key',
-      accountIds: scope === 'all' ? null : selected,
+      // 指定账号一律按账号池顺序落库，保证 Key 的账号顺序与账号池一致。
+      accountIds: scope === 'all' ? null : accounts.filter((account) => selected.includes(account.id)).map((account) => account.id),
     });
   };
   return <Modal title={editing ? '编辑 API Key' : '创建 API Key'} onClose={onClose}><div className="modal-form"><p className="modal-lead">{editing ? '调整此 Key 的账号使用范围。Key 值保持不变，修改后立即对使用它的客户端生效。' : '为本地客户端创建新的访问凭据。完整 Key 创建后会显示在列表中，并支持直接复制。'}</p><Field label="Key 名称"><input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="例如：个人开发" /></Field><Field label="账号使用范围"><div className="scope-options"><button className={scope === 'all' ? 'active' : ''} onClick={() => setScope('all')}><Globe2 size={15} /><span>全部可用账号</span><small>自动调度整个账号池</small></button><button className={scope === 'selected' ? 'active' : ''} onClick={() => setScope('selected')}><Users size={15} /><span>指定账号</span><small>仅使用你选择的账号</small></button></div></Field>{scope === 'selected' && (accounts.length ? <><div className="checklist-toolbar"><span>已选 {selected.length} / {accounts.length} 个账号</span><button type="button" className="inline-link" onClick={() => setSelected(accounts.map((account) => account.id))}>全选</button><button type="button" className="inline-link" onClick={() => setSelected([])}>清空</button></div><div className="account-checklist">{accounts.map((account) => <label key={account.id}><input type="checkbox" checked={selected.includes(account.id)} onChange={(e) => setSelected(e.target.checked ? [...selected, account.id] : selected.filter((id) => id !== account.id))} /><span>{account.email}</span><small>{account.plan}</small></label>)}</div></> : <p className="checklist-empty">账号池还没有账号。请先在账号池中添加账号，再回来限定 Key 的使用范围。</p>)}</div><div className="modal-footer"><button className="button ghost" onClick={onClose}>取消</button><button className="button primary" disabled={scope === 'selected' && !selected.length} onClick={submit}>{editing ? <><Check size={15} />保存修改</> : <><Plus size={15} />创建 Key</>}</button></div></Modal>;
