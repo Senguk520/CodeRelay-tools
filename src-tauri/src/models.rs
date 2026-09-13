@@ -317,6 +317,13 @@ pub struct AppState {
     pub running: bool,
     pub actual_port: Option<u16>,
     pub last_error: Option<String>,
+    /// 只读派生值：局域网可连接地址（形如 `http://192.168.1.23:11435`）。
+    ///
+    /// 仅在访问范围为 `lan` 且成功解析到本机网卡地址时填充；**永不落盘**（由
+    /// `sanitize_for_persistence` 置空），只出现在返回给前端的副本上，避免污染
+    /// `state.json` 并防止被误当成持久化配置。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_base_url: Option<String>,
 }
 
 impl Default for AppState {
@@ -330,6 +337,7 @@ impl Default for AppState {
             running: false,
             actual_port: None,
             last_error: None,
+            lan_base_url: None,
         }
     }
 }
@@ -492,6 +500,9 @@ impl AppState {
     pub fn sanitize_for_persistence(&mut self) {
         self.running = false;
         self.actual_port = None;
+        // 局域网地址是纯派生值，唯一来源是运行时的网卡解析缓存；置空可保证
+        // 它永远不会被写进 state.json（配合 serde skip_serializing_if）。
+        self.lan_base_url = None;
         for account in &mut self.accounts {
             account.access_token = None;
             account.refresh_token = None;

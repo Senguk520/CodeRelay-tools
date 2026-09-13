@@ -160,6 +160,12 @@ export interface AppState {
   running: boolean;
   actualPort: number | null;
   lastError: string | null;
+  /**
+   * 只读派生值：局域网可连接地址（形如 `http://192.168.1.23:11435`，不含 `/v1`）。
+   * 仅当访问范围为 `lan` 且反代成功解析到本机网卡地址时才有值；不参与持久化，
+   * 也不会写进 state.json。
+   */
+  lanBaseUrl: string | null;
 }
 
 export const defaultConfig: ServiceConfig = {
@@ -215,4 +221,6 @@ export const defaultState: AppState = {
   running: false,
   actualPort: null,
   lastError: null,
+  // 派生值：预览模式（无 Tauri）下没有真实网卡，保持空；正式运行时由后端下发。
+  lanBaseUrl: null,
 };

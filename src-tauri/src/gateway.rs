@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::menu::MenuItem;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -41,6 +42,12 @@ struct RuntimeInner {
     generation: AtomicU64,
     tray_start: Mutex<Option<MenuItem<tauri::Wry>>>,
     tray_stop: Mutex<Option<MenuItem<tauri::Wry>>>,
+    /// 本机局域网 IPv4 的进程内缓存。解析要执行外部命令（ipconfig），
+    /// 因此只在异步 / 后台路径刷新，状态读取（get_app_state）只读缓存。
+    lan_ip_cache: Mutex<LanIpCache>,
+    /// 当前运行实例的 config+manifest 稳定指纹；未运行时为 None。
+    /// 用于判断配置保存后是否真的需要重启 sidecar。
+    running_fingerprint: Mutex<Option<String>>,
 }
 
 #[derive(Default)]
@@ -123,6 +130,8 @@ impl RuntimeState {
                 generation: AtomicU64::new(0),
                 tray_start: Mutex::new(None),
                 tray_stop: Mutex::new(None),
+                lan_ip_cache: Mutex::new(LanIpCache::default()),
+                running_fingerprint: Mutex::new(None),
             }),
         }
     }
@@ -290,7 +299,12 @@ pub fn initialize(app: &AppHandle, runtime: &RuntimeState) -> Result<(), String>
     if migrated {
         save_credentials(app, &credentials)?;
     }
-    save_app_state(app, &state)
+    save_app_state(app, &state)?;
+    // 已配置为局域网模式时后台预热本机网卡地址，避免首次打开界面时地址空窗。
+    // 解析要执行外部命令，必须离开主线程（函数内部走 spawn_blocking）。
+    // 放在 initialize 末尾而非 lib.rs：启动流程的唯一入口在此，lib.rs 无需改动。
+    prewarm_lan_ip_cache(runtime);
+    Ok(())
 }
 
 fn validate_config(config: &mut ServiceConfig) -> Result<(), String> {
@@ -332,6 +346,409 @@ fn validate_config(config: &mut ServiceConfig) -> Result<(), String> {
     Ok(())
 }
 
+// ---- 局域网地址解析 ----
+//
+// 目标：为「局域网访问」提供一个**可直接连接**的本机 IPv4（形如 http://192.168.1.23:11435）。
+// 采集沿用系统自带的 ipconfig（本项目仅面向 Windows），不引入任何第三方依赖。
+//
+// 选择策略（对齐参照实现的完整版）：先按网卡类型打分（物理网卡优先、虚拟/隧道垫底），
+// 再按地址段打分（192.168.* 优先于 10.*，其余私有段最后），最后用地址字节做确定性
+// tiebreak——保证多网卡环境下结果稳定可复现，而不是随机挑一个。
+
+/// 一个局域网候选：来自 ipconfig 的 (网卡名, IPv4)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LanIpv4Candidate {
+    interface_name: String,
+    addr: Ipv4Addr,
+}
+
+/// 局域网地址缓存有效期。解析要执行外部命令，缓存用于避免状态读取（同步命令、
+/// 在主线程）触发进程创建；这个窗口同时也是「换网络后地址自行更新」的最大延迟，
+/// 所以取一个既便宜又够实时的值——解析在后台阻塞线程执行，单次只有几十毫秒。
+const LAN_IP_CACHE_TTL: Duration = Duration::from_secs(10);
+
+/// 进程内缓存的本机局域网 IPv4。
+#[derive(Debug, Default)]
+struct LanIpCache {
+    ip: Option<String>,
+    resolved_at: Option<Instant>,
+}
+
+/// 虚拟 / 隧道 / 回环网卡关键词（**包含**匹配即视为虚拟）。
+///
+/// 虚拟判定优先于物理判定：中文 Windows 的头行是「以太网适配器 vEthernet (WSL)」，
+/// 若先按"以太网"判成物理就会把 Hyper-V 虚拟交换机当成局域网出口。
+const LAN_VIRTUAL_INTERFACE_KEYWORDS: &[&str] = &[
+    "loopback",
+    "vethernet",
+    "hyper-v",
+    "virtual",
+    "vmware",
+    "vmnet",
+    "virtualbox",
+    "vbox",
+    "docker",
+    "veth",
+    "virbr",
+    "br-",
+    "bridge",
+    "tailscale",
+    "zerotier",
+    "wireguard",
+    "wintun",
+    "tunnel",
+    "utun",
+    "awdl",
+    "llw",
+    "tap-",
+    "tap ",
+    "虚拟",
+    "环回",
+];
+
+/// 物理网卡关键词（**前缀**匹配）。
+const LAN_PHYSICAL_INTERFACE_PREFIXES: &[&str] = &[
+    "en",
+    "eth",
+    "wlan",
+    "wi-fi",
+    "wifi",
+    "ethernet",
+    "wireless",
+];
+
+/// 物理网卡关键词（**包含**匹配）。中文 Windows 的网卡名形如
+/// 「以太网适配器 以太网」「无线局域网适配器 WLAN」，不满足前缀匹配，必须用包含匹配兜住。
+const LAN_PHYSICAL_INTERFACE_KEYWORDS: &[&str] = &[
+    "ethernet",
+    "wireless",
+    "wlan",
+    "wi-fi",
+    "wifi",
+    "以太网",
+    "无线",
+    "本地连接",
+];
+
+/// 判定是否为可用的局域网地址：只接受私有段（10/8、172.16/12、192.168/16）。
+/// 该判定天然排除回环（127/8）、链路本地（169.254/16）与公网地址。
+fn is_lan_ipv4(addr: Ipv4Addr) -> bool {
+    addr.is_private()
+}
+
+/// 网卡类型打分：0 = 物理网卡（优先），1 = 未知，2 = 虚拟 / 隧道 / 回环（垫底）。
+fn lan_interface_score(interface_name: &str) -> u8 {
+    let name = interface_name.trim().to_ascii_lowercase();
+    if LAN_VIRTUAL_INTERFACE_KEYWORDS
+        .iter()
+        .any(|keyword| name.contains(keyword))
+    {
+        return 2;
+    }
+    if LAN_PHYSICAL_INTERFACE_PREFIXES
+        .iter()
+        .any(|keyword| name.starts_with(keyword))
+        || LAN_PHYSICAL_INTERFACE_KEYWORDS
+            .iter()
+            .any(|keyword| name.contains(keyword))
+    {
+        return 0;
+    }
+    1
+}
+
+/// 地址段打分：0 = 192.168.*（家用最常见），1 = 10.*，2 = 其余私有段（172.16-31.* 等）。
+fn lan_addr_score(addr: Ipv4Addr) -> u8 {
+    let octets = addr.octets();
+    if octets[0] == 192 && octets[1] == 168 {
+        return 0;
+    }
+    if octets[0] == 10 {
+        return 1;
+    }
+    2
+}
+
+/// 从候选中选出首要局域网 IPv4：按（网卡类型, 地址段, 地址字节）升序取第一。
+/// 无候选时返回 None，由调用方静默降级。
+fn select_primary_lan_ipv4(mut candidates: Vec<LanIpv4Candidate>) -> Option<Ipv4Addr> {
+    candidates.sort_by_key(|candidate| {
+        (
+            lan_interface_score(&candidate.interface_name),
+            lan_addr_score(candidate.addr),
+            candidate.addr.octets(),
+        )
+    });
+    candidates.into_iter().next().map(|candidate| candidate.addr)
+}
+
+/// 解析 `ipconfig` 输出，抽出所有私有 IPv4 候选。
+///
+/// 规则（对中英文 Windows 均适用，不依赖字段文案）：
+/// - **网卡头行**：不缩进且以 `:` 结尾，剥掉尾部 `:` 作为网卡名；
+/// - **地址行**：含 ASCII 子串 `IPv4`（中文输出为「IPv4 地址 …」，仍含该子串），
+///   取最后一个 `:` 之后的内容解析；
+/// - 非私有地址（回环、169.254 链路本地、公网）直接丢弃。
+fn parse_ipconfig_candidates(output: &str) -> Vec<LanIpv4Candidate> {
+    let mut candidates = Vec::new();
+    let mut current_interface = String::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let is_indented = line
+            .chars()
+            .next()
+            .map(|character| character.is_whitespace())
+            .unwrap_or(false);
+        if !is_indented && trimmed.ends_with(':') {
+            current_interface = trimmed.trim_end_matches(':').trim().to_string();
+            continue;
+        }
+        if !trimmed.contains("IPv4") {
+            continue;
+        }
+        let Some(raw_addr) = trimmed.rsplit(':').next() else {
+            continue;
+        };
+        let Ok(addr) = raw_addr.trim().parse::<Ipv4Addr>() else {
+            continue;
+        };
+        if !is_lan_ipv4(addr) {
+            continue;
+        }
+        candidates.push(LanIpv4Candidate {
+            interface_name: current_interface.clone(),
+            addr,
+        });
+    }
+    candidates
+}
+
+/// 执行 `ipconfig` 并选出首要局域网 IPv4。命令失败 / 无候选时返回 None（静默降级）。
+#[cfg(target_os = "windows")]
+fn resolve_primary_lan_ipv4() -> Option<Ipv4Addr> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let output = Command::new("ipconfig")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    select_primary_lan_ipv4(parse_ipconfig_candidates(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// 非 Windows 平台不提供局域网地址解析（本项目仅面向 Windows）。
+#[cfg(not(target_os = "windows"))]
+fn resolve_primary_lan_ipv4() -> Option<Ipv4Addr> {
+    None
+}
+
+/// 读取缓存结论。
+///
+/// - `Some(Some(ip))`：TTL 内解析成功；
+/// - `Some(None)`：TTL 内已尝试过，结论是「本机当前没有可用局域网地址」；
+/// - `None`：缓存缺失或已过期，需要重新解析。
+///
+/// 区分「已尝试但无结果」与「尚未尝试」很重要：否则解析不出地址时，
+/// 每次状态读取都会重新拉起一次 ipconfig。
+fn cached_lan_ip(inner: &Arc<RuntimeInner>) -> Option<Option<String>> {
+    let cache = locked(&inner.lan_ip_cache, "局域网地址缓存").ok()?;
+    if cache.resolved_at?.elapsed() > LAN_IP_CACHE_TTL {
+        return None;
+    }
+    Some(cache.ip.clone())
+}
+
+/// 判断该 IPv4 是否仍属于本机网卡。
+///
+/// 必要性：切换 WiFi / 连手机热点 / 拔插网线后，旧地址会从网卡上消失，但缓存里
+/// 还留着它。若继续把这个地址展示给用户，客户端会去连一个**已经不存在的** IP，
+/// 表现为几十秒后超时（SYN 无人应答），而不是快速失败——非常难排查。
+///
+/// 校验手段是对该地址做一次 UDP 随机端口绑定：地址不属于本机时，操作系统直接
+/// 返回「地址不可用」。只做一次系统调用、不监听端口、不发起连接，因此可以在
+/// 状态读取路径（主线程）安全调用，也不需要引入任何第三方依赖。
+fn is_local_ipv4(addr: Ipv4Addr) -> bool {
+    UdpSocket::bind(SocketAddr::new(IpAddr::V4(addr), 0)).is_ok()
+}
+
+/// 作废局域网地址缓存，让下一次读取重新解析。
+fn invalidate_lan_ip_cache(inner: &Arc<RuntimeInner>) {
+    if let Ok(mut cache) = locked(&inner.lan_ip_cache, "局域网地址缓存") {
+        cache.ip = None;
+        cache.resolved_at = None;
+    }
+}
+
+/// 从缓存取可用的局域网地址（TTL 内、解析成功、且地址仍在本机）。
+/// **绝不现场执行外部命令**；但会做一次极轻量的归属校验，见 `is_local_ipv4`。
+fn lan_ip_from_cache(inner: &Arc<RuntimeInner>) -> Option<String> {
+    let ip = cached_lan_ip(inner).flatten()?;
+    let Ok(addr) = ip.parse::<Ipv4Addr>() else {
+        return None;
+    };
+    if is_local_ipv4(addr) {
+        return Some(ip);
+    }
+    // 地址已不在本机（换网络了）→ 立刻作废缓存并返回空，让上层重新解析；
+    // 宁可短暂显示"未识别到"，也不能把一个连不上的地址给用户复制。
+    invalidate_lan_ip_cache(inner);
+    None
+}
+
+/// 刷新局域网地址缓存。**会执行外部命令（ipconfig），禁止在主线程直接调用**，
+/// 只能从 `spawn_blocking` 路径或后台线程调用。无论成功与否都记时间戳，
+/// 让「解析不到」也享受 TTL 保护。
+fn refresh_lan_ip_cache(inner: &Arc<RuntimeInner>) -> Option<String> {
+    let ip = resolve_primary_lan_ipv4().map(|addr| addr.to_string());
+    if let Ok(mut cache) = locked(&inner.lan_ip_cache, "局域网地址缓存") {
+        cache.ip = ip.clone();
+        cache.resolved_at = Some(Instant::now());
+    }
+    ip
+}
+
+/// 若当前配置为局域网模式，则刷新一次地址缓存（调用方必须已在阻塞线程 / 后台线程）。
+fn warm_lan_ip_cache_if_lan(state: &AppState, inner: &Arc<RuntimeInner>) {
+    if scope_is_lan(&state.config.scope) {
+        refresh_lan_ip_cache(inner);
+    }
+}
+
+/// 后台刷新局域网地址缓存，成功后广播状态变化事件让前端自动补上地址。
+///
+/// 用于状态读取（同步命令，跑在主线程）命中缓存空窗的场景——那里不能直接执行
+/// 外部命令，否则会冻结窗口事件循环。
+fn schedule_lan_ip_refresh(app: AppHandle, inner: Arc<RuntimeInner>) {
+    // 先占位再派发：立刻把 resolved_at 写成当前时间，让并发 / 连续触发的调用
+    // 在 TTL 窗口内不再各自拉起一个 ipconfig。判定与占位必须在同一次加锁内完成，
+    // 否则两个线程可能同时通过判定、各派发一次。解析完成后由
+    // refresh_lan_ip_cache 覆盖时间戳与地址；失败也由 TTL 兜底重试，无需额外状态位。
+    let dispatched = match locked(&inner.lan_ip_cache, "局域网地址缓存") {
+        Ok(mut cache) => {
+            let fresh = cache
+                .resolved_at
+                .map(|at| at.elapsed() <= LAN_IP_CACHE_TTL)
+                .unwrap_or(false);
+            if fresh {
+                false
+            } else {
+                cache.resolved_at = Some(Instant::now());
+                true
+            }
+        }
+        Err(_) => return,
+    };
+    if !dispatched {
+        return;
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        // 只在地址真的发生变化时广播：否则每次 TTL 到期的例行解析都会把前端叫起来
+        // 重拉一次全量状态，白白形成「解析 → 广播 → 拉取 → 再解析」的循环。
+        let before = cached_lan_ip(&inner).flatten();
+        let after = refresh_lan_ip_cache(&inner);
+        if after.is_some() && after != before {
+            let _ = app.emit(STATE_CHANGED_EVENT, ());
+        }
+    });
+}
+
+/// 应用启动时后台预热一次局域网地址缓存（仅在已配置为局域网模式时）。
+///
+/// 由 `initialize` 末尾调用，让用户在打开界面之前缓存就已就绪；解析要执行
+/// 外部命令，必须离开主线程。
+fn prewarm_lan_ip_cache(runtime: &RuntimeState) {
+    let inner = runtime.inner.clone();
+    let scope = locked(&inner.app, "应用")
+        .map(|state| state.config.scope.clone())
+        .unwrap_or_default();
+    if !scope_is_lan(&scope) {
+        return;
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        refresh_lan_ip_cache(&inner);
+    });
+}
+
+/// 访问范围是否等于「局域网」。
+///
+/// `scope` 在配置里是自由字符串（历史原因），判定收敛到这里，
+/// 避免 `eq_ignore_ascii_case("lan")` 散落在多个函数里。
+fn scope_is_lan(scope: &str) -> bool {
+    scope.trim().eq_ignore_ascii_case("lan")
+}
+
+/// 依据当前配置与缓存中的网卡地址，构造「局域网可连接地址」。
+/// 仅在访问范围为 `lan` 且缓存命中时返回 Some。
+fn lan_base_url_for_state(state: &AppState, inner: &Arc<RuntimeInner>) -> Option<String> {
+    if !scope_is_lan(&state.config.scope) {
+        return None;
+    }
+    let ip = lan_ip_from_cache(inner)?;
+    // 运行中优先用 sidecar ready 上报的实际端口，与前端既有取值逻辑一致。
+    let port = state.actual_port.unwrap_or(state.config.port);
+    Some(format!("http://{ip}:{port}"))
+}
+
+/// 在**返回给前端的副本**上填充只读派生字段。
+///
+/// 关键约束：派生字段绝不能写进 `inner.app` 里那份状态，否则会被持久化到
+/// `state.json` 并被误当成配置。这里只处理传值进来的克隆。
+fn with_derived_fields(mut state: AppState, inner: &Arc<RuntimeInner>) -> AppState {
+    state.lan_base_url = lan_base_url_for_state(&state, inner);
+    state
+}
+
+/// FNV-1a 64 位哈希，输出 16 位小写十六进制。
+///
+/// 用途：运行实例指纹的**同进程内**相等性比较，不需要密码学强度，因此不引入
+/// `sha2` 依赖（本项目要求零新增第三方依赖）。与 `auth_file_name` 共用同一算法，
+/// 保持项目内哈希实现唯一。
+fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// 指纹稳定化：剔除「随运行状态变化、但不影响 sidecar 启动」的字段，
+/// 避免额度刷新、统计变动引发无谓重启（那会打断进行中的请求）。
+///
+/// 已逐项核对（`prepare_runtime_files` 产出的 config / manifest）：
+/// - manifest `accounts[].remainingQuota`：随额度刷新变化 → **剔除**；
+/// - manifest `accounts[].planType`：随额度刷新变化 → **保留**（套餐变化重启一次可接受）；
+/// - manifest `apiKeys[]`：条目里不含最近使用时间 → 无需处理；
+/// - auths 里的 `quota_remain`：不在指纹范围内（本函数只处理 config / manifest）。
+///
+/// 序列化依赖 serde_json 的默认键序（BTreeMap，按键排序），结果稳定可复现。
+fn stable_json_for_fingerprint(value: &Value) -> String {
+    let mut value = value.clone();
+    if let Some(accounts) = value.get_mut("accounts").and_then(Value::as_array_mut) {
+        for account in accounts {
+            if let Some(account) = account.as_object_mut() {
+                account.remove("remainingQuota");
+            }
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_default()
+}
+
+/// 运行实例指纹：config 与 manifest 的稳定化内容拼接后取 FNV-1a。
+fn runtime_fingerprint(config: &Value, manifest: &Value) -> String {
+    let mut buffer = stable_json_for_fingerprint(config);
+    buffer.push_str("\n--manifest--\n");
+    buffer.push_str(&stable_json_for_fingerprint(manifest));
+    fnv1a_hex(buffer.as_bytes())
+}
+
 fn auth_file_name(account_id: &str) -> String {
     let safe: String = account_id
         .trim()
@@ -349,12 +766,7 @@ fn auth_file_name(account_id: &str) -> String {
     } else {
         safe
     };
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in account_id.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{safe}-{hash:016x}.json")
+    format!("{safe}-{}.json", fnv1a_hex(account_id.as_bytes()))
 }
 
 fn plan_rank(plan: &str) -> i32 {
@@ -393,65 +805,56 @@ fn runtime_files(app: &AppHandle) -> Result<RuntimeFiles, String> {
     })
 }
 
-fn prepare_runtime_files(
-    app: &AppHandle,
-    state: &AppState,
-    credentials: &HashMap<String, AccountCredential>,
-) -> Result<RuntimeFiles, String> {
-    let files = runtime_files(app)?;
-    let auths_dir = files.root.join("auths");
-    fs::create_dir_all(&auths_dir)
-        .map_err(|error| format!("创建 sidecar 认证目录失败：{error}"))?;
-
-    let mut expected = HashSet::new();
-    let mut manifest_accounts = Vec::new();
-    for account in state
+/// 参与 sidecar 运行时的账号：未禁用、中国站、且存在非空 access_token 的凭据。
+/// 返回值保持 `state.accounts` 的原始顺序。
+fn runtime_accounts<'a>(
+    state: &'a AppState,
+    credentials: &'a HashMap<String, AccountCredential>,
+) -> Vec<(&'a Account, &'a AccountCredential)> {
+    state
         .accounts
         .iter()
-        .filter(|account| account.status != "disabled")
-    {
-        if account.region != "cn" {
-            continue;
-        }
-        let Some(credential) = credentials.get(&account.id) else {
-            continue;
-        };
-        if credential.access_token.trim().is_empty() {
-            continue;
-        }
-        let file_name = auth_file_name(&account.id);
-        expected.insert(file_name.clone());
-        let data = serde_json::to_vec_pretty(&auth_json(account, credential))
-            .map_err(|error| format!("序列化账号 {} 的运行时凭据失败：{error}", account.email))?;
-        atomic_write(&auths_dir.join(&file_name), &data)?;
-        manifest_accounts.push(json!({
-            "id": account.id,
-            "email": account.email,
-            "authId": file_name,
-            "authKind": "oauth",
-            "planType": account.plan,
-            "remainingQuota": account.quota.round() as i64,
-        }));
-    }
+        .filter(|account| account.status != "disabled" && account.region == "cn")
+        .filter_map(|account| {
+            let credential = credentials.get(&account.id)?;
+            if credential.access_token.trim().is_empty() {
+                return None;
+            }
+            Some((account, credential))
+        })
+        .collect()
+}
 
-    for entry in fs::read_dir(&auths_dir)
-        .map_err(|error| format!("读取 sidecar 认证目录失败：{error}"))?
-        .flatten()
-    {
-        let path = entry.path();
-        let is_json = path.extension().and_then(|value| value.to_str()) == Some("json");
-        let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        if is_json && !expected.contains(name) {
-            fs::remove_file(&path)
-                .map_err(|error| format!("删除过期凭据 {} 失败：{error}", path.display()))?;
-        }
-    }
-    if manifest_accounts.is_empty() {
+/// 在内存中构建 sidecar 的 config / manifest（**纯函数：零 I/O、不写任何文件**）。
+///
+/// 为什么必须从 `prepare_runtime_files` 抽出来：`reconcile_if_running` 需要在**不写文件**
+/// 的前提下算出指纹。`prepare_runtime_files` 会重写 `auths/*.json`，而那是 sidecar 的凭据
+/// 热更新通道（fsnotify 监听）——运行中重复执行会触发无谓的热重载，还可能把尚未由
+/// `sync_credentials_from_runtime` 同步回来的新 token 覆盖成旧值。
+///
+/// 校验顺序与拆分前保持一致：先校验账号，再校验 API Key。
+fn build_runtime_payloads(
+    state: &AppState,
+    credentials: &HashMap<String, AccountCredential>,
+    auths_dir: &Path,
+) -> Result<(Value, Value), String> {
+    let accounts = runtime_accounts(state, credentials);
+    if accounts.is_empty() {
         return Err("没有带有效 Token 且未禁用的 CodeBuddy 中国站账号".to_string());
     }
+    let manifest_accounts: Vec<Value> = accounts
+        .iter()
+        .map(|(account, _)| {
+            json!({
+                "id": account.id,
+                "email": account.email,
+                "authId": auth_file_name(&account.id),
+                "authKind": "oauth",
+                "planType": account.plan,
+                "remainingQuota": account.quota.round() as i64,
+            })
+        })
+        .collect();
 
     let api_keys: Vec<String> = state
         .keys
@@ -462,6 +865,7 @@ fn prepare_runtime_files(
     if api_keys.is_empty() {
         return Err("没有启用的 API Key，请先创建以 sk- 开头的 Key".to_string());
     }
+
     let config = json!({
         "host": state.config.bind_host,
         "port": state.config.port,
@@ -515,6 +919,52 @@ fn prepare_runtime_files(
         "imageGenerationMode": state.config.image_generation_mode,
         "imageModels": ["codebuddy-image-1"],
     });
+    Ok((config, manifest))
+}
+
+/// 写入 sidecar 运行目录，返回「文件路径 + 本次 config/manifest 的稳定指纹」。
+///
+/// ⚠️ 本函数会写 `auths/*.json`（sidecar 的凭据热更新通道）与 config / manifest，
+/// **不能**用于「只想算指纹」的场景——那种场景请用纯函数 `build_runtime_payloads`
+/// 配合 `runtime_fingerprint`，避免多余的文件副作用。
+fn prepare_runtime_files(
+    app: &AppHandle,
+    state: &AppState,
+    credentials: &HashMap<String, AccountCredential>,
+) -> Result<(RuntimeFiles, String), String> {
+    let files = runtime_files(app)?;
+    let auths_dir = files.root.join("auths");
+    fs::create_dir_all(&auths_dir)
+        .map_err(|error| format!("创建 sidecar 认证目录失败：{error}"))?;
+
+    // 只写凭据文件（保持既有行为：先写期望集合，再清理陈旧文件）。
+    let mut expected = HashSet::new();
+    for (account, credential) in runtime_accounts(state, credentials) {
+        let file_name = auth_file_name(&account.id);
+        expected.insert(file_name.clone());
+        let data = serde_json::to_vec_pretty(&auth_json(account, credential))
+            .map_err(|error| format!("序列化账号 {} 的运行时凭据失败：{error}", account.email))?;
+        atomic_write(&auths_dir.join(&file_name), &data)?;
+    }
+
+    for entry in fs::read_dir(&auths_dir)
+        .map_err(|error| format!("读取 sidecar 认证目录失败：{error}"))?
+        .flatten()
+    {
+        let path = entry.path();
+        let is_json = path.extension().and_then(|value| value.to_str()) == Some("json");
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if is_json && !expected.contains(name) {
+            fs::remove_file(&path)
+                .map_err(|error| format!("删除过期凭据 {} 失败：{error}", path.display()))?;
+        }
+    }
+    // 内容构建交给纯函数：与 reconcile 的指纹计算共用同一份逻辑，避免两处漂移。
+    let (config, manifest) = build_runtime_payloads(state, credentials, &auths_dir)?;
+    let fingerprint = runtime_fingerprint(&config, &manifest);
     atomic_write(
         &files.config_path,
         &serde_json::to_vec_pretty(&config)
@@ -525,7 +975,7 @@ fn prepare_runtime_files(
         &serde_json::to_vec_pretty(&manifest)
             .map_err(|error| format!("序列化 sidecar 清单失败：{error}"))?,
     )?;
-    Ok(files)
+    Ok((files, fingerprint))
 }
 
 fn sync_credentials_from_runtime(app: &AppHandle, inner: &Arc<RuntimeInner>) -> Result<(), String> {
@@ -1128,6 +1578,11 @@ fn stop_process_only(inner: &Arc<RuntimeInner>) {
     if let Ok(mut events) = inner.events.lock() {
         events.pending.clear();
     }
+    // 进程已停，运行实例指纹随之失效；下次启动会重新记录。
+    // 用带名字的 locked()：锁毒化时能给出可定位的中文错误（与全局约定一致）。
+    if let Ok(mut slot) = locked(&inner.running_fingerprint, "运行指纹") {
+        *slot = None;
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1182,7 +1637,7 @@ fn start_service_locked(app: &AppHandle, inner: &Arc<RuntimeInner>) -> Result<Ap
     sync_credentials_from_runtime(app, inner)?;
     let state = locked(&inner.app, "应用")?.clone();
     let credentials = locked(&inner.credentials, "凭据")?.clone();
-    let files = prepare_runtime_files(app, &state, &credentials)?;
+    let (files, accepted_fingerprint) = prepare_runtime_files(app, &state, &credentials)?;
     let binary = sidecar_binary(app)?;
     let mut command = Command::new(&binary);
     command
@@ -1254,6 +1709,12 @@ fn start_service_locked(app: &AppHandle, inner: &Arc<RuntimeInner>) -> Result<Ap
     });
     match result {
         StartupResult::Ready { port } => {
+            // 记录本次运行实例的指纹，供配置保存时判断是否需要重启。
+            // 注意先取指纹锁并释放，再取应用锁：与 reconcile_if_running 的加锁顺序
+            // 保持一致（那里是先应用锁、后指纹锁，且两者不重叠持有）。
+            if let Ok(mut slot) = locked(&inner.running_fingerprint, "运行指纹") {
+                *slot = Some(accepted_fingerprint.clone());
+            }
             let mut state = locked(&inner.app, "应用")?;
             state.running = true;
             state.config.enabled = true;
@@ -1275,21 +1736,87 @@ fn start_service_locked(app: &AppHandle, inner: &Arc<RuntimeInner>) -> Result<Ap
 
 fn restart_if_running(app: &AppHandle, inner: &Arc<RuntimeInner>) -> Result<AppState, String> {
     let _lifecycle = locked(&inner.lifecycle, "服务生命周期")?;
-    if locked(&inner.app, "应用")?.running {
+    let state = if locked(&inner.app, "应用")?.running {
         stop_process_only(inner);
-        start_service_locked(app, inner)
+        start_service_locked(app, inner)?
     } else {
-        Ok(locked(&inner.app, "应用")?.clone())
+        locked(&inner.app, "应用")?.clone()
+    };
+    // 返回给前端的 AppState 必须带派生字段：前端是**整份替换** state 的，
+    // 缺字段会让局域网地址在界面上凭空消失，而部分命令又不 emit 事件、无法自愈。
+    Ok(with_derived_fields(state, inner))
+}
+
+/// 配置保存后的「幂等收敛」：只有**真正影响 sidecar 启动**的变更才重启它。
+///
+/// - 未运行：直接返回（保留 CodeRelay 的手动启停语义，不擅自拉起服务）；
+/// - 运行中且指纹一致：**不动进程**，保护进行中的请求（额度刷新、统计变动等不应触发重启）；
+/// - 运行中且指纹变化：走既有 `restart_if_running`，从而自动获得
+///   `sync_credentials_from_runtime` → `prepare_runtime_files` 的正确顺序。
+///
+/// 关键点：指纹由 `build_runtime_payloads` 在**内存中**构建，全程不写任何文件——
+/// 绝不能在这里重复执行 `prepare_runtime_files`：那会重写 `auths/*.json`（sidecar 的
+/// 凭据热更新通道），触发无谓热重载，并可能覆盖掉 sidecar 刚热刷新出来的新 token。
+fn reconcile_if_running(app: &AppHandle, inner: &Arc<RuntimeInner>) -> Result<AppState, String> {
+    let (running, state) = {
+        let guard = locked(&inner.app, "应用")?;
+        (guard.running, guard.clone())
+    };
+    if !running {
+        return Ok(with_derived_fields(state, inner));
     }
+    let credentials = locked(&inner.credentials, "凭据")?.clone();
+    let auths_dir = runtime_files(app)?.root.join("auths");
+    let (config, manifest) = match build_runtime_payloads(&state, &credentials, &auths_dir) {
+        Ok(payloads) => payloads,
+        Err(error) => {
+            // 服务正在运行却构建不出运行载荷：不要动这个还在工作的进程（避免
+            // 「保存成功却把服务弄停」），但**必须把异常暴露出来**——静默跳过会让
+            // 用户以为配置已生效、实际一直跑着旧配置。
+            let message = format!("服务配置未能生效：{error}");
+            if let Ok(mut guard) = locked(&inner.app, "应用") {
+                guard.last_error = Some(message);
+            }
+            notify_failure(app, "服务配置未能生效", &error);
+            persist_and_emit(app, inner);
+            let snapshot = locked(&inner.app, "应用")?.clone();
+            return Ok(with_derived_fields(snapshot, inner));
+        }
+    };
+    let fingerprint = runtime_fingerprint(&config, &manifest);
+    let unchanged = {
+        let current = locked(&inner.running_fingerprint, "运行指纹")?;
+        current.as_deref() == Some(fingerprint.as_str())
+    };
+    if unchanged {
+        return Ok(with_derived_fields(state, inner));
+    }
+    restart_if_running(app, inner)
 }
 
 #[tauri::command]
-pub fn get_app_state(runtime: State<'_, RuntimeState>) -> Result<AppState, String> {
-    let mut state = locked(&runtime.inner.app, "应用")?;
-    // 读取时惰性跨天清零日志并同步"今天"快照，保证零点后统计自动归零。
-    state.retain_today_logs();
-    state.sync_today_snapshot();
-    Ok(state.clone())
+pub fn get_app_state(
+    app: AppHandle,
+    runtime: State<'_, RuntimeState>,
+) -> Result<AppState, String> {
+    let inner = runtime.inner.clone();
+    drop(runtime);
+    let snapshot = {
+        let mut state = locked(&inner.app, "应用")?;
+        // 读取时惰性跨天清零日志并同步"今天"快照，保证零点后统计自动归零。
+        state.retain_today_logs();
+        state.sync_today_snapshot();
+        state.clone()
+    };
+    // 本命令是同步命令（跑在主线程），绝不能在这里执行 ipconfig：缓存没有结论时
+    // 改为后台刷新一次，完成后广播事件让前端重新拉取，界面自动补上局域网地址。
+    // 先算派生值：这一步会顺带校验缓存里的地址是否还挂在本机网卡上（切换网络后旧
+    // 地址会被回收），失效时缓存被作废，紧接着的判定就能立刻补一次解析。
+    let derived = with_derived_fields(snapshot, &inner);
+    if scope_is_lan(&derived.config.scope) && cached_lan_ip(&inner).is_none() {
+        schedule_lan_ip_refresh(app, inner.clone());
+    }
+    Ok(derived)
 }
 
 // export_accounts 将指定账号（含凭据 token）导出为 JSON，供备份与跨机器迁移。
@@ -1354,20 +1881,34 @@ pub fn export_accounts(
 }
 
 #[tauri::command]
-pub fn save_service_config(
+pub async fn save_service_config(
     app: AppHandle,
     runtime: State<'_, RuntimeState>,
     mut config: ServiceConfig,
 ) -> Result<AppState, String> {
-    validate_config(&mut config)?;
-    let mut state = locked(&runtime.inner.app, "应用")?;
-    config.enabled = state.running;
-    state.config = config;
-    save_app_state(&app, &state)?;
-    let result = state.clone();
-    drop(state);
-    let _ = app.emit(STATE_CHANGED_EVENT, ());
-    Ok(result)
+    // 本命令要写 state.json，并可能重启 sidecar（等待 ready 最长 15 秒）。Tauri 的
+    // 同步命令在主线程执行会冻结窗口事件循环，且等待期间 sidecar 事件触发的
+    // get_app_state 全部排队造成界面假死，因此改到阻塞线程池执行。
+    let inner = runtime.inner.clone();
+    drop(runtime);
+    tauri::async_runtime::spawn_blocking(move || {
+        validate_config(&mut config)?;
+        {
+            let mut state = locked(&inner.app, "应用")?;
+            config.enabled = state.running;
+            state.config = config;
+            save_app_state(&app, &state)?;
+        }
+        let _ = app.emit(STATE_CHANGED_EVENT, ());
+        // 配置已落盘。只有运行中且配置确实影响 sidecar 启动时才重启（指纹判定）；
+        // 未运行时仅保存，保持既有的手动启停语义。
+        let state = reconcile_if_running(&app, &inner)?;
+        // 已在阻塞线程池内，可安全预热局域网地址缓存，让返回副本直接带上地址。
+        warm_lan_ip_cache_if_lan(&state, &inner);
+        Ok(with_derived_fields(state, &inner))
+    })
+    .await
+    .map_err(|error| format!("保存服务配置任务执行失败：{error}"))?
 }
 
 #[tauri::command]
@@ -1467,14 +2008,15 @@ pub fn clear_request_logs(
     app: AppHandle,
     runtime: State<'_, RuntimeState>,
 ) -> Result<AppState, String> {
-    let mut state = locked(&runtime.inner.app, "应用")?;
-    // 清理日志只清空请求日志列表，不影响总览统计数据（按天聚合与累计均保留）。
-    state.logs.clear();
-    save_app_state(&app, &state)?;
-    let result = state.clone();
-    drop(state);
+    let snapshot = {
+        let mut state = locked(&runtime.inner.app, "应用")?;
+        // 清理日志只清空请求日志列表，不影响总览统计数据（按天聚合与累计均保留）。
+        state.logs.clear();
+        save_app_state(&app, &state)?;
+        state.clone()
+    };
     let _ = app.emit(STATE_CHANGED_EVENT, ());
-    Ok(result)
+    Ok(with_derived_fields(snapshot, &runtime.inner))
 }
 
 async fn refresh_account_inner(app: &AppHandle, inner: &Arc<RuntimeInner>, account_id: &str) -> Result<bool, String> {
@@ -1602,7 +2144,7 @@ pub async fn refresh_account_quota(
     }
     let state = locked(&runtime.inner.app, "应用")?.clone();
     let _ = app.emit(STATE_CHANGED_EVENT, ());
-    Ok(state)
+    Ok(with_derived_fields(state, &runtime.inner))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1654,7 +2196,10 @@ pub async fn refresh_all_quotas(
             }
         }
     }
-    let state = locked(&runtime.inner.app, "应用")?.clone();
+    let state = {
+        let snapshot = locked(&runtime.inner.app, "应用")?.clone();
+        with_derived_fields(snapshot, &runtime.inner)
+    };
     let _ = app.emit(STATE_CHANGED_EVENT, ());
     if refreshed == 0 {
         return Err(format!("全部 {} 个账号刷新失败，请检查网络连接或重新认证", ids.len()));
@@ -1735,7 +2280,9 @@ pub async fn codebuddy_checkin(
 pub fn start_service_for_tray(app: &AppHandle) -> Result<AppState, String> {
     let runtime = app.state::<RuntimeState>().inner().clone();
     let _lifecycle = locked(&runtime.inner.lifecycle, "服务生命周期")?;
-    start_service_locked(app, &runtime.inner)
+    let state = start_service_locked(app, &runtime.inner)?;
+    warm_lan_ip_cache_if_lan(&state, &runtime.inner);
+    Ok(with_derived_fields(state, &runtime.inner))
 }
 
 fn stop_service_inner(app: &AppHandle, inner: &Arc<RuntimeInner>) -> Result<AppState, String> {
@@ -1764,7 +2311,8 @@ fn stop_service_inner(app: &AppHandle, inner: &Arc<RuntimeInner>) -> Result<AppS
 
 pub fn stop_service_for_tray(app: &AppHandle) -> Result<AppState, String> {
     let runtime = app.state::<RuntimeState>().inner().clone();
-    stop_service_inner(app, &runtime.inner)
+    let state = stop_service_inner(app, &runtime.inner)?;
+    Ok(with_derived_fields(state, &runtime.inner))
 }
 
 pub fn quit_from_tray(app: &AppHandle) {
@@ -1786,7 +2334,11 @@ pub async fn start_service(
     drop(runtime);
     tauri::async_runtime::spawn_blocking(move || {
         let _lifecycle = locked(&inner.lifecycle, "服务生命周期")?;
-        start_service_locked(&app, &inner)
+        let state = start_service_locked(&app, &inner)?;
+        // 已在阻塞线程池内，可以安全预热局域网地址缓存，让返回给前端的副本
+        // 直接带上局域网地址，避免界面出现一次空窗。
+        warm_lan_ip_cache_if_lan(&state, &inner);
+        Ok(with_derived_fields(state, &inner))
     })
     .await
     .map_err(|error| format!("启动任务执行失败：{error}"))?
@@ -1799,9 +2351,12 @@ pub async fn stop_service(
 ) -> Result<AppState, String> {
     let inner = runtime.inner.clone();
     drop(runtime);
-    tauri::async_runtime::spawn_blocking(move || stop_service_inner(&app, &inner))
-        .await
-        .map_err(|error| format!("停止任务执行失败：{error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = stop_service_inner(&app, &inner)?;
+        Ok(with_derived_fields(state, &inner))
+    })
+    .await
+    .map_err(|error| format!("停止任务执行失败：{error}"))?
 }
 
 pub fn shutdown(app: &AppHandle, runtime: &RuntimeState) {
@@ -1879,5 +2434,306 @@ mod tests {
         assert!(!runtime_cleanup_keeps(
             "11533863-75e0-4cc5-9684-8887b21de491-0b1ba4631f29510f.json"
         ));
+    }
+
+    // ---- 局域网地址解析（纯函数）----
+    //
+    // 采样自真实 ipconfig 输出形态：网卡头行不缩进且以 ':' 结尾，字段行缩进。
+    // 中文 Windows 的字段名是「IPv4 地址 …」，仍含 ASCII 子串 "IPv4"，解析器据此识别。
+
+    fn ipconfig_english_sample() -> String {
+        [
+            "Windows IP Configuration",
+            "",
+            "Ethernet adapter Ethernet:",
+            "",
+            "   Connection-specific DNS Suffix  . :",
+            "   Link-local IPv6 Address . . . . . : fe80::1%12",
+            "   IPv4 Address. . . . . . . . . . . : 192.168.1.23",
+            "   Subnet Mask . . . . . . . . . . . : 255.255.255.0",
+            "   Default Gateway . . . . . . . . . : 192.168.1.1",
+            "",
+            "Wireless LAN adapter Wi-Fi:",
+            "",
+            "   IPv4 Address. . . . . . . . . . . : 10.0.0.5",
+            "   Subnet Mask . . . . . . . . . . . : 255.0.0.0",
+        ]
+        .join("\n")
+    }
+
+    fn ipconfig_chinese_sample() -> String {
+        [
+            "Windows IP 配置",
+            "",
+            "以太网适配器 以太网:",
+            "",
+            "   连接特定的 DNS 后缀 . . . . . . . :",
+            "   IPv4 地址 . . . . . . . . . . . . : 192.168.1.23",
+            "   子网掩码  . . . . . . . . . . . . : 255.255.255.0",
+            "   默认网关. . . . . . . . . . . . . : 192.168.1.1",
+            "",
+            "无线局域网适配器 WLAN:",
+            "",
+            "   IPv4 地址 . . . . . . . . . . . . : 192.168.1.88",
+            "",
+            "以太网适配器 vEthernet (WSL):",
+            "",
+            "   IPv4 地址 . . . . . . . . . . . . : 172.20.16.1",
+            "",
+            "以太网适配器 VMware Network Adapter VMnet1:",
+            "",
+            "   IPv4 地址 . . . . . . . . . . . . : 192.168.56.1",
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn parse_ipconfig_extracts_private_ipv4_with_interface_names() {
+        let candidates = parse_ipconfig_candidates(&ipconfig_english_sample());
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].interface_name, "Ethernet adapter Ethernet");
+        assert_eq!(candidates[0].addr.to_string(), "192.168.1.23");
+        assert_eq!(
+            candidates[1].interface_name,
+            "Wireless LAN adapter Wi-Fi"
+        );
+        assert_eq!(candidates[1].addr.to_string(), "10.0.0.5");
+    }
+
+    #[test]
+    fn parse_ipconfig_skips_loopback_and_link_local_addresses() {
+        let output = [
+            "Ethernet adapter Ethernet:",
+            "",
+            "   IPv4 Address. . . . . . . . . . . : 127.0.0.1",
+            "",
+            "Ethernet adapter vEthernet (Default Switch):",
+            "",
+            "   Autoconfiguration IPv4 Address. . : 169.254.10.20",
+        ]
+        .join("\n");
+        assert!(parse_ipconfig_candidates(&output).is_empty());
+    }
+
+    #[test]
+    fn lan_interface_score_prefers_physical_over_virtual() {
+        assert_eq!(lan_interface_score("Ethernet adapter Ethernet"), 0);
+        assert_eq!(lan_interface_score("Wireless LAN adapter Wi-Fi"), 0);
+        assert_eq!(lan_interface_score("Ethernet adapter vEthernet (WSL)"), 2);
+        assert_eq!(
+            lan_interface_score("Ethernet adapter VMware Network Adapter VMnet1"),
+            2
+        );
+        assert_eq!(lan_interface_score("Loopback Pseudo-Interface 1"), 2);
+        assert_eq!(lan_interface_score("Some Unknown Adapter"), 1);
+    }
+
+    #[test]
+    fn lan_interface_score_recognises_chinese_adapter_names() {
+        assert_eq!(lan_interface_score("以太网适配器 以太网"), 0);
+        assert_eq!(lan_interface_score("无线局域网适配器 WLAN"), 0);
+        // vEthernet / VMnet 虽是中文头行，但必须按虚拟网卡处理（虚拟判定优先）。
+        assert_eq!(lan_interface_score("以太网适配器 vEthernet (WSL)"), 2);
+        assert_eq!(
+            lan_interface_score("以太网适配器 VMware Network Adapter VMnet1"),
+            2
+        );
+    }
+
+    #[test]
+    fn lan_addr_score_prefers_home_networks() {
+        assert_eq!(lan_addr_score(Ipv4Addr::new(192, 168, 1, 23)), 0);
+        assert_eq!(lan_addr_score(Ipv4Addr::new(10, 0, 0, 5)), 1);
+        assert_eq!(lan_addr_score(Ipv4Addr::new(172, 20, 16, 1)), 2);
+    }
+
+    #[test]
+    fn select_primary_lan_ipv4_prefers_physical_home_network() {
+        let candidates = vec![
+            LanIpv4Candidate {
+                interface_name: "Ethernet adapter VMware Network Adapter VMnet1".to_string(),
+                addr: Ipv4Addr::new(192, 168, 56, 1),
+            },
+            LanIpv4Candidate {
+                interface_name: "Wireless LAN adapter Wi-Fi".to_string(),
+                addr: Ipv4Addr::new(10, 0, 0, 5),
+            },
+            LanIpv4Candidate {
+                interface_name: "Ethernet adapter Ethernet".to_string(),
+                addr: Ipv4Addr::new(192, 168, 1, 23),
+            },
+        ];
+        assert_eq!(
+            select_primary_lan_ipv4(candidates).map(|addr| addr.to_string()),
+            Some("192.168.1.23".to_string())
+        );
+    }
+
+    #[test]
+    fn select_primary_lan_ipv4_is_deterministic_on_ties() {
+        let candidates = vec![
+            LanIpv4Candidate {
+                interface_name: "Ethernet adapter Ethernet".to_string(),
+                addr: Ipv4Addr::new(192, 168, 1, 30),
+            },
+            LanIpv4Candidate {
+                interface_name: "Ethernet adapter Ethernet 2".to_string(),
+                addr: Ipv4Addr::new(192, 168, 1, 10),
+            },
+        ];
+        assert_eq!(
+            select_primary_lan_ipv4(candidates).map(|addr| addr.to_string()),
+            Some("192.168.1.10".to_string())
+        );
+    }
+
+    #[test]
+    fn select_primary_lan_ipv4_returns_none_without_candidates() {
+        assert!(select_primary_lan_ipv4(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn chinese_ipconfig_picks_real_nic_over_virtual_switches() {
+        let candidates = parse_ipconfig_candidates(&ipconfig_chinese_sample());
+        assert_eq!(candidates.len(), 4);
+        assert_eq!(
+            select_primary_lan_ipv4(candidates).map(|addr| addr.to_string()),
+            Some("192.168.1.23".to_string())
+        );
+    }
+
+    // ---- 运行指纹与运行载荷（纯函数）----
+
+    #[test]
+    fn fnv1a_hex_is_shared_with_auth_file_name() {
+        // auth_file_name 复用同一算法：后缀必须等于 fnv1a_hex，钉死"项目内哈希实现唯一"。
+        let name = auth_file_name("acc-1");
+        assert!(name.ends_with(&format!("-{}.json", fnv1a_hex(b"acc-1"))));
+        assert_ne!(fnv1a_hex(b"a"), fnv1a_hex(b"b"));
+        assert_eq!(fnv1a_hex(b"a"), fnv1a_hex(b"a"));
+    }
+
+    fn fingerprint_fixture(host: &str, remaining_quota: i64, plan: &str) -> (Value, Value) {
+        let config = json!({ "host": host, "port": 11435 });
+        let manifest = json!({
+            "accounts": [
+                { "id": "acc-1", "planType": plan, "remainingQuota": remaining_quota }
+            ]
+        });
+        (config, manifest)
+    }
+
+    #[test]
+    fn stable_json_for_fingerprint_drops_quota_but_keeps_plan_type() {
+        let (_, manifest) = fingerprint_fixture("0.0.0.0", 100, "PRO");
+        let stable = stable_json_for_fingerprint(&manifest);
+        assert!(!stable.contains("remainingQuota"));
+        assert!(stable.contains("planType"));
+        assert!(stable.contains("PRO"));
+    }
+
+    #[test]
+    fn runtime_fingerprint_ignores_quota_refresh() {
+        // 额度刷新不得触发重启：否则会打断进行中的请求（对应交接文档问题 5 的热更新链路）。
+        let (config_a, manifest_a) = fingerprint_fixture("0.0.0.0", 100, "PRO");
+        let (config_b, manifest_b) = fingerprint_fixture("0.0.0.0", 42, "PRO");
+        assert_eq!(
+            runtime_fingerprint(&config_a, &manifest_a),
+            runtime_fingerprint(&config_b, &manifest_b)
+        );
+        assert_eq!(
+            runtime_fingerprint(&config_a, &manifest_a),
+            runtime_fingerprint(&config_a, &manifest_a)
+        );
+    }
+
+    #[test]
+    fn runtime_fingerprint_changes_on_startup_relevant_fields() {
+        let (config_a, manifest_a) = fingerprint_fixture("127.0.0.1", 100, "PRO");
+        // 访问范围变化 → 绑定地址变化 → 必须重启。
+        let (config_b, manifest_b) = fingerprint_fixture("0.0.0.0", 100, "PRO");
+        assert_ne!(
+            runtime_fingerprint(&config_a, &manifest_a),
+            runtime_fingerprint(&config_b, &manifest_b)
+        );
+        // 套餐变化会触发一次重启（已确认可接受）。
+        let (config_c, manifest_c) = fingerprint_fixture("127.0.0.1", 100, "FREE");
+        assert_ne!(
+            runtime_fingerprint(&config_a, &manifest_a),
+            runtime_fingerprint(&config_c, &manifest_c)
+        );
+    }
+
+    #[test]
+    fn build_runtime_payloads_requires_accounts_then_api_keys() {
+        let auths_dir = Path::new("C:/coderelay-test/auths");
+        let state = AppState::default();
+        let error = build_runtime_payloads(&state, &HashMap::new(), auths_dir).unwrap_err();
+        assert!(error.contains("账号"), "unexpected error: {error}");
+
+        let mut state = AppState::default();
+        state.accounts.push(Account {
+            id: "acc-1".into(),
+            email: "user@example.cn".into(),
+            region: "cn".into(),
+            plan: "PRO".into(),
+            ..Account::default()
+        });
+        let mut credentials = HashMap::new();
+        credentials.insert(
+            "acc-1".to_string(),
+            AccountCredential {
+                account_id: "acc-1".into(),
+                access_token: "access-secret".into(),
+                refresh_token: None,
+            },
+        );
+        // 账号齐了但没有任何启用的 Key → 报 API Key 错误（校验顺序与拆分前一致）。
+        let error = build_runtime_payloads(&state, &credentials, auths_dir).unwrap_err();
+        assert!(error.contains("API Key"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn build_runtime_payloads_matches_sidecar_contract() {
+        let mut state = AppState::default();
+        state.accounts.push(Account {
+            id: "acc-1".into(),
+            email: "user@example.cn".into(),
+            region: "cn".into(),
+            plan: "PRO".into(),
+            quota: 12.6,
+            ..Account::default()
+        });
+        state.keys.push(ApiKey {
+            id: "key-1".into(),
+            name: "cursor".into(),
+            key: "sk-test".into(),
+            enabled: true,
+            ..ApiKey::default()
+        });
+        let mut credentials = HashMap::new();
+        credentials.insert(
+            "acc-1".to_string(),
+            AccountCredential {
+                account_id: "acc-1".into(),
+                access_token: "access-secret".into(),
+                refresh_token: None,
+            },
+        );
+        // 局域网模式下 host 必须是绑定地址，绝不能被"展示折叠"影响。
+        state.config.scope = "lan".into();
+        state.config.bind_host = "0.0.0.0".into();
+        state.config.port = 11435;
+
+        let (config, manifest) =
+            build_runtime_payloads(&state, &credentials, Path::new("C:/coderelay-test/auths"))
+                .expect("payloads");
+
+        assert_eq!(config["host"], "0.0.0.0");
+        assert_eq!(config["port"], 11435);
+        assert_eq!(config["request-log"], false);
+        assert_eq!(manifest["accounts"][0]["planType"], "PRO");
+        assert_eq!(manifest["accounts"][0]["remainingQuota"], 13);
+        assert_eq!(manifest["apiKeys"][0]["key"], "sk-test");
     }
 }
