@@ -3,7 +3,7 @@
 一个面向高级用户的 **Windows 桌面管理工具**：集中管理 CodeBuddy 中国站账号池，并运行一个本地 **OpenAI 兼容反代服务**，让 Cursor、CodeBuddy IDE 等客户端通过统一的本地地址接入多个账号，按策略做负载均衡、冷却与配额调度。
 
 ![License](https://img.shields.io/badge/license-MIT%20with%20Commons%20Clause-blue)
-![Version](https://img.shields.io/badge/version-0.1.2-blue)
+![Version](https://img.shields.io/badge/version-0.3.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)
 
 [English](./README.en.md) | **中文**
@@ -14,12 +14,13 @@
 
 ## 功能特性
 
-- **账号池管理**：支持 OAuth/网页登录、手动粘贴 Token、导入配置文件三种方式添加账号；账号健康状态、冷却、额度与绑定关系一目了然。
+- **账号池管理**：支持 OAuth/网页登录、手动粘贴 Token、导入配置文件三种方式添加账号；账号健康状态、冷却、额度与绑定关系一目了然；支持长按拖拽调整账号顺序，账号导出用于备份与迁移。
 - **每日签到**：单个账号签到或一键全部签到。
 - **API Key 管理**：`sk-*` 前缀，支持绑定账号范围、限制模型、别名与启用/禁用。
-- **模型管理**：从在线接口同步模型清单并本地缓存，支持别名与禁用。
-- **本地反代服务**：`127.0.0.1:11435`，手动启动/停止，支持多账号调度策略与会话亲和。
-- **请求统计与日志**：总请求数、Token、缓存命中率、Credit 消耗、按小时柱状图；日志保留最近 7 天，支持筛选与 JSON 导出。
+- **模型管理**：从在线接口同步模型清单并本地缓存（跨重启保留），支持别名与禁用；同步失败时逐账号回退并给出可见的错误提示。
+- **本地反代服务**：默认监听 `127.0.0.1:11435`，手动启动/停止，支持多账号调度策略与会话亲和。
+- **局域网接入**：访问范围可切换为「本机 + 局域网」，界面自动识别并展示局域网接入地址（一键复制，附 Windows 防火墙放行命令）；切换网络后地址自动刷新。
+- **请求统计与日志**：总请求数、Token、缓存命中率、Credit 消耗、按小时柱状图与按天聚合；请求日志当日保留，支持筛选、详情与 JSON 导出。
 - **系统托盘与通知**：最小化到托盘、启动/停止反代、退出；启动失败/服务异常时发送 Windows 系统通知。
 
 ---
@@ -65,7 +66,7 @@ npm run tauri:build
 1. **添加账号**：进入「账号池」，通过浏览器认证、手动 Token 或配置文件导入添加 CodeBuddy 中国站账号。
 2. **创建 API Key**：在「API Key」页面创建一个以 `sk-` 开头的 Key，并绑定可用的账号范围。
 3. **启动服务**：在「服务配置」或底部状态栏手动启动反代服务（服务**不会**随软件启动自动运行）。
-4. **接入客户端**：把客户端指向 `http://127.0.0.1:11435`，用你创建的 API Key 认证即可。
+4. **接入客户端**：把客户端指向 `http://127.0.0.1:11435`，用你创建的 API Key 认证即可。若要让手机、平板等局域网设备接入，在「服务配置 → 网络 → 访问范围」切换为「本机 + 局域网」，复制页面展示的局域网地址（页面同时提供 Windows 防火墙放行命令）。
 
 ### 接入示例
 
@@ -120,7 +121,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | `src-tauri/src/lib.rs` | Tauri 入口（插件、单实例、托盘、窗口） |
 | `src-tauri/src/gateway.rs` | 核心：sidecar 进程管理、状态机、事件解析、凭据热更新 |
 | `src-tauri/src/codebuddy_oauth.rs` | 账号 OAuth 认证、token/额度刷新、签到 |
-| `src-tauri/src/models.rs` | 请求日志/统计结构 |
+| `src-tauri/src/models.rs` | 请求日志/统计结构与应用状态模型 |
 | `sidecars/coderelay-proxy/` | Go sidecar 主程序（relay 服务器、模型同步、账号池调度） |
 | `scripts/` | `build-sidecar.ps1`、`sync-version.mjs` |
 

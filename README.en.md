@@ -3,7 +3,7 @@
 A **Windows desktop management tool** for power users: centrally manage CodeBuddy China account pools and run a local **OpenAI-compatible reverse proxy service**, letting clients such as Cursor and CodeBuddy IDE connect to multiple accounts through a single local address with policy-based load balancing, cooldown, and quota scheduling.
 
 ![License](https://img.shields.io/badge/license-MIT%20with%20Commons%20Clause-blue)
-![Version](https://img.shields.io/badge/version-0.1.2-blue)
+![Version](https://img.shields.io/badge/version-0.3.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)
 
 **English** | [中文](./README.md)
@@ -14,12 +14,13 @@ A **Windows desktop management tool** for power users: centrally manage CodeBudd
 
 ## Features
 
-- **Account Pool Management**: Add accounts via OAuth/web login, manual token paste, or config file import. Account health, cooldown, quota, and binding status are visible at a glance.
+- **Account Pool Management**: Add accounts via OAuth/web login, manual token paste, or config file import. Account health, cooldown, quota, and binding status are visible at a glance; long-press drag to reorder accounts, and export accounts for backup or migration.
 - **Daily Check-in**: Check in a single account or all accounts with one click.
 - **API Key Management**: `sk-*` prefixed keys with binding scope, model restrictions, aliases, and enable/disable.
-- **Model Management**: Sync model lists from the online API with local caching; supports aliases and disabling.
-- **Local Reverse Proxy Service**: `127.0.0.1:11435`, manual start/stop, multi-account scheduling strategies with session affinity.
-- **Request Statistics & Logs**: Total requests, tokens, cache hit rate, credit consumption, hourly bar chart; logs retained for 7 days with filtering and JSON export.
+- **Model Management**: Sync model lists from the online API with local caching that survives restarts; supports aliases and disabling, with per-account fallback and visible error reporting when a sync fails.
+- **Local Reverse Proxy Service**: Listens on `127.0.0.1:11435` by default, manual start/stop, multi-account scheduling strategies with session affinity.
+- **LAN Access**: Switch the access scope to "Local + LAN" and the app automatically detects and displays a LAN address (one-click copy, plus a Windows Firewall rule command); the address refreshes automatically when the network changes.
+- **Request Statistics & Logs**: Total requests, tokens, cache hit rate, credit consumption, hourly bar chart and per-day aggregation; request logs are kept for the current day with filtering, details, and JSON export.
 - **System Tray & Notifications**: Minimize to tray, start/stop proxy, quit; Windows system notifications on startup failure or service errors.
 
 ---
@@ -65,7 +66,7 @@ Build artifacts (NSIS installer and MSI) are output to the Cargo target director
 1. **Add Accounts**: Go to "Account Pool" and add CodeBuddy China accounts via browser authentication, manual token, or config file import.
 2. **Create an API Key**: On the "API Key" page, create a `sk-` prefixed key and bind it to the available account scope.
 3. **Start the Service**: Manually start the reverse proxy from "Service Config" or the bottom status bar (the service does **not** auto-start with the app).
-4. **Connect Your Client**: Point your client to `http://127.0.0.1:11435` and authenticate with the API key you created.
+4. **Connect Your Client**: Point your client to `http://127.0.0.1:11435` and authenticate with the API key you created. To let phones, tablets, or other LAN devices connect, switch "Service Config -> Network -> Access Scope" to "Local + LAN" and copy the LAN address shown on the page (a Windows Firewall rule command is provided there as well).
 
 ### Connection Examples
 
@@ -122,7 +123,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | `src-tauri/src/lib.rs` | Tauri entry point (plugins, single instance, tray, window) |
 | `src-tauri/src/gateway.rs` | Core: sidecar process management, state machine, event parsing, credential hot-reload |
 | `src-tauri/src/codebuddy_oauth.rs` | Account OAuth, token/quota refresh, check-in |
-| `src-tauri/src/models.rs` | Request log / statistics structures |
+| `src-tauri/src/models.rs` | Request log / statistics structures and app state model |
 | `sidecars/coderelay-proxy/` | Go sidecar main program (relay server, model sync, account pool scheduling) |
 | `scripts/` | `build-sidecar.ps1`, `sync-version.mjs` |
 
