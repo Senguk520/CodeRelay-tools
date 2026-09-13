@@ -127,17 +127,41 @@ export async function listModels(port = 11435, apiKey?: string): Promise<ModelIn
   return payload.data ?? [];
 }
 
+// ModelSyncResult 是 sidecar 模型同步接口的返回结果。count 为后端实际拉取到的
+// 模型数（0 表示失败），error 带具体失败原因（失败阶段 / HTTP 状态 / 业务码 /
+// 使用的账号），界面必须按它展示结果，不能拿 /v1/models 的长度冒充同步结果。
+export interface ModelSyncResult {
+  count: number;
+  refreshed: boolean;
+  error?: string;
+  attempts?: number;
+  accountsTried?: number;
+  accountId?: string;
+  httpStatus?: number;
+  bizCode?: number;
+}
+
 // syncModels 通知 sidecar 立即从 CodeBuddy CN 后端重新拉取模型清单并覆盖
 // 本地缓存（POST /v1/coderelay/codebuddy/sync）。随后再调 listModels 读取
 // 更新后的 /v1/models 目录。
-export async function syncModels(port = 11435, apiKey?: string): Promise<number> {
+export async function syncModels(port = 11435, apiKey?: string): Promise<ModelSyncResult> {
   const response = await fetch(`http://127.0.0.1:${port}/v1/coderelay/codebuddy/sync`, {
     method: 'POST',
     headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
   });
   if (!response.ok) throw new Error(`模型同步失败：HTTP ${response.status}`);
-  const payload = await response.json() as { count?: number };
-  return payload.count ?? 0;
+  const payload = await response.json() as Partial<ModelSyncResult> & { error?: string };
+  const error = typeof payload.error === 'string' ? payload.error.trim() : '';
+  return {
+    count: typeof payload.count === 'number' ? payload.count : 0,
+    refreshed: Boolean(payload.refreshed),
+    error: error || undefined,
+    attempts: payload.attempts,
+    accountsTried: payload.accountsTried,
+    accountId: payload.accountId,
+    httpStatus: payload.httpStatus,
+    bizCode: payload.bizCode,
+  };
 }
 
 function requireTauri(feature: string) {

@@ -277,6 +277,17 @@ func InstallCodebuddyModelIDs(ids []string) []string {
 	return InstallCodebuddyModels(models)
 }
 
+// ResetCodebuddyModelCatalogForTest clears the installed online model catalog so
+// capability lookups fall back to the static models.json again. Unit tests that
+// install a fake catalog use it to avoid leaking that catalog into other tests of
+// the same test binary (test order is not guaranteed). Production code must not
+// call it.
+func ResetCodebuddyModelCatalogForTest() {
+	codebuddySyncMu.Lock()
+	codebuddySynced = nil
+	codebuddySyncMu.Unlock()
+}
+
 // InstallCodebuddyModels installs an externally-fetched model list (e.g. from
 // the official backend model-list endpoint) as the active codebuddy registry
 // catalog, preserving capability fields such as SupportsImages so vision-proxy

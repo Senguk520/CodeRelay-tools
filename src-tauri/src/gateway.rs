@@ -18,6 +18,10 @@ use tauri_plugin_notification::NotificationExt;
 const STATE_FILE: &str = "state.json";
 const CREDENTIALS_FILE: &str = "credentials.json";
 const RUNTIME_DIR: &str = "sidecar-runtime";
+// RUNTIME_MODEL_CACHE_FILE 是 sidecar 写出的 CodeBuddy 模型清单缓存。停止服务/退出
+// 程序清理运行目录时必须保留它：否则每次重启都要靠一次性的后端同步兜底，单次失败
+// 就会让模型目录退化成只剩 auto + codex-auto-review。该文件不含任何凭据。
+const RUNTIME_MODEL_CACHE_FILE: &str = "codebuddy_models_cache.json";
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_PENDING_REQUESTS: usize = 4096;
 const MAX_STDERR_BYTES: usize = 16 * 1024;
@@ -566,10 +570,38 @@ fn sync_credentials_from_runtime(app: &AppHandle, inner: &Arc<RuntimeInner>) -> 
 
 fn clear_runtime_files(app: &AppHandle) -> Result<(), String> {
     let root = runtime_files(app)?.root;
-    if root.exists() {
-        fs::remove_dir_all(&root).map_err(|error| format!("清理 sidecar 运行目录失败：{error}"))?;
+    if !root.exists() {
+        return Ok(());
+    }
+    // 逐项清理而不是整体删目录：模型清单缓存要跨启动保留（见 RUNTIME_MODEL_CACHE_FILE），
+    // 其余内容（config.json / manifest.json / auths/ 凭据）照旧清掉，token 不落盘。
+    for entry in fs::read_dir(&root)
+        .map_err(|error| format!("读取 sidecar 运行目录失败：{error}"))?
+        .flatten()
+    {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if runtime_cleanup_keeps(name) {
+            continue;
+        }
+        let removal = if path.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        removal.map_err(|error| format!("清理 sidecar 运行目录失败：{error}"))?;
     }
     Ok(())
+}
+
+// runtime_cleanup_keeps 判断停止/退出清理运行目录时该条目是否必须保留。当前只保留
+// 模型清单缓存：它是「打包后模型目录只剩 2 个」问题的关键兜底，被删掉后重启就只能
+// 依赖一次性后端同步；凭据文件不在此列。
+fn runtime_cleanup_keeps(name: &str) -> bool {
+    name.eq_ignore_ascii_case(RUNTIME_MODEL_CACHE_FILE)
 }
 
 fn sidecar_binary(app: &AppHandle) -> Result<PathBuf, String> {
@@ -925,6 +957,31 @@ fn ingest_event(app: &AppHandle, inner: &Arc<RuntimeInner>, value: &Value) {
             if !message.is_empty() {
                 if let Ok(mut state) = inner.app.lock() {
                     state.last_error = Some(message);
+                    changed = true;
+                }
+            }
+        }
+        // 模型同步失败：把原因（失败阶段 / HTTP 状态 / 业务码 / 使用的账号）写进
+        // last_error，概览页与服务页会直接显示，不再只表现为「目录里少了一堆模型」。
+        "codebuddy_model_sync_error" => {
+            let message = event_string(value, "message");
+            if !message.is_empty() {
+                if let Ok(mut state) = inner.app.lock() {
+                    state.last_error = Some(message);
+                    changed = true;
+                }
+            }
+        }
+        // 同步恢复成功后清掉这条同步错误，避免失败提示常驻界面；其它来源的
+        // last_error（如启动失败、异常退出）不受影响。
+        "codebuddy_model_sync" => {
+            if let Ok(mut state) = inner.app.lock() {
+                let stale = state
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|message| message.starts_with("CodeBuddy 模型同步失败"));
+                if stale {
+                    state.last_error = None;
                     changed = true;
                 }
             }
@@ -1808,5 +1865,19 @@ mod tests {
         config.scope = "lan".into();
         validate_config(&mut config).expect("valid config");
         assert_eq!(config.bind_host, "0.0.0.0");
+    }
+
+    #[test]
+    fn runtime_cleanup_keeps_only_model_cache() {
+        // 模型清单缓存必须跨「停止服务 / 退出程序」保留，否则下次启动只剩一次性的
+        // 后端同步兜底；凭据、配置与清单文件必须照旧清理。
+        assert!(runtime_cleanup_keeps(RUNTIME_MODEL_CACHE_FILE));
+        assert!(runtime_cleanup_keeps("CodeBuddy_Models_Cache.JSON"));
+        assert!(!runtime_cleanup_keeps("manifest.json"));
+        assert!(!runtime_cleanup_keeps("config.json"));
+        assert!(!runtime_cleanup_keeps("auths"));
+        assert!(!runtime_cleanup_keeps(
+            "11533863-75e0-4cc5-9684-8887b21de491-0b1ba4631f29510f.json"
+        ));
     }
 }

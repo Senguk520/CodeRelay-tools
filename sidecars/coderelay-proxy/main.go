@@ -22,6 +22,7 @@ import (
 
 	codexlive "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/live"
 	internalregistry "github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	log "github.com/sirupsen/logrus"
 
 	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	sdkopenai "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/openai"
@@ -179,32 +180,54 @@ func main() {
 		os.Exit(1)
 	}
 	defer runtime.Stop()
-	// 导入 codebuddy 账号时自动执行一次模型同步并持久化；不做定时自动拉取，
-	// 以最大程度节省资源。手动「同步模型」按钮仍会覆盖本地缓存。
-	hook.syncCodebuddy = func() {
-		synced := syncCodebuddyModelsFromBackend(coreManager.List(), codebuddyModelCachePath(*manifestPath))
+	// runCodebuddyModelSync 执行一次 CodeBuddy 模型同步：成功刷新清单并广播事件，
+	// 失败写日志并发事件（Rust 侧落到 last_error，界面可见）。失败不动已有清单与
+	// 本地缓存，避免把可用目录退化成只剩 auto。
+	runCodebuddyModelSync := func(stage string) bool {
+		synced, outcome := syncCodebuddyModelsFromBackend(coreManager.List(), codebuddyModelCachePath(*manifestPath))
 		if len(synced) == 0 {
-			return
+			log.Warnf("codebuddy model sync failed (%s): %s (accounts=%d attempts=%d httpStatus=%d bizCode=%d)",
+				stage, outcome.Error, outcome.AccountsTried, outcome.Attempts, outcome.HTTPStatus, outcome.BizCode)
+			emitter.emit(map[string]any{
+				"type":    "codebuddy_model_sync_error",
+				"message": "CodeBuddy 模型同步失败：" + outcome.Error,
+			})
+			return false
 		}
 		if !m.setModelIDs(synced) {
-			return
+			log.Infof("codebuddy model sync ok (%s): %d models unchanged (account=%s)", stage, len(synced), outcome.AccountID)
+			return true
 		}
 		internalregistry.NotifyCodebuddyModelRefresh()
+		log.Infof("codebuddy model sync ok (%s): %d models via account=%s", stage, len(synced), outcome.AccountID)
 		emitter.emit(map[string]any{
 			"type":    "codebuddy_model_sync",
 			"message": fmt.Sprintf("codebuddy models updated to %d entries (source=tencent-backend)", len(synced)),
 		})
+		return true
 	}
+	// 导入 codebuddy 账号时自动执行一次模型同步并持久化；不做定时自动拉取，
+	// 以最大程度节省资源。手动「同步模型」按钮仍会覆盖本地缓存。
+	hook.syncCodebuddy = func() { runCodebuddyModelSync("auth-hook") }
 	// 服务启动后从 model 接口同步一次模型清单并覆盖本地缓存，使 /v1/models
 	// 反映完整模型目录（后端接口直接拉取，不做任何本地 app.asar 提取）。
-	// 异步执行，不阻塞 ready 事件与 HTTP 服务启动。
+	// 异步执行，不阻塞 ready 事件与 HTTP 服务启动；失败则在启动窗口内补一次——
+	// 账号池里存在失效 token 或网关偶发抖动时，单次失败不应让模型目录长期缺项。
 	go func() {
 		select {
 		case <-time.After(500 * time.Millisecond):
 		case <-ctx.Done():
 			return
 		}
-		hook.syncCodebuddy()
+		if runCodebuddyModelSync("startup") {
+			return
+		}
+		select {
+		case <-time.After(codebuddyModelSyncStartupRetryDelay):
+		case <-ctx.Done():
+			return
+		}
+		runCodebuddyModelSync("startup-retry")
 	}()
 	emitter.emitStartupStage("start_http_server")
 

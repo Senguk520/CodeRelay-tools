@@ -639,12 +639,21 @@ function ModelsPage({ state, notify }: { state: AppState; notify: NoticeHandler 
     try {
       const port = state.actualPort ?? state.config.port;
       // 先让 sidecar 从 CodeBuddy CN 后端重新拉取模型并覆盖本地缓存，
-      // 再读取更新后的 /v1/models 目录展示。
-      await syncModels(port, enabledKey);
+      // 再读取更新后的 /v1/models 目录展示。失败时必须展示 sidecar 回传的
+      // 真实原因（失败阶段 / HTTP 状态 / 使用的账号），不能拿目录长度冒充结果。
+      const result = await syncModels(port, enabledKey);
+      if (result.count <= 0) {
+        notify(`模型同步失败：${result.error ?? '后端未返回可用模型'}`);
+        return;
+      }
       const next = await listModels(port, enabledKey);
+      if (!next.length) {
+        notify(`已同步 ${result.count} 个模型，但目录暂不可读，请稍后重试或查看日志`);
+        return;
+      }
       setModels(next);
       setLastSync(Date.now());
-      notify(`已从后端同步 ${next.length} 个模型`);
+      notify(`已从后端同步 ${result.count} 个模型`);
     } catch (reason) {
       notify(reason instanceof Error ? reason.message : String(reason));
     } finally { setSyncing(false); }
