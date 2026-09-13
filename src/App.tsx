@@ -79,6 +79,27 @@ function parseDateKey(key: string) { const [y, m, d] = key.split('-').map(Number
 function formatDateLabel(d: Date) { return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`; }
 function maskKey(key: string) { return key.length <= 12 ? key : `${key.slice(0, 8)}••••••${key.slice(-4)}`; }
 
+/**
+ * 展示用主机名：`0.0.0.0` / `::` 表示「监听本机所有网卡」，是可路由语义符号而**不是**
+ * 可连接的地址，直接展示会让用户复制出一个连不通的地址，因此统一折叠为本机回环地址。
+ *
+ * 注意：这里只影响界面展示，**绝不改写后端 `bind_host`** —— 它是 sidecar 实际绑定
+ * 地址的唯一来源，被折叠成 127.0.0.1 会让局域网绑定静默失效。
+ */
+function displayHost(host: string) {
+  const trimmed = (host ?? '').trim();
+  if (!trimmed || trimmed === '0.0.0.0' || trimmed === '::') return '127.0.0.1';
+  return trimmed;
+}
+
+/**
+ * 本机可连接地址（含 OpenAI 兼容路径）。走 `displayHost` 折叠，
+ * 因此在「本机 + 局域网」模式下也不会把不可连接的 `0.0.0.0` 暴露给用户。
+ */
+function localBaseUrl(state: AppState) {
+  return `http://${displayHost(state.config.bindHost)}:${state.actualPort ?? state.config.port}/v1`;
+}
+
 async function copyText(value: string) {
   if (navigator.clipboard) {
     await navigator.clipboard.writeText(value);
@@ -140,6 +161,23 @@ export function App() {
     let unlisten: (() => void) | undefined;
     void listen('coderelay-state-changed', () => { void refreshState(); }).then((cleanup) => { unlisten = cleanup; });
     return () => unlisten?.();
+  }, []);
+
+  useEffect(() => {
+    if (!hasTauri()) return;
+    // 切换 WiFi / 手机热点 / 插拔网线后，网卡地址会变，界面上残留的旧地址会变成
+    // 连不上的黑洞（客户端表现为几十秒超时）。系统一报告网络变化就拉一次状态，
+    // 后端会校验并重新解析地址，界面自动跟上。
+    const handleNetworkChange = () => { void refreshState(); };
+    window.addEventListener('online', handleNetworkChange);
+    window.addEventListener('visibilitychange', handleNetworkChange);
+    const connection = (navigator as unknown as { connection?: EventTarget }).connection;
+    connection?.addEventListener?.('change', handleNetworkChange);
+    return () => {
+      window.removeEventListener('online', handleNetworkChange);
+      window.removeEventListener('visibilitychange', handleNetworkChange);
+      connection?.removeEventListener?.('change', handleNetworkChange);
+    };
   }, []);
 
   useEffect(() => {
@@ -278,7 +316,7 @@ export function App() {
       </header>
       <div className="content-scroll"><div className="page-container">
         {page === 'overview' && <OverviewPage state={state} onNavigate={setPage} onRefresh={() => { void handleRefreshOverview(); }} refreshing={refreshing} />}
-        {page === 'service' && <ServicePage state={state} onSave={(config) => void runAction(() => saveConfig(config), '服务配置已保存；服务运行时需重新启动后生效', 'save')} notify={notify} />}
+        {page === 'service' && <ServicePage state={state} onApply={async (config) => { updateState(await saveConfig(config)); }} notify={notify} />}
         {page === 'keys' && <KeysPage state={state} onAdd={() => { setEditingKey(null); setShowKeyModal(true); }} onEdit={(key) => { setEditingKey(key); setShowKeyModal(true); }} onSave={(keys) => void runAction(() => saveKeys(keys), 'API Key 已更新', 'save')} notify={notify} />}
         {page === 'logs' && <LogsPage state={state} onClear={() => void runAction(clearLogs, '请求日志已清理', 'save')} notify={notify} />}
         {page === 'accounts' && <AccountsPage state={state} blocked={busy !== null} onAdd={() => { setAccountModalMode('browser'); setShowAccountModal(true); }} onImport={() => { setAccountModalMode('file'); setShowAccountModal(true); }} onSave={(accounts) => void runAction(() => saveAccounts(accounts), '账号列表已更新', 'save')} onRefresh={handleRefreshAccount} onRefreshAll={handleRefreshAll} onCheckin={() => setShowCheckinModal(true)} notify={notify} />}
@@ -335,7 +373,7 @@ function OverviewPage({ state, onNavigate, onRefresh, refreshing }: { state: App
     </div>
     {isEmptyDay && <div className="inline-empty-hint"><CalendarDays size={14} />该日暂无请求数据，可选择其他日期或切换到累计视图。</div>}
     <div className="overview-grid">
-      <section className={`hero-status panel ${state.running ? 'running' : ''}`}><div className="panel-topline"><span className="panel-kicker"><Server size={14} />反代服务</span><StatusPill tone={state.running ? 'success' : 'muted'}>{state.running ? '运行中' : '已停止'}</StatusPill></div><div className="hero-value">{state.running ? '服务在线' : '等待手动启动'}</div><p>{state.running ? `正在监听 ${state.config.bindHost}:${state.actualPort ?? state.config.port}` : state.lastError ?? '服务启动后将通过本地 OpenAI 兼容接口接收请求。'}</p><div className="hero-foot"><div><span>可用账号</span><strong>{available} / {state.accounts.length}</strong></div><div><span>需要关注</span><strong>{attention}</strong></div><button className="inline-link" onClick={() => onNavigate('service')}>查看服务配置 <span>→</span></button></div></section>
+      <section className={`hero-status panel ${state.running ? 'running' : ''}`}><div className="panel-topline"><span className="panel-kicker"><Server size={14} />反代服务</span><StatusPill tone={state.running ? 'success' : 'muted'}>{state.running ? '运行中' : '已停止'}</StatusPill></div><div className="hero-value">{state.running ? '服务在线' : '等待手动启动'}</div><p>{state.running ? `正在监听 ${displayHost(state.config.bindHost)}:${state.actualPort ?? state.config.port}` : state.lastError ?? '服务启动后将通过本地 OpenAI 兼容接口接收请求。'}{state.running && state.lanBaseUrl ? ` · 局域网设备可用 ${state.lanBaseUrl}` : ''}</p><div className="hero-foot"><div><span>可用账号</span><strong>{available} / {state.accounts.length}</strong></div><div><span>需要关注</span><strong>{attention}</strong></div><button className="inline-link" onClick={() => onNavigate('service')}>查看服务配置 <span>→</span></button></div></section>
       <section className="metric-card panel"><span className="metric-icon blue"><Activity size={17} /></span><span className="metric-label">总请求数</span><strong>{formatCompact(source.requestCount)}</strong><span className="metric-trend"><small>{formatNumber(source.successCount)} 成功 · {formatNumber(source.failureCount)} 失败</small></span></section>
       <section className="metric-card panel"><span className="metric-icon purple"><Zap size={17} /></span><span className="metric-label">总 Token</span><strong>{formatCompact(source.totalTokens)}</strong><span className="metric-trend"><small>输入 + 输出</small></span></section>
       <section className="metric-card panel"><span className="metric-icon green"><Database size={17} /></span><span className="metric-label">缓存命中率</span><strong>{cacheRate}%</strong><span className="metric-trend"><small>{formatNumber(source.cacheHitTokens)} tokens 命中</small></span></section>
@@ -375,17 +413,89 @@ function DatePicker({ value, byDay, onSelect, onClose }: { value: string; byDay:
 
 function MiniLog({ log, accounts }: { log: RequestLog; accounts: Account[] }) { const account = accounts.find((item) => item.id === log.accountId); return <div className="mini-log"><span className={`log-status-icon ${log.success ? 'ok' : 'fail'}`}>{log.success ? <Check size={13} /> : <X size={13} />}</span><div className="mini-log-main"><strong>{log.model || '未指定模型'}</strong><span>{log.path || '—'} · {account?.email ?? (log.accountId || '未选择账号')}</span></div><span className="mini-log-time">{formatTime(log.timestamp)}</span><span className={`code-status ${log.success ? 'ok' : 'fail'}`}>{log.status || '—'}</span></div>; }
 
-function ServicePage({ state, onSave, notify }: { state: AppState; onSave: (config: ServiceConfig) => void; notify: NoticeHandler }) {
+function ServicePage({ state, onApply, notify }: { state: AppState; onApply: (config: ServiceConfig) => Promise<void>; notify: NoticeHandler }) {
   const [draft, setDraft] = useState(state.config);
-  useEffect(() => setDraft(state.config), [state.config]);
-  const change = <K extends keyof ServiceConfig>(key: K, value: ServiceConfig[K]) => setDraft((current) => ({ ...current, [key]: value }));
-  const save = () => {
-    if (draft.port < 1024 || draft.port > 65535) { notify('服务端口必须在 1024 到 65535 之间'); return; }
-    onSave(draft);
+  const draftRef = useRef(state.config);
+  // 自动生效：改动任意一项就排队落盘，不再需要底部确认按钮。
+  // - pendingConfig / applyTimer 做去抖，连点或连续输入只会打一次保存；
+  // - dirty 表示「本地还有没落盘的改动」，此时绝不回灌服务端状态，否则会打断输入。
+  const pendingConfig = useRef<ServiceConfig | null>(null);
+  const applyTimer = useRef<number | null>(null);
+  const dirty = useRef(false);
+  const [applyState, setApplyState] = useState<'idle' | 'applying' | 'error'>('idle');
+  const [applyError, setApplyError] = useState<string | null>(null);
+  useEffect(() => {
+    if (dirty.current) return;
+    draftRef.current = state.config;
+    setDraft(state.config);
+  }, [state.config]);
+  // 本地先校验：不合法就不发给后端（避免边输入边报错刷屏），也不冒充「已生效」。
+  const localConfigError = (config: ServiceConfig) => {
+    if (!Number.isInteger(config.port) || config.port < 1024 || config.port > 65535) return '服务端口必须在 1024 到 65535 之间，改好后自动生效';
+    if (config.requestTimeoutMs < 1000) return '请求超时不能小于 1 秒，改好后自动生效';
+    return null;
   };
+  const flush = async () => {
+    const config = pendingConfig.current;
+    if (!config) return;
+    pendingConfig.current = null;
+    setApplyState('applying');
+    try {
+      await onApply(config);
+      setApplyError(null);
+      setApplyState('idle');
+      // 落盘期间没有新的输入时，允许服务端状态回灌（两边此刻是一致的）。
+      if (pendingConfig.current === null && applyTimer.current === null) dirty.current = false;
+    } catch (error) {
+      setApplyError(String(error));
+      setApplyState('error');
+    }
+  };
+  const queue = (config: ServiceConfig, delay: number) => {
+    if (applyTimer.current !== null) { window.clearTimeout(applyTimer.current); applyTimer.current = null; }
+    const invalid = localConfigError(config);
+    if (invalid) {
+      pendingConfig.current = null;
+      setApplyError(invalid);
+      setApplyState('error');
+      return;
+    }
+    pendingConfig.current = config;
+    setApplyError(null);
+    setApplyState('applying');
+    applyTimer.current = window.setTimeout(() => { applyTimer.current = null; void flush(); }, delay);
+  };
+  const commit = (patch: Partial<ServiceConfig>, delay = 0) => {
+    const next = { ...draftRef.current, ...patch };
+    draftRef.current = next;
+    dirty.current = true;
+    setDraft(next);
+    queue(next, delay);
+  };
+  const change = <K extends keyof ServiceConfig>(key: K, value: ServiceConfig[K], delay = 0) => commit({ [key]: value } as Partial<ServiceConfig>, delay);
+  // 离开本页时把排队中的改动立刻落盘，避免「改完就走」丢配置。
+  useEffect(() => () => { if (applyTimer.current !== null) { window.clearTimeout(applyTimer.current); applyTimer.current = null; void flush(); } }, []);
+  const applyHint = applyError ?? (applyState === 'idle' ? '所有修改已自动生效；服务运行中且配置有变化时会自动重启反代。' : '正在应用修改…');
+  const [lanCopied, setLanCopied] = useState(false);
+  // 局域网地址来自后端派生值（后端已挑好本机网卡 IPv4）。为空表示尚未解析到，
+  // 此时给轻提示而不是静默，方便用户自救。
+  const lanAddress = state.lanBaseUrl ? `${state.lanBaseUrl}/v1` : '';
+  // 草稿切到「本机 + 局域网」但尚未保存时，后端还没绑定 0.0.0.0，
+  // 此时不能显示「稍候会自动重试」这类描述"已生效"的话术，否则等于骗用户。
+  const lanPendingSave = draft.scope === 'lan' && state.config.scope !== 'lan' && applyState !== 'error';
+  // 草稿切到局域网但还没保存时，后端根本不会派生地址（它只看已保存的 scope）。
+  // 此时若写「未识别到可用局域网地址」，会把"还没保存"误报成"解析失败"——排查成本很高。
+  const lanAddressPlaceholder = lanPendingSave ? '正在应用配置…' : '未识别到可用局域网地址';
+  const firewallPort = state.actualPort ?? state.config.port;
+  const firewallCommand = `netsh advfirewall firewall add rule name="CodeRelay ${firewallPort}" dir=in action=allow protocol=TCP localport=${firewallPort} profile=private`;
+  const copyLanAddress = () => {
+    if (!lanAddress) { notify('尚未识别到可用局域网地址'); return; }
+    void copyText(lanAddress).then(() => { setLanCopied(true); notify('局域网地址已复制'); window.setTimeout(() => setLanCopied(false), 1600); });
+  };
+
   return <><SectionHeader eyebrow="反代服务 / 配置" title="服务配置" description="控制本地 OpenAI 兼容入口、请求处理和 CodeBuddy 账号调度。" action={<StatusPill tone={state.running ? 'success' : 'muted'}>{state.running ? `运行中 · ${state.actualPort ?? draft.port}` : '已停止'}</StatusPill>} />
     {state.lastError && <div className="inline-error"><AlertTriangle size={15} /><span>{state.lastError}</span></div>}
-    <div className="service-layout"><div className="service-form-column"><div className="panel form-panel"><div className="form-section"><div className="form-section-title"><div><h3>网络</h3><p>服务默认只绑定本机，局域网访问需要显式开启。</p></div><Network size={18} /></div><div className="form-grid"><Field label="监听地址" hint="默认使用本机回环地址"><select value={draft.scope} onChange={(e) => { const scope = e.target.value as ServiceConfig['scope']; change('scope', scope); change('bindHost', scope === 'lan' ? '0.0.0.0' : '127.0.0.1'); }}><option value="localhost">localhost · 127.0.0.1</option><option value="lan">局域网 · 0.0.0.0</option></select></Field><Field label="服务端口" hint="修改后需要重新启动服务"><input type="number" min={1024} max={65535} value={draft.port} onChange={(e) => change('port', Number(e.target.value))} /></Field></div><div className="notice-box"><ShieldCheck size={17} /><div><strong>{draft.scope === 'lan' ? '局域网访问已开启' : '仅允许本机访问'}</strong><span>{draft.scope === 'lan' ? '同一网络中的设备可以连接此服务，请确认网络可信。' : '外部设备无法访问此服务，适合单机开发。'}</span></div></div></div><div className="form-divider" /><div className="form-section"><div className="form-section-title"><div><h3>请求处理</h3><p>配置超时、重试和账号选择行为。</p></div><RefreshCw size={18} /></div><div className="form-grid"><Field label="请求超时" hint="单次上游请求最长等待时间"><div className="input-with-suffix"><input type="number" min={1} value={draft.requestTimeoutMs / 1000} onChange={(e) => change('requestTimeoutMs', Number(e.target.value) * 1000)} /><span>秒</span></div></Field><Field label="失败重试次数" hint="重试会切换到其他可用账号"><select value={draft.maxRetries} onChange={(e) => change('maxRetries', Number(e.target.value))}><option value={0}>不重试</option><option value={1}>1 次</option><option value={2}>2 次</option><option value={3}>3 次</option></select></Field><Field label="账号调度策略" hint="决定请求优先使用哪个账号" wide><select value={draft.routingStrategy} onChange={(e) => change('routingStrategy', e.target.value as ServiceConfig['routingStrategy'])}><option value="auto">自动：综合健康度和额度</option><option value="random">随机轮换</option><option value="quota_high_first">剩余额度优先</option><option value="single_account">固定单账号</option><option value="custom">自定义优先级</option></select></Field></div><Toggle label="会话亲和" description="同一会话尽量使用同一个账号，减少上下文漂移。" checked={draft.sessionAffinity} onChange={(value) => change('sessionAffinity', value)} /></div><div className="form-divider" /><div className="form-section"><div className="form-section-title"><div><h3>协议兼容</h3><p>保持 OpenAI Chat Completions 请求格式。</p></div><Globe2 size={18} /></div><Toggle label="图片生成和编辑" description="将图片请求路由到支持的 CodeBuddy 模型。" checked={draft.imageGenerationMode !== 'disabled'} onChange={(value) => change('imageGenerationMode', value ? 'enabled' : 'disabled')} /><Toggle label="调试日志" description="记录更多协议细节。可能包含请求元数据，请仅在排查问题时开启。" checked={draft.debugLogs} onChange={(value) => change('debugLogs', value)} /></div></div><div className="form-actions"><span className="save-hint">保存配置不会自动重启服务。</span><button className="button primary" onClick={save}><Check size={15} />保存配置</button></div></div><div className="service-side-column"><div className="panel endpoint-panel"><div className="panel-heading"><div><span className="panel-kicker">连接信息</span><h3>本地接口</h3></div><StatusPill tone="blue">OpenAI 兼容</StatusPill></div><div className="endpoint-row"><span>Base URL</span><code>http://localhost:{draft.port}/v1</code><IconButton label="复制 Base URL" onClick={() => { void copyText(`http://localhost:${draft.port}/v1`).then(() => notify('Base URL 已复制')); }}><Copy size={15} /></IconButton></div>{draft.scope === 'lan' && <div className="endpoint-row"><span>LAN URL</span><code>http://局域网地址:{draft.port}/v1</code><IconButton label="复制局域网地址" onClick={() => notify('请将“局域网地址”替换为本机实际 IPv4 地址')}><Copy size={15} /></IconButton></div>}<div className="endpoint-rule" /><div className="endpoint-meta"><span><LockKeyhole size={14} />API Key 鉴权</span><span><Terminal size={14} />POST /v1/chat/completions</span></div></div><div className="panel side-help"><div className="help-icon"><Clipboard size={18} /></div><div><h3>接入客户端</h3><p>将 Base URL 设置为上方地址，并使用 CodeRelay API Key 作为 Bearer Token。</p><button className="inline-link" onClick={() => notify('示例：Authorization: Bearer sk-coderelay-…')} >查看接入示例 <span>→</span></button></div></div><div className="panel side-warning"><AlertTriangle size={17} /><div><strong>安全提示</strong><p>API Key 只保存在本机配置目录。日志和错误消息不会记录上游 Token。</p></div></div></div></div></>;
+    <div className="service-layout"><div className="service-form-column"><div className="panel form-panel"><div className="form-section"><div className="form-section-title"><div><h3>网络</h3><p>服务默认只绑定本机，局域网访问需要显式开启。</p></div><Network size={18} /></div><div className="form-grid"><Field label="访问范围" hint="「本机 + 局域网」允许同网段的其他设备接入，建议只在可信网络下开启"><select value={draft.scope} onChange={(e) => { const scope = e.target.value as ServiceConfig['scope']; commit({ scope, bindHost: scope === 'lan' ? '0.0.0.0' : '127.0.0.1' }); }}><option value="localhost">仅本机</option><option value="lan">本机 + 局域网</option></select></Field><Field label="服务端口" hint="修改后自动生效"><input type="number" min={1024} max={65535} value={draft.port} onChange={(e) => change('port', Number(e.target.value), 600)} /></Field></div><div className="notice-box"><ShieldCheck size={17} /><div><strong>{draft.scope === 'lan' ? '局域网访问已开启' : '仅允许本机访问'}</strong><span>{draft.scope === 'lan' ? '同一网络中的设备可以连接此服务，调用时必须携带 API Key（sk- 开头，在「API Key」页创建）。请确认当前网络可信。' : '外部设备无法访问此服务，适合单机开发。'}</span></div></div>{draft.scope === 'lan' && <div className="lan-access-card"><div className="lan-access-head"><strong>局域网接入</strong><span>其他设备用下方地址调用</span></div><div className="lan-access-row"><code>{lanAddress || lanAddressPlaceholder}</code><button className="button ghost compact" onClick={copyLanAddress} disabled={!lanAddress}>{lanCopied ? <Check size={13} /> : <Copy size={13} />}{lanCopied ? '已复制' : '复制'}</button></div>{!lanAddress && (applyState === 'error' ? <p className="lan-access-hint">配置尚未生效：{applyError}</p> : lanPendingSave ? <p className="lan-access-hint">配置生效后，这里会显示其他设备可用的局域网地址。</p> : <p className="lan-access-hint">已开启局域网绑定，但还没解析到本机网卡地址。请确认已连接 WiFi 或网线，稍候会自动重试。</p>)}<p className="lan-access-hint">该地址需要配合 API Key 调用：浏览器直接打开会返回 404 / 401，属正常现象，不代表连不通。</p><div className="lan-access-firewall"><div className="lan-access-firewall-title"><AlertTriangle size={14} />其他设备连不上？多半是 Windows 防火墙拦了入站</div><p>以<strong>管理员身份</strong>打开 PowerShell 或 CMD，执行下面这条命令放行（只放行当前端口，且只对「专用网络」生效）：</p><div className="lan-access-row"><code>{firewallCommand}</code><button className="button ghost compact" onClick={() => { void copyText(firewallCommand).then(() => notify('防火墙放行命令已复制')); }}><Copy size={13} />复制</button></div><p className="lan-access-hint">若当前网络被 Windows 标记为「公用」，需先改为「专用」，或把命令末尾的 profile=private 改成 profile=any。</p></div></div>}</div><div className="form-divider" /><div className="form-section"><div className="form-section-title"><div><h3>请求处理</h3><p>配置超时、重试和账号选择行为。</p></div><RefreshCw size={18} /></div><div className="form-grid"><Field label="请求超时" hint="单次上游请求最长等待时间"><div className="input-with-suffix"><input type="number" min={1} value={draft.requestTimeoutMs / 1000} onChange={(e) => change('requestTimeoutMs', Number(e.target.value) * 1000, 600)} /><span>秒</span></div></Field><Field label="失败重试次数" hint="重试会切换到其他可用账号"><select value={draft.maxRetries} onChange={(e) => change('maxRetries', Number(e.target.value))}><option value={0}>不重试</option><option value={1}>1 次</option><option value={2}>2 次</option><option value={3}>3 次</option></select></Field><Field label="账号调度策略" hint="决定请求优先使用哪个账号" wide><select value={draft.routingStrategy} onChange={(e) => change('routingStrategy', e.target.value as ServiceConfig['routingStrategy'])}><option value="auto">自动：综合健康度和额度</option><option value="random">随机轮换</option><option value="quota_high_first">剩余额度优先</option><option value="single_account">固定单账号</option><option value="custom">自定义优先级</option></select></Field></div><Toggle label="会话亲和" description="同一会话尽量使用同一个账号，减少上下文漂移。" checked={draft.sessionAffinity} onChange={(value) => change('sessionAffinity', value)} /></div><div className="form-divider" /><div className="form-section"><div className="form-section-title"><div><h3>协议兼容</h3><p>保持 OpenAI Chat Completions 请求格式。</p></div><Globe2 size={18} /></div><Toggle label="图片生成和编辑" description="将图片请求路由到支持的 CodeBuddy 模型。" checked={draft.imageGenerationMode !== 'disabled'} onChange={(value) => change('imageGenerationMode', value ? 'enabled' : 'disabled')} /><Toggle label="调试日志" description="记录更多协议细节。可能包含请求元数据，请仅在排查问题时开启。" checked={draft.debugLogs} onChange={(value) => change('debugLogs', value)} /></div></div><div className="form-actions"><span className={`save-hint${applyState === 'error' ? ' error' : ''}`}>{applyHint}</span></div></div><div className="service-side-column"><div className="panel endpoint-panel"><div className="panel-heading"><div><span className="panel-kicker">连接信息</span><h3>本地接口</h3></div><StatusPill tone="blue">OpenAI 兼容</StatusPill></div><div className="endpoint-row"><span>Base URL</span><code>{localBaseUrl(state)}</code><IconButton label="复制 Base URL" onClick={() => { void copyText(localBaseUrl(state)).then(() => notify('Base URL 已复制')); }}><Copy size={15} /></IconButton></div>{draft.scope === 'lan' && <div className="endpoint-row"><span>局域网 URL</span><code>{lanAddress || lanAddressPlaceholder}</code><IconButton label="复制局域网地址" onClick={copyLanAddress} disabled={!lanAddress}><Copy size={15} /></IconButton></div>}<div className="endpoint-rule" /><div className="endpoint-meta"><span><LockKeyhole size={14} />API Key 鉴权</span><span><Terminal size={14} />POST /v1/chat/completions</span></div></div><div className="panel side-help"><div className="help-icon"><Clipboard size={18} /></div><div><h3>接入客户端</h3><p>将 Base URL 设置为上方地址，并使用 CodeRelay API Key 作为 Bearer Token。</p><button className="inline-link" onClick={() => notify('示例：Authorization: Bearer sk-coderelay-…')} >查看接入示例 <span>→</span></button></div></div><div className="panel side-warning"><AlertTriangle size={17} /><div><strong>安全提示</strong><p>API Key 只保存在本机配置目录。日志和错误消息不会记录上游 Token。</p></div></div></div></div></>;
 }
 
 function Field({ label, hint, children, wide = false }: { label: string; hint?: string; children: ReactNode; wide?: boolean }) { return <label className={`field ${wide ? 'wide' : ''}`}><span>{label}</span>{children}{hint && <small>{hint}</small>}</label>; }
