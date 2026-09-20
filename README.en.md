@@ -22,6 +22,7 @@ A **Windows desktop management tool** for power users: centrally manage CodeBudd
 - **LAN Access**: Switch the access scope to "Local + LAN" and the app automatically detects and displays a LAN address (one-click copy, plus a Windows Firewall rule command); the address refreshes automatically when the network changes.
 - **Request Statistics & Logs**: Total requests, tokens, cache hit rate, credit consumption, hourly bar chart and per-day aggregation; request logs are kept for the current day with filtering, details, and JSON export.
 - **System Tray & Notifications**: Minimize to tray, start/stop proxy, quit; Windows system notifications on startup failure or service errors.
+- **Update Check**: Queries the latest GitHub Release and compares it with the running version, surfacing new versions in the sidebar and on the overview page; shows release notes and opens the release page for download (CodeRelay does **not** download or install updates automatically).
 
 ---
 
@@ -123,6 +124,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | `src-tauri/src/lib.rs` | Tauri entry point (plugins, single instance, tray, window) |
 | `src-tauri/src/gateway.rs` | Core: sidecar process management, state machine, event parsing, credential hot-reload |
 | `src-tauri/src/codebuddy_oauth.rs` | Account OAuth, token/quota refresh, check-in |
+| `src-tauri/src/update.rs` | GitHub Releases update check (version comparison, installer URL parsing) |
 | `src-tauri/src/models.rs` | Request log / statistics structures and app state model |
 | `sidecars/coderelay-proxy/` | Go sidecar main program (relay server, model sync, account pool scheduling) |
 | `scripts/` | `build-sidecar.ps1`, `sync-version.mjs` |
@@ -141,7 +143,17 @@ go test ./...
 
 ### Version Convention
 
-**Single version source = `package.json` `version`**. To bump the version, modify only this file, then run `npm run sync-version` (or just `tauri:build`, which includes it in beforeBuild). The frontend displays the version via `APP_VERSION` (injected by Vite) — do not hardcode it.
+**Single version source = `package.json` `version`**. To bump the version, modify only this file, then run `npm run sync-version` (or just `tauri:build`, which includes it in beforeBuild). The frontend displays the version via `APP_VERSION` (injected by Vite) — do not hardcode it. The Rust side reads the same version through `env!("CARGO_PKG_VERSION")` for update comparison, so nothing else needs maintaining.
+
+### Release Convention
+
+The update check reads the latest GitHub Release. Upload installers to the release **Assets**, named like `CodeRelay_<version>_x64-setup.zip`:
+
+- **Assets first**: gives a stable direct URL, file name, and size, so the UI can show installer details.
+- **Release body fallback**: if Assets is empty, the app parses `user-attachments` zip links from the release notes (compatible with v0.3.0 and earlier releases). Size is unavailable this way and shows as "—".
+- Tags must parse as a version (e.g. `v0.3.0`). Unparsable tags such as `Bate_Version` are treated as "no update" rather than a false positive.
+
+Update results are session state and are not written to `state.json`. "Check for updates on startup" is off by default; enable it under Settings → General.
 
 ---
 

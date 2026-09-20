@@ -22,6 +22,7 @@
 - **局域网接入**：访问范围可切换为「本机 + 局域网」，界面自动识别并展示局域网接入地址（一键复制，附 Windows 防火墙放行命令）；切换网络后地址自动刷新。
 - **请求统计与日志**：总请求数、Token、缓存命中率、Credit 消耗、按小时柱状图与按天聚合；请求日志当日保留，支持筛选、详情与 JSON 导出。
 - **系统托盘与通知**：最小化到托盘、启动/停止反代、退出；启动失败/服务异常时发送 Windows 系统通知。
+- **更新检测**：查询 GitHub 最新 Release 并与当前版本比对，发现新版本时在侧边栏与总览页提示；可查看更新说明并一键打开发布页下载安装包（CodeRelay **不会**自动下载或安装更新）。
 
 ---
 
@@ -121,6 +122,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | `src-tauri/src/lib.rs` | Tauri 入口（插件、单实例、托盘、窗口） |
 | `src-tauri/src/gateway.rs` | 核心：sidecar 进程管理、状态机、事件解析、凭据热更新 |
 | `src-tauri/src/codebuddy_oauth.rs` | 账号 OAuth 认证、token/额度刷新、签到 |
+| `src-tauri/src/update.rs` | GitHub Releases 更新检查（版本比对、安装包地址解析） |
 | `src-tauri/src/models.rs` | 请求日志/统计结构与应用状态模型 |
 | `sidecars/coderelay-proxy/` | Go sidecar 主程序（relay 服务器、模型同步、账号池调度） |
 | `scripts/` | `build-sidecar.ps1`、`sync-version.mjs` |
@@ -139,7 +141,17 @@ go test ./...
 
 ### 版本号约定
 
-**单一版本源 = `package.json` 的 `version`**。升级版本只改这一个文件，再运行 `npm run sync-version`（或直接 `tauri:build`，其 beforeBuild 已包含）。前端通过 `APP_VERSION`（由 Vite 注入）展示版本号，不要硬编码。
+**单一版本源 = `package.json` 的 `version`**。升级版本只改这一个文件，再运行 `npm run sync-version`（或直接 `tauri:build`，其 beforeBuild 已包含）。前端通过 `APP_VERSION`（由 Vite 注入）展示版本号，不要硬编码。Rust 侧通过 `env!("CARGO_PKG_VERSION")` 读取同一版本参与更新比对，无需另行维护。
+
+### 发布约定
+
+更新检测读取 GitHub Releases 的最新发布。发版时请把安装包上传到 Release 的 **Assets**（附件），命名建议 `CodeRelay_<版本>_x64-setup.zip`：
+
+- **优先读 Assets**：能拿到稳定直链、文件名与体积，界面可直接展示安装包信息。
+- **正文链接兜底**：若 Assets 为空，程序会从发布说明正文里解析 `user-attachments` 的 zip 直链（兼容 v0.3.0 及更早的发布方式）。该方式拿不到体积，界面显示为「—」。
+- Tag 需可解析为版本号（如 `v0.3.0`）。`Bate_Version` 这类无法解析的 tag 会被视为「无更新」，不会误报。
+
+更新检测结果属于会话态，不写入 `state.json`；「启动时检测更新」默认关闭，需在「设置 → 常规」手动开启。
 
 ---
 
