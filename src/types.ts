@@ -168,6 +168,33 @@ export interface AppState {
   lanBaseUrl: string | null;
 }
 
+/** 安装包下载地址的来源。`asset` 为 GitHub Release 附件，`releaseBody` 为说明正文里的历史链接。 */
+export type InstallerSource = 'asset' | 'releaseBody';
+
+/**
+ * 更新检查结果。属于会话态数据，不写进 localStorage / state.json，
+ * 每次检测都由后端重新下发。
+ */
+export interface UpdateCheckResult {
+  /** 当前运行版本（来自后端编译期版本，无 `v` 前缀）。 */
+  currentVersion: string;
+  /** 最新发布版本（tag 去掉 `v` 前缀）。 */
+  latestVersion: string;
+  hasUpdate: boolean;
+  /** 发布页地址，「打开发布页」按钮的目标。 */
+  releaseUrl: string;
+  releaseName?: string;
+  /** 发布说明正文（Markdown 原文）。 */
+  releaseNotes?: string;
+  publishedAt?: string;
+  prerelease: boolean;
+  /** 安装包直链；解析不到时界面只提供「打开发布页」。 */
+  installerUrl?: string;
+  installerName?: string;
+  installerSize?: number;
+  installerSource?: InstallerSource;
+}
+
 export const defaultConfig: ServiceConfig = {
   enabled: false,
   port: 11435,

@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import type { Account, ApiKey, AppState, CheckinResponse, CheckinStatusResponse, ModelInfo, OAuthCompleteResponse, OAuthStartResponse, ServiceConfig } from './types';
+import type { Account, ApiKey, AppState, CheckinResponse, CheckinStatusResponse, ModelInfo, OAuthCompleteResponse, OAuthStartResponse, ServiceConfig, UpdateCheckResult } from './types';
 import { defaultState } from './types';
 
 const STORAGE_KEY = 'coderelay-app-state';
@@ -191,6 +191,17 @@ export async function validateToken(accessToken: string): Promise<OAuthCompleteR
 export async function openExternal(url: string): Promise<void> {
   requireTauri('打开系统浏览器');
   await openUrl(url);
+}
+
+/**
+ * 检查 GitHub 上的最新发布。
+ *
+ * 失败（断网、限流、仓库改址）会抛错，界面必须把错误展示为「检测失败」而不是
+ * 「已是最新」——否则用户会误以为更新功能正常。
+ */
+export async function checkForUpdate(): Promise<UpdateCheckResult> {
+  requireTauri('检测更新');
+  return invoke<UpdateCheckResult>('check_for_update');
 }
 
 export interface RefreshAllResponse {

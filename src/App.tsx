@@ -9,11 +9,11 @@ import {
   ShieldCheck, SlidersHorizontal, Sparkles, Square, Terminal, Trash2, Upload,
   Users, X, Zap,
 } from 'lucide-react';
-import type { Account, ApiKey, AppState, CheckinResponse, CheckinStatusResponse, DayStats, ModelInfo, OAuthCompleteResponse, PageId, RequestLog, ServiceConfig, ThemeMode } from './types';
+import type { Account, ApiKey, AppState, CheckinResponse, CheckinStatusResponse, DayStats, ModelInfo, OAuthCompleteResponse, PageId, RequestLog, ServiceConfig, ThemeMode, UpdateCheckResult } from './types';
 import { defaultState, emptyDayStats } from './types';
 import { applyTheme } from './theme';
 import {
-  cancelOAuth, checkinAccount, clearLogs, completeOAuth, exportAccounts, getCheckinStatus, getState, listModels, openExternal,
+  cancelOAuth, checkForUpdate, checkinAccount, clearLogs, completeOAuth, exportAccounts, getCheckinStatus, getState, listModels, openExternal,
   refreshAccountQuota, refreshAllQuotas, resetLocalState, saveAccounts, syncModels,
   saveConfig, saveKeys, startOAuth, startService, stopService, validateToken,
 } from './services';
@@ -117,6 +117,46 @@ function hasTauri() {
   return Boolean((window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
 }
 
+/**
+ * 读取本地偏好设置。更新检查等偏好与主题、关闭行为共用同一个存储键，
+ * 集中在这里解析，避免各处重复写 JSON.parse + try/catch。
+ */
+interface AppPreferences {
+  openOverview?: boolean;
+  refreshAccounts?: boolean;
+  closeBehavior?: string;
+  retention?: string;
+  theme?: ThemeMode;
+  /** 启动时静默检测新版本。默认关闭，避免每次启动都产生一次网络请求。 */
+  autoCheckUpdate?: boolean;
+}
+
+function readPreferences(): AppPreferences {
+  try {
+    return JSON.parse(localStorage.getItem('coderelay-preferences') ?? '') as AppPreferences;
+  } catch {
+    return {};
+  }
+}
+
+/** 把字节数格式化为便于阅读的体积文案。 */
+function formatBytes(value: number | null | undefined) {
+  if (!value || value < 0) return '—';
+  const units: Array<[number, string]> = [[1024 ** 3, 'GB'], [1024 ** 2, 'MB'], [1024, 'KB']];
+  for (const [threshold, suffix] of units) {
+    if (value >= threshold) return `${(value / threshold).toFixed(1)} ${suffix}`;
+  }
+  return `${value} B`;
+}
+
+/** 把 ISO 时间格式化为本地日期时间；解析失败时原样返回，不显示 Invalid Date。 */
+function formatIsoDate(value: string | null | undefined) {
+  if (!value) return '';
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(parsed);
+}
+
 function StatusPill({ children, tone = 'muted', dot = true }: { children: ReactNode; tone?: 'success' | 'warning' | 'danger' | 'muted' | 'blue'; dot?: boolean }) {
   return <span className={`status-pill ${tone}`}>{dot && <i className="status-dot" />}{children}</span>;
 }
@@ -145,6 +185,11 @@ export function App() {
   const [editingKey, setEditingKey] = useState<ApiKey | null>(null);
   const [showCheckinModal, setShowCheckinModal] = useState(false);
   const [showExitMenu, setShowExitMenu] = useState(false);
+  // 更新检查结果属于会话态：不落盘，仅在本次运行期间用于界面提示。
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+  const [showUpdateModal, setShowUpdateModal] = useState(false);
 
   const refreshState = async () => {
     const next = await getState();
@@ -152,8 +197,49 @@ export function App() {
     return next;
   };
 
+  /**
+   * 检测新版本。
+   *
+   * `silent` 用于启动时的自动检测：失败只记录错误、不弹全局提示，避免用户一开机
+   * 就被网络问题打扰。手动点击时则把结果反馈到全局提示里。
+   *
+   * 注意「检测失败」与「已是最新」必须严格区分：失败时保留 updateInfo 为 null，
+   * 界面显示错误文案，绝不能退化成「已是最新」。
+   */
+  const handleCheckUpdate = useCallback(async (silent = false) => {
+    if (checkingUpdate) return null;
+    setCheckingUpdate(true);
+    setUpdateError(null);
+    try {
+      const result = await checkForUpdate();
+      setUpdateInfo(result);
+      if (!silent) setNotice(result.hasUpdate ? `发现新版本 ${result.latestVersion}` : `已是最新版本 ${result.currentVersion}`);
+      return result;
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      setUpdateInfo(null);
+      setUpdateError(message);
+      if (!silent) {
+        setNotice(null);
+        setError(message);
+      }
+      return null;
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }, [checkingUpdate]);
+
   useEffect(() => {
     void refreshState().catch((reason) => setError(String(reason))).finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    // 启动时静默检测一次新版本，仅在用户显式勾选后执行（默认关闭，避免每次启动
+    // 都产生一次网络请求）。静默模式：失败只记录，不弹全局提示。
+    if (!hasTauri() || !readPreferences().autoCheckUpdate) return;
+    void handleCheckUpdate(true);
+    // 只在挂载时触发一次；handleCheckUpdate 的身份变化不应重新发起检测。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -303,7 +389,11 @@ export function App() {
           </div>;
         })}
       </nav>
-      <div className="sidebar-bottom"><button className="nav-icon" aria-label="帮助" onClick={() => notify('帮助文档尚未接入，当前可查看项目 README.md')}><CircleHelp size={18} /></button><div className="avatar">C</div></div>
+      <div className="sidebar-bottom">
+        <button className={`nav-icon ${updateInfo?.hasUpdate ? 'has-update' : ''}`} aria-label={updateInfo?.hasUpdate ? `发现新版本 ${updateInfo.latestVersion}` : '检测更新'} title={updateInfo?.hasUpdate ? `发现新版本 ${updateInfo.latestVersion}` : '检测更新'} onClick={() => { if (updateInfo?.hasUpdate) { setShowUpdateModal(true); return; } void handleCheckUpdate(); }}>{checkingUpdate ? <RefreshCw size={18} className="spin" /> : <Download size={18} />}{updateInfo?.hasUpdate && <span className="nav-badge" aria-hidden="true" />}</button>
+        <button className="nav-icon" aria-label="帮助" onClick={() => notify('帮助文档尚未接入，当前可查看项目 README.md')}><CircleHelp size={18} /></button>
+        <div className="avatar">C</div>
+      </div>
     </aside>
     <main className="main-shell">
       <header className="titlebar" data-tauri-drag-region="true">
@@ -315,13 +405,13 @@ export function App() {
         </div>
       </header>
       <div className="content-scroll"><div className="page-container">
-        {page === 'overview' && <OverviewPage state={state} onNavigate={setPage} onRefresh={() => { void handleRefreshOverview(); }} refreshing={refreshing} />}
+        {page === 'overview' && <OverviewPage state={state} onNavigate={setPage} onRefresh={() => { void handleRefreshOverview(); }} refreshing={refreshing} updateInfo={updateInfo} onShowUpdate={() => setShowUpdateModal(true)} />}
         {page === 'service' && <ServicePage state={state} onApply={async (config) => { updateState(await saveConfig(config)); }} notify={notify} />}
         {page === 'keys' && <KeysPage state={state} onAdd={() => { setEditingKey(null); setShowKeyModal(true); }} onEdit={(key) => { setEditingKey(key); setShowKeyModal(true); }} onSave={(keys) => void runAction(() => saveKeys(keys), 'API Key 已更新', 'save')} notify={notify} />}
         {page === 'logs' && <LogsPage state={state} onClear={() => void runAction(clearLogs, '请求日志已清理', 'save')} notify={notify} />}
         {page === 'accounts' && <AccountsPage state={state} blocked={busy !== null} onAdd={() => { setAccountModalMode('browser'); setShowAccountModal(true); }} onImport={() => { setAccountModalMode('file'); setShowAccountModal(true); }} onSave={(accounts) => void runAction(() => saveAccounts(accounts), '账号列表已更新', 'save')} onRefresh={handleRefreshAccount} onRefreshAll={handleRefreshAll} onCheckin={() => setShowCheckinModal(true)} notify={notify} />}
         {page === 'models' && <ModelsPage state={state} notify={notify} />}
-        {page === 'settings' && <SettingsPage onReset={resetLocalState} notify={notify} />}
+        {page === 'settings' && <SettingsPage onReset={resetLocalState} notify={notify} updateInfo={updateInfo} updateError={updateError} checkingUpdate={checkingUpdate} onCheckUpdate={() => { void handleCheckUpdate(); }} onShowUpdate={() => setShowUpdateModal(true)} />}
       </div></div>
       <footer className="statusbar"><div className="statusbar-left"><span className="secure-note"><LockKeyhole size={13} />本地数据</span><span className="divider" /><span>CodeRelay {APP_VERSION}</span></div><div className="statusbar-right"><StatusPill tone={busy === 'start' || busy === 'stop' ? 'warning' : state.running ? 'success' : 'muted'}>{busy === 'start' ? '启动中…' : busy === 'stop' ? '停止中…' : state.running ? `运行中 · ${state.actualPort ?? state.config.port}` : '已停止'}</StatusPill>{state.running ? <button className="button compact ghost" disabled={busy !== null} onClick={() => void runAction(stopService, '反代服务已停止', 'stop')}><Pause size={14} />停止服务</button> : <button className="button compact primary" disabled={busy !== null} onClick={() => void runAction(startService, '反代服务已启动', 'start')}><Play size={14} />启动服务</button>}<button className="status-chevron" aria-label="更多服务操作" onClick={() => setPage('service')}><ChevronDown size={15} /></button></div></footer>
     </main>
@@ -330,11 +420,12 @@ export function App() {
     {showAccountModal && <AccountModal existingAccounts={state.accounts} initialMode={accountModalMode} onClose={() => setShowAccountModal(false)} onSave={(accounts, summary) => { setShowAccountModal(false); void runAction(() => { const ids = new Set(accounts.map((account) => account.id)); const emails = new Set(accounts.map((account) => account.email.trim().toLowerCase()).filter(Boolean)); const kept = state.accounts.filter((account) => !ids.has(account.id) && !emails.has(account.email.trim().toLowerCase())); return saveAccounts([...kept, ...accounts]); }, summary ?? `已添加 ${accounts.length} 个账号`, 'save'); }} notify={notify} />}
     {showKeyModal && <KeyModal accounts={state.accounts} existingKey={editingKey} onClose={() => { setShowKeyModal(false); setEditingKey(null); }} onSave={(key) => { setShowKeyModal(false); setEditingKey(null); if (editingKey) { void runAction(() => saveKeys(state.keys.map((item) => item.id === key.id ? key : item)), 'API Key 已更新', 'save'); } else { void runAction(() => saveKeys([...state.keys, key]), 'API Key 已创建', 'save'); } }} />}
     {showCheckinModal && <CheckinModal accounts={state.accounts} onClose={() => setShowCheckinModal(false)} />}
+    {showUpdateModal && updateInfo && <UpdateModal info={updateInfo} onClose={() => setShowUpdateModal(false)} />}
     {showExitMenu && <Modal title={state.running ? '反代服务正在运行' : '退出 CodeRelay'} onClose={() => setShowExitMenu(false)}><div className="modal-form exit-confirm"><p className="exit-confirm-lead">{state.running ? '关闭前需要先停止反代服务。请选择最小化到系统盘或继续退出。' : '确认退出当前应用？'}</p><div className="exit-confirm-actions"><button className="button ghost" onClick={() => setShowExitMenu(false)}><X size={14} />取消</button><button className="button ghost" onClick={() => { void hideToTray(); }}><Minus size={14} />最小化到系统盘</button><button className="button danger-button" onClick={() => { void closeWindow(); }}><LogOut size={14} />{state.running ? '停止并退出' : '退出'}</button></div></div></Modal>}
   </div>;
 }
 
-function OverviewPage({ state, onNavigate, onRefresh, refreshing }: { state: AppState; onNavigate: (page: PageId) => void; onRefresh: () => void; refreshing: boolean }) {
+function OverviewPage({ state, onNavigate, onRefresh, refreshing, updateInfo, onShowUpdate }: { state: AppState; onNavigate: (page: PageId) => void; onRefresh: () => void; refreshing: boolean; updateInfo: UpdateCheckResult | null; onShowUpdate: () => void }) {
   const [viewDate, setViewDate] = useState<string>('today');
   const [showCalendar, setShowCalendar] = useState(false);
   const available = state.accounts.filter((account) => account.status === 'available').length;
@@ -372,6 +463,7 @@ function OverviewPage({ state, onNavigate, onRefresh, refreshing }: { state: App
       <button className={`date-trigger ${viewDate !== 'today' && viewDate !== 'lifetime' ? 'active' : ''}`} onClick={() => setShowCalendar(true)} aria-label="选择日期"><CalendarDays size={14} /><span>{viewLabel}</span><ChevronDown size={13} /></button>
     </div>
     {isEmptyDay && <div className="inline-empty-hint"><CalendarDays size={14} />该日暂无请求数据，可选择其他日期或切换到累计视图。</div>}
+    {updateInfo?.hasUpdate && <div className="update-banner"><span className="update-banner-icon"><Download size={16} /></span><div className="update-banner-copy"><strong>发现新版本 {updateInfo.latestVersion}</strong><span>当前版本 {updateInfo.currentVersion}，可查看更新说明后前往 GitHub 下载安装包。</span></div><div className="update-banner-actions"><button className="button ghost compact" onClick={onShowUpdate}>查看更新</button><button className="button primary compact" onClick={() => { void openExternal(updateInfo.releaseUrl); }}>打开发布页</button></div></div>}
     <div className="overview-grid">
       <section className={`hero-status panel ${state.running ? 'running' : ''}`}><div className="panel-topline"><span className="panel-kicker"><Server size={14} />反代服务</span><StatusPill tone={state.running ? 'success' : 'muted'}>{state.running ? '运行中' : '已停止'}</StatusPill></div><div className="hero-value">{state.running ? '服务在线' : '等待手动启动'}</div><p>{state.running ? `正在监听 ${displayHost(state.config.bindHost)}:${state.actualPort ?? state.config.port}` : state.lastError ?? '服务启动后将通过本地 OpenAI 兼容接口接收请求。'}{state.running && state.lanBaseUrl ? ` · 局域网设备可用 ${state.lanBaseUrl}` : ''}</p><div className="hero-foot"><div><span>可用账号</span><strong>{available} / {state.accounts.length}</strong></div><div><span>需要关注</span><strong>{attention}</strong></div><button className="inline-link" onClick={() => onNavigate('service')}>查看服务配置 <span>→</span></button></div></section>
       <section className="metric-card panel"><span className="metric-icon blue"><Activity size={17} /></span><span className="metric-label">总请求数</span><strong>{formatCompact(source.requestCount)}</strong><span className="metric-trend"><small>{formatNumber(source.successCount)} 成功 · {formatNumber(source.failureCount)} 失败</small></span></section>
@@ -1110,13 +1202,13 @@ function ModelsPage({ state, notify }: { state: AppState; notify: NoticeHandler 
   return <><SectionHeader eyebrow="CodeBuddy / 能力目录" title="模型管理" description="从运行中的 CodeBuddy CN sidecar 获取模型目录和能力信息。" action={<div className="header-actions"><span className="sync-time"><RefreshCw size={13} />{lastSync ? `上次同步：${formatDate(lastSync)}` : '尚未同步'}</span><button className="button ghost" onClick={() => { void sync(); }} disabled={syncing}><RefreshCw size={15} />{syncing ? '同步中…' : '立即同步'}</button></div>} /><div className="model-notice"><Sparkles size={17} /><div><strong>模型目录来自 CodeBuddy CN 后端</strong><span>没有运行服务或有效 API Key 时，不会显示伪造的模型列表。</span></div><StatusPill tone={models.length ? 'success' : 'muted'}>{models.length ? '已同步' : '等待同步'}</StatusPill></div><div className="panel table-panel"><div className="table-toolbar"><div className="toolbar-title"><Layers3 size={17} /><strong>模型目录</strong><span>{filtered.length} 个模型</span></div><div className="search-box compact-search"><Search size={15} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索模型" /></div></div>{filtered.length ? <div className="data-table models-table"><div className="table-head"><span>模型</span><span>能力</span><span>可用状态</span><span>来源</span><span>别名</span><span /></div>{filtered.map((model) => { const capabilities = ['文本', ...(model.supportsImages || model.inputModalities?.includes('image') ? ['视觉'] : []), ...(model.supportsToolCall ? ['工具'] : [])]; return <div className="table-row" key={model.id}><div className="model-name"><span className="model-glyph"><Sparkles size={14} /></span><div><strong>{model.id}</strong><code>{model.ownedBy ?? 'codebuddy'}</code></div></div><div className="capability-list">{capabilities.map((capability) => <span key={capability} className={capability === '视觉' ? 'vision' : ''}>{capability}</span>)}</div><StatusPill tone="success">可用</StatusPill><span className="muted-text">CodeBuddy CN</span><button className="alias-button" onClick={() => notify('模型别名持久化命令尚未接入')}><span>未设置</span><Pencil size={13} /></button><IconButton label="模型详情" onClick={() => notify(`${model.id}：上下文 ${model.contextLength ?? '未知'}`)}><MoreHorizontal size={16} /></IconButton></div>; })}</div> : <EmptyState icon={Layers3} title="还没有模型目录" description="启动服务并点击“立即同步”，从 CodeBuddy CN 后端读取模型。" action={<button className="button primary" onClick={() => { void sync(); }} disabled={syncing}><RefreshCw size={15} />同步模型</button>} />}</div><div className="model-footnote"><span><Eye size={14} />视觉能力由在线模型目录与实测校正表决定。</span></div></>;
 }
 
-function SettingsPage({ onReset, notify }: { onReset: () => void; notify: NoticeHandler }) {
+function SettingsPage({ onReset, notify, updateInfo, updateError, checkingUpdate, onCheckUpdate, onShowUpdate }: { onReset: () => void; notify: NoticeHandler; updateInfo: UpdateCheckResult | null; updateError: string | null; checkingUpdate: boolean; onCheckUpdate: () => void; onShowUpdate: () => void }) {
   const [tab, setTab] = useState<'general' | 'network' | 'data' | 'about'>('general');
-  const [prefs, setPrefs] = useState(() => { try { return JSON.parse(localStorage.getItem('coderelay-preferences') ?? '{}') as { openOverview?: boolean; refreshAccounts?: boolean; closeBehavior?: string; retention?: string; theme?: ThemeMode }; } catch { return {}; } });
+  const [prefs, setPrefs] = useState<AppPreferences>(readPreferences);
   const update = (changes: Partial<typeof prefs>) => setPrefs((current) => ({ ...current, ...changes }));
   const changeTheme = (theme: ThemeMode) => { update({ theme }); applyTheme(theme); };
   const save = () => { localStorage.setItem('coderelay-preferences', JSON.stringify(prefs)); applyTheme(prefs.theme ?? 'system'); notify('应用设置已保存'); };
-  return <><SectionHeader eyebrow="应用 / 偏好" title="设置" description="调整 CodeRelay 的桌面行为、数据保留和隐私选项。" action={<button className="button primary" onClick={save}><Check size={15} />保存设置</button>} /><div className="settings-layout"><div className="settings-tabs">{([['general', '常规', Settings2], ['network', '网络', Network], ['data', '数据与隐私', Database], ['about', '关于', CircleHelp]] as Array<[typeof tab, string, LucideIcon]>).map(([id, label, Icon]) => <button key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)}><Icon size={16} />{label}</button>)}</div><div className="panel settings-panel">{tab === 'general' && <><div className="settings-section"><h3>启动行为</h3><Toggle label="启动时打开总览" description="软件启动后默认显示总览页。" checked={prefs.openOverview ?? true} onChange={(value) => update({ openOverview: value })} /><Toggle label="启动时自动刷新账号额度" description="启动后读取最近保存的账号并刷新配额。" checked={prefs.refreshAccounts ?? false} onChange={(value) => update({ refreshAccounts: value })} /></div><div className="settings-section"><h3>外观</h3><Field label="主题模式" hint="选择后立即预览，点击“保存设置”持久化。"><div className="segmented theme-segmented"><button className={(prefs.theme ?? 'system') === 'system' ? 'active' : ''} onClick={() => changeTheme('system')}>跟随系统</button><button className={(prefs.theme ?? 'system') === 'light' ? 'active' : ''} onClick={() => changeTheme('light')}>浅色</button><button className={(prefs.theme ?? 'system') === 'dark' ? 'active' : ''} onClick={() => changeTheme('dark')}>深色</button></div></Field></div><div className="settings-section"><h3>关闭窗口</h3><Field label="服务运行时点击关闭" hint="此设置用于后续窗口关闭流程"><select value={prefs.closeBehavior ?? 'ask'} onChange={(e) => update({ closeBehavior: e.target.value })}><option value="ask">每次询问</option><option value="tray">最小化到系统托盘</option><option value="exit">停止服务后退出</option></select></Field></div></>}{tab === 'network' && <div className="settings-section"><h3>网络安全</h3><p className="settings-note"><ShieldCheck size={15} />默认监听 localhost。局域网入口需要在“服务配置”中单独开启，所有请求仍需有效 API Key。</p></div>}{tab === 'data' && <div className="settings-section"><h3>本地数据</h3><Field label="请求日志保留时间"><select value={prefs.retention ?? '7'} onChange={(e) => update({ retention: e.target.value })}><option value="7">最近 7 天</option><option value="30">最近 30 天</option></select></Field><div className="danger-zone"><div><h3>重置浏览器预览数据</h3><p>仅清理当前 Web 预览中的本地状态，不会删除桌面端凭据文件。</p></div><button className="button danger-button" onClick={onReset}><Trash2 size={15} />重置数据</button></div></div>}{tab === 'about' && <div className="about-block"><div className="about-logo">CR</div><h3>CodeRelay</h3><p>面向高级用户的 CodeBuddy CN 账号池和本地 OpenAI 兼容反代管理工具。</p><div className="about-meta"><span>版本 {APP_VERSION}</span><span>Windows 桌面端</span><span>本地优先</span></div><button className="inline-link" onClick={() => notify('第三方组件许可见项目根目录 NOTICE.md')}>查看第三方许可 <span>→</span></button></div>}</div></div></>;
+  return <><SectionHeader eyebrow="应用 / 偏好" title="设置" description="调整 CodeRelay 的桌面行为、数据保留和隐私选项。" action={<button className="button primary" onClick={save}><Check size={15} />保存设置</button>} /><div className="settings-layout"><div className="settings-tabs">{([['general', '常规', Settings2], ['network', '网络', Network], ['data', '数据与隐私', Database], ['about', '关于', CircleHelp]] as Array<[typeof tab, string, LucideIcon]>).map(([id, label, Icon]) => <button key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)}><Icon size={16} />{label}</button>)}</div><div className="panel settings-panel">{tab === 'general' && <><div className="settings-section"><h3>启动行为</h3><Toggle label="启动时打开总览" description="软件启动后默认显示总览页。" checked={prefs.openOverview ?? true} onChange={(value) => update({ openOverview: value })} /><Toggle label="启动时自动刷新账号额度" description="启动后读取最近保存的账号并刷新配额。" checked={prefs.refreshAccounts ?? false} onChange={(value) => update({ refreshAccounts: value })} /><Toggle label="启动时检测更新" description="启动后静默查询 GitHub 最新发布，发现新版本时在侧边栏与总览页提示。" checked={prefs.autoCheckUpdate ?? false} onChange={(value) => update({ autoCheckUpdate: value })} /></div><div className="settings-section"><h3>外观</h3><Field label="主题模式" hint="选择后立即预览，点击“保存设置”持久化。"><div className="segmented theme-segmented"><button className={(prefs.theme ?? 'system') === 'system' ? 'active' : ''} onClick={() => changeTheme('system')}>跟随系统</button><button className={(prefs.theme ?? 'system') === 'light' ? 'active' : ''} onClick={() => changeTheme('light')}>浅色</button><button className={(prefs.theme ?? 'system') === 'dark' ? 'active' : ''} onClick={() => changeTheme('dark')}>深色</button></div></Field></div><div className="settings-section"><h3>关闭窗口</h3><Field label="服务运行时点击关闭" hint="此设置用于后续窗口关闭流程"><select value={prefs.closeBehavior ?? 'ask'} onChange={(e) => update({ closeBehavior: e.target.value })}><option value="ask">每次询问</option><option value="tray">最小化到系统托盘</option><option value="exit">停止服务后退出</option></select></Field></div></>}{tab === 'network' && <div className="settings-section"><h3>网络安全</h3><p className="settings-note"><ShieldCheck size={15} />默认监听 localhost。局域网入口需要在“服务配置”中单独开启，所有请求仍需有效 API Key。</p></div>}{tab === 'data' && <div className="settings-section"><h3>本地数据</h3><Field label="请求日志保留时间"><select value={prefs.retention ?? '7'} onChange={(e) => update({ retention: e.target.value })}><option value="7">最近 7 天</option><option value="30">最近 30 天</option></select></Field><div className="danger-zone"><div><h3>重置浏览器预览数据</h3><p>仅清理当前 Web 预览中的本地状态，不会删除桌面端凭据文件。</p></div><button className="button danger-button" onClick={onReset}><Trash2 size={15} />重置数据</button></div></div>}{tab === 'about' && <div className="about-block"><div className="about-logo">CR</div><h3>CodeRelay</h3><p>面向高级用户的 CodeBuddy CN 账号池和本地 OpenAI 兼容反代管理工具。</p><div className="about-meta"><span>版本 {APP_VERSION}</span><span>Windows 桌面端</span><span>本地优先</span></div><div className="update-check"><div className="update-check-row"><button className="button ghost" onClick={onCheckUpdate} disabled={checkingUpdate}><RefreshCw size={15} className={checkingUpdate ? 'spin' : ''} />{checkingUpdate ? '检测中…' : '检测更新'}</button>{updateInfo && <span className={`update-status ${updateInfo.hasUpdate ? 'has-update' : 'up-to-date'}`}>{updateInfo.hasUpdate ? <><Sparkles size={13} />发现新版本 {updateInfo.latestVersion}</> : <><Check size={13} />已是最新版本 {updateInfo.currentVersion}</>}</span>}{!updateInfo && !checkingUpdate && !updateError && <span className="update-status muted">尚未检测</span>}{updateError && <span className="update-status failed"><AlertTriangle size={13} />检测失败</span>}</div>{updateError && <p className="update-hint">{updateError}</p>}{updateInfo?.hasUpdate && <div className="update-actions"><button className="button primary" onClick={onShowUpdate}><Download size={15} />查看更新详情</button><button className="button ghost" onClick={() => { void openExternal(updateInfo.releaseUrl); }}><Globe2 size={15} />打开发布页</button></div>}{updateInfo && !updateInfo.hasUpdate && <p className="update-hint">当前版本 {updateInfo.currentVersion} 已经是 GitHub 上发布的最新版本。</p>}</div><button className="inline-link" onClick={() => notify('第三方组件许可见项目根目录 NOTICE.md')}>查看第三方许可 <span>→</span></button></div>}</div></div></>;
 }
 
 interface ParsedAccount {
@@ -1327,6 +1419,32 @@ function KeyModal({ accounts, existingKey, onClose, onSave }: { accounts: Accoun
     });
   };
   return <Modal title={editing ? '编辑 API Key' : '创建 API Key'} onClose={onClose}><div className="modal-form"><p className="modal-lead">{editing ? '调整此 Key 的账号使用范围。Key 值保持不变，修改后立即对使用它的客户端生效。' : '为本地客户端创建新的访问凭据。完整 Key 创建后会显示在列表中，并支持直接复制。'}</p><Field label="Key 名称"><input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="例如：个人开发" /></Field><Field label="账号使用范围"><div className="scope-options"><button className={scope === 'all' ? 'active' : ''} onClick={() => setScope('all')}><Globe2 size={15} /><span>全部可用账号</span><small>自动调度整个账号池</small></button><button className={scope === 'selected' ? 'active' : ''} onClick={() => setScope('selected')}><Users size={15} /><span>指定账号</span><small>仅使用你选择的账号</small></button></div></Field>{scope === 'selected' && (accounts.length ? <><div className="checklist-toolbar"><span>已选 {selected.length} / {accounts.length} 个账号</span><button type="button" className="inline-link" onClick={() => setSelected(accounts.map((account) => account.id))}>全选</button><button type="button" className="inline-link" onClick={() => setSelected([])}>清空</button></div><div className="account-checklist">{accounts.map((account) => <label key={account.id}><input type="checkbox" checked={selected.includes(account.id)} onChange={(e) => setSelected(e.target.checked ? [...selected, account.id] : selected.filter((id) => id !== account.id))} /><span>{account.email}</span><small>{account.plan}</small></label>)}</div></> : <p className="checklist-empty">账号池还没有账号。请先在账号池中添加账号，再回来限定 Key 的使用范围。</p>)}</div><div className="modal-footer"><button className="button ghost" onClick={onClose}>取消</button><button className="button primary" disabled={scope === 'selected' && !selected.length} onClick={submit}>{editing ? <><Check size={15} />保存修改</> : <><Plus size={15} />创建 Key</>}</button></div></Modal>;
+}
+
+/**
+ * 更新详情弹窗：展示版本对比、发布时间、安装包信息与发布说明。
+ *
+ * 发布说明是 Markdown 原文，这里按纯文本原样呈现（保留换行与缩进），不引入
+ * Markdown 渲染依赖——展示内容以「可读、不丢信息」为准，避免额外依赖与 XSS 面。
+ */
+function UpdateModal({ info, onClose }: { info: UpdateCheckResult; onClose: () => void }) {
+  return <Modal title="发现新版本" onClose={onClose} wide>
+    <div className="modal-form update-detail">
+      <div className="update-version-line"><span className="update-version-current">{info.currentVersion}</span><span className="update-arrow">→</span><span className="update-version-latest">{info.latestVersion}</span>{info.prerelease && <StatusPill tone="warning">预发布</StatusPill>}</div>
+      {info.releaseName && <p className="update-release-name">{info.releaseName}</p>}
+      <div className="update-meta-grid">
+        <div><span>最新版本</span><strong>{info.latestVersion}</strong></div>
+        <div><span>当前版本</span><strong>{info.currentVersion}</strong></div>
+        <div><span>发布时间</span><strong>{formatIsoDate(info.publishedAt) || '—'}</strong></div>
+        <div><span>安装包</span><strong>{info.installerName ?? '见发布页'}</strong></div>
+        <div><span>安装包大小</span><strong>{formatBytes(info.installerSize)}</strong></div>
+        <div><span>来源</span><strong>{info.installerSource === 'asset' ? 'Release 附件' : info.installerSource === 'releaseBody' ? '发布说明链接' : '—'}</strong></div>
+      </div>
+      {info.releaseNotes ? <div className="update-notes-section"><h3>更新说明</h3><div className="update-notes">{info.releaseNotes}</div></div> : <p className="update-hint">该发布没有填写更新说明。</p>}
+      <p className="update-hint">CodeRelay 不会自动下载或安装更新，请打开发布页手动下载安装包。</p>
+    </div>
+    <div className="modal-footer"><button className="button ghost" onClick={onClose}>稍后再说</button><button className="button primary" onClick={() => { void openExternal(info.releaseUrl); }}><Globe2 size={15} />打开发布页</button></div>
+  </Modal>;
 }
 
 function Modal({ title, onClose, children, wide = false }: { title: string; onClose: () => void; children: ReactNode; wide?: boolean }) { return <div className="modal-scrim" role="dialog" aria-modal="true" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><div className={`modal ${wide ? 'wide' : ''}`}><div className="modal-header"><div><span className="eyebrow">CodeRelay</span><h2>{title}</h2></div><IconButton label="关闭" onClick={onClose}><X size={17} /></IconButton></div>{children}</div></div>; }

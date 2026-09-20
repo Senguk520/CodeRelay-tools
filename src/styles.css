@@ -352,3 +352,43 @@ html[data-theme='dark'] .status-pill.blue { color: var(--blue); border-color: rg
 .lan-access-firewall-title { display: flex; align-items: center; gap: 6px; color: var(--orange); font-size: 11px; font-weight: 600; }
 .lan-access-firewall p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
 .lan-access-card .button:disabled { opacity: .5; }
+
+/* ---- 更新检测（侧边栏角标 / 总览提示条 / 设置页关于 / 详情弹窗）----
+   一律取既有变量，深色模式自动适配；不做额外色彩定义。 */
+.nav-icon.has-update { position: relative; color: var(--blue); }
+.nav-icon.has-update:hover, .nav-icon.has-update:focus-visible { color: var(--blue); }
+/* 角标叠在图标右上角：用 sidebar 的背景色描边，避免与图标笔画糊在一起。 */
+.nav-badge { position: absolute; top: 6px; right: 6px; width: 7px; height: 7px; border-radius: 50%; background: var(--red); box-shadow: 0 0 0 2px #f2f2ef; }
+html[data-theme='dark'] .nav-badge { box-shadow: 0 0 0 2px #23241f; }
+
+.update-banner { display: flex; align-items: center; gap: 12px; margin: 0 0 16px; padding: 12px 14px; border: 1px solid var(--blue); border-radius: var(--radius); background: var(--blue-soft); }
+.update-banner-icon { display: grid; place-items: center; flex: 0 0 auto; width: 30px; height: 30px; border-radius: 8px; color: #fff; background: var(--blue); }
+.update-banner-copy { display: flex; flex: 1; flex-direction: column; gap: 2px; min-width: 0; }
+.update-banner-copy strong { color: var(--ink-strong); font-size: 12px; }
+.update-banner-copy span { color: var(--muted); font-size: 10px; line-height: 1.5; }
+.update-banner-actions { display: flex; flex: 0 0 auto; gap: 7px; }
+
+.update-check { display: flex; flex-direction: column; gap: 9px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+.update-check-row { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.update-status { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; }
+.update-status.up-to-date { color: var(--green); }
+.update-status.has-update { color: var(--blue); }
+.update-status.failed { color: var(--red); }
+.update-status.muted { color: var(--subtle); font-weight: 500; }
+.update-hint { margin: 0; color: var(--subtle); font-size: 10px; line-height: 1.55; }
+.update-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.update-detail { display: flex; flex-direction: column; gap: 14px; }
+.update-version-line { display: flex; align-items: center; gap: 9px; }
+.update-version-current { color: var(--muted); font-family: 'DM Mono', monospace; font-size: 13px; text-decoration: line-through; }
+.update-arrow { color: var(--subtle); }
+.update-version-latest { color: var(--blue); font-family: 'DM Mono', monospace; font-size: 15px; font-weight: 600; }
+.update-release-name { margin: 0; color: var(--ink-strong); font-size: 12px; font-weight: 600; line-height: 1.5; }
+.update-meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 9px; }
+.update-meta-grid > div { display: flex; flex-direction: column; gap: 3px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); }
+.update-meta-grid span { color: var(--subtle); font-size: 10px; }
+.update-meta-grid strong { color: var(--ink-strong); font-family: 'DM Mono', monospace; font-size: 11px; font-weight: 500; overflow-wrap: anywhere; }
+.update-notes-section { display: flex; flex-direction: column; gap: 8px; }
+.update-notes-section h3 { margin: 0; color: var(--ink-strong); font-size: 12px; }
+/* 发布说明保留原文换行；限制高度并单独滚动，避免长说明把弹窗撑出屏幕。 */
+.update-notes { max-height: 260px; overflow: auto; padding: 12px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink-soft); background: var(--surface-soft); font-size: 11px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; }

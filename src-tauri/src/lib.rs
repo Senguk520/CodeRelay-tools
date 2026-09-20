@@ -1,6 +1,7 @@
 mod codebuddy_oauth;
 mod gateway;
 mod models;
+mod update;
 
 use tauri::{
     menu::{Menu, MenuItem},
@@ -94,6 +95,7 @@ pub fn run() {
             codebuddy_oauth::codebuddy_oauth_complete,
             codebuddy_oauth::codebuddy_oauth_cancel,
             codebuddy_oauth::codebuddy_validate_token,
+            update::check_for_update,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build CodeRelay");
