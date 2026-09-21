@@ -161,6 +161,88 @@ impl Store {
         Ok(())
     }
 
+    /// Rebuilds `model_configs` so that it matches `inputs` exactly.
+    ///
+    /// CodeRelay is the authoritative source for the model binding list, and this
+    /// SQLite file is only a runtime cache. The rows are keyed by `model_hash`,
+    /// which is derived from `request_url` — and therefore from the relay's
+    /// *resolved* port. When the relay picks a different port every hash changes,
+    /// so a plain upsert would leave the previous generation of rows behind and
+    /// each model would appear twice in Cursor's picker. Reconciling against the
+    /// requested set makes port drift converge instead of accumulate.
+    ///
+    /// Matching proceeds in two steps, because a port change alters *every* hash
+    /// at once and an exact-hash match is therefore useless exactly when it is
+    /// most needed:
+    ///
+    /// 1. Rows pointed at a different `base_url` than requested are stale
+    ///    bindings and are deleted (this is what collapses port drift).
+    /// 2. The survivors all share the requested `base_url`, so they are matched
+    ///    on `display_name` — the one field CodeRelay keeps stable across a relay
+    ///    restart. A match is rewritten in place (which is what lets a
+    ///    `display_name` edit keep its row identity instead of orphaning it),
+    ///    and anything left over was removed by the user, so it is deleted.
+    pub async fn reconcile_models(&self, inputs: &[ModelConfigInput]) -> Result<Vec<ModelConfig>> {
+        let current = self.models().await?;
+        if inputs.is_empty() {
+            for model in &current {
+                self.delete_model(&model.model_hash).await?;
+            }
+            return Ok(Vec::new());
+        }
+
+        let mut normalized = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let input = normalize_model_input(input)?;
+            let hash = model_hash(&input)?;
+            normalized.push((hash, input));
+        }
+
+        // 1. Drop the rows that do not point at the requested relay base URL.
+        //    The requested set is built by CodeRelay from a single relay address,
+        //    so any disagreement here means the row is from another generation.
+        let desired_base_url = normalized[0].1.base_url.clone();
+        let mut survivors: Vec<ModelConfig> = Vec::new();
+        for model in current {
+            if model.base_url == desired_base_url {
+                survivors.push(model);
+            } else {
+                self.delete_model(&model.model_hash).await?;
+            }
+        }
+
+        // 2. Match what survives against the requested bindings by display name.
+        let mut saved = Vec::with_capacity(normalized.len());
+        for (hash, input) in normalized {
+            let matched = survivors
+                .iter()
+                .position(|model| model.display_name == input.display_name)
+                .map(|position| survivors.remove(position));
+            match matched {
+                Some(current) if current.model_hash == hash => {
+                    // Already identical; the write path is idempotent but there is
+                    // no reason to spend a transaction on it.
+                    saved.push(current);
+                }
+                Some(current) => {
+                    saved.push(self.update_model(&current.model_hash, &input).await?);
+                }
+                None => {
+                    let created = self.create_models(std::slice::from_ref(&input)).await?;
+                    saved.extend(created);
+                }
+            }
+        }
+
+        // 3. Anything the user removed from the binding list is now orphaned.
+        for model in survivors {
+            self.delete_model(&model.model_hash).await?;
+        }
+
+        saved.sort_by_key(|model| model.sort_order);
+        Ok(saved)
+    }
+
     pub async fn reorder_models(&self, model_hashes: &[String]) -> Result<Vec<ModelConfig>> {
         let current = self.models().await?;
         let current_hashes = current

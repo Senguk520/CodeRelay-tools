@@ -113,6 +113,7 @@ pub fn api_router(service: ControlService) -> Router {
             get(models::list).post(models::create),
         )
         .route("/__byok-api__/api/models/discover", post(models::discover))
+        .route("/__byok-api__/api/models/reconcile", put(models::reconcile))
         .route("/__byok-api__/api/models/order", put(models::reorder))
         .route(
             "/__byok-api__/api/models/{model_hash}",

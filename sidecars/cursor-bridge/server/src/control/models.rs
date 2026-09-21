@@ -39,6 +39,18 @@ pub async fn create(
     ))
 }
 
+/// Replaces every configured model with the posted set.
+///
+/// CodeRelay calls this instead of `create` when it owns the binding list: the
+/// bridge's rows are a cache of that list, so anything not in the request is
+/// stale and must go. `PUT` (rather than `POST`) marks the replace semantics.
+pub async fn reconcile(
+    State(service): State<ControlService>,
+    Json(input): Json<SaveModels>,
+) -> Result<Json<Vec<ModelConfig>>> {
+    Ok(Json(service.reconcile_models(&input.models).await?))
+}
+
 pub async fn reorder(
     State(service): State<ControlService>,
     Json(input): Json<ModelOrder>,

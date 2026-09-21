@@ -139,6 +139,12 @@ impl ControlService {
         self.store.create_models(models).await
     }
 
+    /// Replaces the whole model set with the authoritative binding list CodeRelay
+    /// pushes down, deleting the rows left behind by a relay port change.
+    pub async fn reconcile_models(&self, models: &[ModelConfigInput]) -> Result<Vec<ModelConfig>> {
+        self.store.reconcile_models(models).await
+    }
+
     pub async fn reorder_models(&self, model_hashes: &[String]) -> Result<Vec<ModelConfig>> {
         self.store.reorder_models(model_hashes).await
     }
