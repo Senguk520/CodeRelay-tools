@@ -1,4 +1,5 @@
 mod codebuddy_oauth;
+mod cursor_bridge;
 mod gateway;
 mod models;
 mod update;
@@ -71,9 +72,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .manage(gateway::RuntimeState::new())
+        .manage(cursor_bridge::CursorBridgeState::new())
         .setup(|app| {
             let runtime = app.state::<gateway::RuntimeState>().inner().clone();
             gateway::initialize(app.handle(), &runtime)?;
+            let bridge = app.state::<cursor_bridge::CursorBridgeState>();
+            cursor_bridge::initialize(app.handle(), &bridge)?;
+            drop(bridge);
             build_tray(app)?;
             gateway::sync_tray_menu(app.handle());
             Ok(())
@@ -95,6 +100,15 @@ pub fn run() {
             codebuddy_oauth::codebuddy_oauth_complete,
             codebuddy_oauth::codebuddy_oauth_cancel,
             codebuddy_oauth::codebuddy_validate_token,
+            cursor_bridge::cursor_bridge_status,
+            cursor_bridge::cursor_bridge_start,
+            cursor_bridge::cursor_bridge_stop,
+            cursor_bridge::cursor_bridge_init_ca,
+            cursor_bridge::cursor_bridge_install_command,
+            cursor_bridge::cursor_bridge_set_enabled,
+            cursor_bridge::cursor_bridge_sync_models,
+            cursor_bridge::cursor_bridge_save_bindings,
+            cursor_bridge::cursor_bridge_save_preferences,
             update::check_for_update,
         ])
         .build(tauri::generate_context!())
@@ -104,6 +118,8 @@ pub fn run() {
         if matches!(event, RunEvent::Exit) {
             let runtime = app_handle.state::<gateway::RuntimeState>().inner().clone();
             gateway::shutdown(app_handle, &runtime);
+            let bridge = app_handle.state::<cursor_bridge::CursorBridgeState>();
+            cursor_bridge::shutdown(&bridge);
         }
     });
 }

@@ -23,7 +23,7 @@ const RUNTIME_DIR: &str = "sidecar-runtime";
 // 程序清理运行目录时必须保留它：否则每次重启都要靠一次性的后端同步兜底，单次失败
 // 就会让模型目录退化成只剩 auto + codex-auto-review。该文件不含任何凭据。
 const RUNTIME_MODEL_CACHE_FILE: &str = "codebuddy_models_cache.json";
-const READY_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_PENDING_REQUESTS: usize = 4096;
 const MAX_STDERR_BYTES: usize = 16 * 1024;
 const STATE_CHANGED_EVENT: &str = "coderelay-state-changed";
@@ -72,19 +72,23 @@ struct RuntimeFiles {
 }
 
 #[derive(Debug, Clone)]
-enum StartupResult {
+pub(crate) enum StartupResult {
     Ready { port: u16 },
     Failed(String),
 }
 
+/// One-shot handshake a sidecar signals exactly once when it has started.
+///
+/// Shared by the Go relay sidecar and the Cursor bridge so both use an identical
+/// ready protocol: one JSON object per stdout line, `{"type":"ready","port":N}`.
 #[derive(Default)]
-struct StartupLatch {
+pub(crate) struct StartupLatch {
     result: Mutex<Option<StartupResult>>,
     changed: Condvar,
 }
 
 impl StartupLatch {
-    fn signal(&self, result: StartupResult) {
+    pub(crate) fn signal(&self, result: StartupResult) {
         let mut current = self
             .result
             .lock()
@@ -95,7 +99,7 @@ impl StartupLatch {
         }
     }
 
-    fn wait(&self, timeout: Duration) -> Option<StartupResult> {
+    pub(crate) fn wait(&self, timeout: Duration) -> Option<StartupResult> {
         let current = self
             .result
             .lock()
@@ -150,7 +154,7 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
         .map_err(|error| format!("读取应用数据目录失败：{error}"))
@@ -164,7 +168,7 @@ fn ensure_parent(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("创建目录 {} 失败：{error}", parent.display()))
 }
 
-fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
     ensure_parent(path)?;
     let name = path
         .file_name()
@@ -204,11 +208,24 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn load_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> T {
+pub(crate) fn load_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> T {
     fs::read(path)
         .ok()
         .and_then(|data| serde_json::from_slice(&data).ok())
         .unwrap_or_default()
+}
+
+/// Reads a snapshot of the persisted application state.
+///
+/// Used by modules that need the relay's ports and API keys but must not own a
+/// `RuntimeState` reference (the Cursor bridge does, when it derives the relay
+/// address it hands to the bridge).
+pub(crate) fn app_state_snapshot(app: &AppHandle) -> Result<AppState, String> {
+    let runtime = app.state::<RuntimeState>();
+    let inner = runtime.inner.clone();
+    drop(runtime);
+    let snapshot = locked(&inner.app, "应用")?.clone();
+    Ok(snapshot)
 }
 
 fn state_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -702,6 +719,9 @@ fn lan_base_url_for_state(state: &AppState, inner: &Arc<RuntimeInner>) -> Option
 /// `state.json` 并被误当成配置。这里只处理传值进来的克隆。
 fn with_derived_fields(mut state: AppState, inner: &Arc<RuntimeInner>) -> AppState {
     state.lan_base_url = lan_base_url_for_state(&state, inner);
+    // cursor-bridge 端口来自进程全局量（bridge 的 ready 行上报的真实端口），
+    // 不经过 RuntimeInner，因此这里直接取。它是纯派生值，永不落盘。
+    state.cursor_bridge_port = crate::cursor_bridge::current_port();
     state
 }
 
@@ -1112,7 +1132,7 @@ fn append_stderr(buffer: &Arc<Mutex<String>>, chunk: &str) {
     }
 }
 
-fn spawn_stderr_reader(stderr: impl Read + Send + 'static, buffer: Arc<Mutex<String>>) {
+pub(crate) fn spawn_stderr_reader(stderr: impl Read + Send + 'static, buffer: Arc<Mutex<String>>) {
     thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         let mut line = String::new();
@@ -1586,7 +1606,7 @@ fn stop_process_only(inner: &Arc<RuntimeInner>) {
 }
 
 #[cfg(target_os = "windows")]
-fn terminate_child_tree(child: &mut Child) {
+pub(crate) fn terminate_child_tree(child: &mut Child) {
     // taskkill /T /F 终止整个进程树，避免 sidecar 派生的子进程残留占用端口。
     use std::os::windows::process::CommandExt;
     let pid = child.id();
@@ -1602,7 +1622,7 @@ fn terminate_child_tree(child: &mut Child) {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn terminate_child_tree(child: &mut Child) {
+pub(crate) fn terminate_child_tree(child: &mut Child) {
     let _ = child.kill();
 }
 

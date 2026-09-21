@@ -324,6 +324,12 @@ pub struct AppState {
     /// `state.json` 并防止被误当成持久化配置。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lan_base_url: Option<String>,
+    /// 只读派生值：cursor-bridge sidecar 当前监听的端口。
+    ///
+    /// 与 `lan_base_url` 同属派生字段：唯一来源是 cursor_bridge 模块的运行时
+    /// 端口原子量，**永不落盘**。bridge 未运行时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_bridge_port: Option<u16>,
 }
 
 impl Default for AppState {
@@ -338,6 +344,7 @@ impl Default for AppState {
             actual_port: None,
             last_error: None,
             lan_base_url: None,
+            cursor_bridge_port: None,
         }
     }
 }
@@ -503,6 +510,8 @@ impl AppState {
         // 局域网地址是纯派生值，唯一来源是运行时的网卡解析缓存；置空可保证
         // 它永远不会被写进 state.json（配合 serde skip_serializing_if）。
         self.lan_base_url = None;
+        // cursor-bridge 端口同理：唯一来源是 bridge 进程的 ready 行。
+        self.cursor_bridge_port = None;
         for account in &mut self.accounts {
             account.access_token = None;
             account.refresh_token = None;
