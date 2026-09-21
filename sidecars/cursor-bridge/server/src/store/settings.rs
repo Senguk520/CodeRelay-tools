@@ -156,10 +156,27 @@ pub(crate) struct ProxySettingsSecret {
 /// before it writes, so the settings page could neither load nor replace the
 /// row that broke it.
 fn read_proxy_settings(value: &str) -> ProxySettingsSecret {
-    serde_json::from_str(value).unwrap_or_else(|error| {
+    let mut settings: ProxySettingsSecret = serde_json::from_str(value).unwrap_or_else(|error| {
         tracing::warn!(%error, "ignoring unreadable outbound proxy settings");
         ProxySettingsSecret::default()
-    })
+    });
+    // The stored password is sealed at rest (see `crate::secret`). An empty
+    // value means "no password" and is left alone so the common case costs no
+    // work.
+    if !settings.password.is_empty() {
+        match crate::secret::unprotect_string(&settings.password) {
+            Ok(password) => settings.password = password,
+            Err(error) => {
+                // Same reasoning as an unparsable row: losing the password is
+                // bad, but failing here would make the settings page unloadable
+                // and leave the user unable to replace the row that broke it.
+                // Clearing it lets them re-enter the password.
+                tracing::warn!(%error, "could not unprotect the stored outbound proxy password");
+                settings.password.clear();
+            }
+        }
+    }
+    settings
 }
 
 impl Store {
@@ -248,7 +265,10 @@ impl Store {
             address,
             auth_enabled: input.auth_enabled,
             username: input.username.trim().to_owned(),
-            password,
+            // Sealed at rest: this struct is serialized straight into the
+            // settings row, and the proxy password is a credential like any
+            // other.
+            password: crate::secret::protect_string(&password)?,
         };
         let value_json = serde_json::to_string(&settings)?;
         let _write = self.writes.lock().await;

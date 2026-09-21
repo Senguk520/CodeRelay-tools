@@ -1426,10 +1426,15 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
 
     {showInstall && <Modal title="安装根证书" onClose={() => setShowInstall(false)} wide>
       <div className="detail-view">
-        <p className="settings-note"><ShieldCheck size={15} />CodeRelay 不会自动提权。请以管理员身份打开终端，手动执行下面的命令，把根证书加入系统信任库。</p>
+        <p className="settings-note"><ShieldCheck size={15} />CodeRelay 不会自动提权。请在终端中手动执行下面的命令，把根证书加入系统信任库。</p>
         <pre className="code-block">{status.installCommand ?? '（尚无安装命令，请先生成根证书）'}</pre>
+        {status.uninstallCommand && <>
+          <p className="settings-note">不再需要接管时，用这条命令把根证书撤下来：</p>
+          <pre className="code-block">{status.uninstallCommand}</pre>
+        </>}
         <div className="modal-footer">
           <button className="button ghost" onClick={() => setShowInstall(false)}>关闭</button>
+          {status.uninstallCommand && <button className="button ghost" onClick={() => { void copyText(status.uninstallCommand!).then(() => notify('卸载命令已复制')); }}><Copy size={15} />复制卸载命令</button>}
           <button className="button primary" disabled={!status.installCommand} onClick={() => { if (status.installCommand) void copyText(status.installCommand).then(() => notify('安装命令已复制')); }}><Copy size={15} />复制命令</button>
         </div>
       </div>
@@ -1627,9 +1632,18 @@ function CertificateSection({ notify }: { notify: NoticeHandler }) {
       {!status.running && <span className="save-hint">桥接未运行，请先在「Cursor 服务」页启动桥接。</span>}
     </div>
     {command && <>
-      <p className="settings-note"><Terminal size={15} />以管理员身份打开终端后执行（CodeRelay 不会自动提权）：</p>
+      <p className="settings-note"><Terminal size={15} />在终端中执行（Windows 写入当前用户信任库，无需管理员；macOS/Linux 需 sudo）：</p>
       <pre className="code-block">{command}</pre>
-      <button className="button ghost" onClick={() => { void copyText(command).then(() => notify('安装命令已复制')); }}><Copy size={15} />复制命令</button>
+      <div className="form-actions" style={{ justifyContent: 'flex-start' }}>
+        <button className="button ghost" onClick={() => { void copyText(command).then(() => notify('安装命令已复制')); }}><Copy size={15} />复制命令</button>
+      </div>
+    </>}
+    {status.uninstallCommand && <>
+      <p className="settings-note"><ShieldCheck size={15} />不再需要接管时，用下面的命令把根证书从信任库中撤下。信任不该是单向门：留着它，这张证书会一直在这台机器上被信任。</p>
+      <pre className="code-block">{status.uninstallCommand}</pre>
+      <div className="form-actions" style={{ justifyContent: 'flex-start' }}>
+        <button className="button ghost" onClick={() => { void copyText(status.uninstallCommand!).then(() => notify('卸载命令已复制')); }}><Copy size={15} />复制卸载命令</button>
+      </div>
     </>}
   </div>;
 }
@@ -1718,7 +1732,13 @@ function CursorSettingsSection({ notify }: { notify: NoticeHandler }) {
         <Toggle label="代理认证" description="代理需要用户名密码时开启。" checked={draft.proxyAuthEnabled} onChange={(value) => update({ proxyAuthEnabled: value })} />
         {draft.proxyAuthEnabled && <div className="form-grid">
           <Field label="用户名"><input value={draft.proxyUsername} onChange={(e) => update({ proxyUsername: e.target.value })} /></Field>
-          <Field label="密码" hint="留空表示保留已保存的密码。"><input type="password" value={draft.proxyPassword} onChange={(e) => update({ proxyPassword: e.target.value })} placeholder="留空则不修改" /></Field>
+          <Field label="密码" hint={status.hasProxyPassword === true
+            ? '已保存密码；留空表示不修改。'
+            : status.hasProxyPassword === false
+              ? '当前未保存密码。'
+              : '桥接未运行，无法确认是否已保存密码。'}>
+            <input type="password" value={draft.proxyPassword} onChange={(e) => update({ proxyPassword: e.target.value })} placeholder={status.hasProxyPassword ? '留空则不修改' : '请输入密码'} />
+          </Field>
         </div>}
       </>}
     </div>

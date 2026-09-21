@@ -12,6 +12,7 @@ pub mod parent_monitor;
 pub mod provider;
 pub mod run;
 pub mod search;
+pub mod secret;
 pub mod store;
 
 pub use app::App;

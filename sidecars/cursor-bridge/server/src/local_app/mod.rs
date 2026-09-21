@@ -58,6 +58,12 @@ pub struct CursorHarnessStatus {
     pub settings_applied: bool,
     pub proxy_url: Option<String>,
     pub ca_install_command: Option<String>,
+    /// The command that removes the trusted root again.
+    ///
+    /// Paired with `ca_install_command` so the trust is reversible: without a
+    /// documented removal path the root outlives the feature on the user's
+    /// machine, still trusted, with nothing telling them how to withdraw it.
+    pub ca_uninstall_command: Option<String>,
     /// The persisted, explicitly-set takeover intent.
     ///
     /// Reads `false` when the row is missing, which is the whole point: an
@@ -151,6 +157,7 @@ impl CursorHarness {
             settings_applied,
             proxy_url,
             ca_install_command: self.inner.ca.install_command(),
+            ca_uninstall_command: self.inner.ca.uninstall_command(),
             takeover_requested: self.inner.store.cursor_takeover_enabled().await?,
             cursor_terminate_failed: self
                 .inner

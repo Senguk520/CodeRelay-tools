@@ -166,8 +166,19 @@ pub struct CursorBridgePreferences {
     pub proxy_address: String,
     pub proxy_auth_enabled: bool,
     pub proxy_username: String,
+    /// The outbound-proxy password, **write-only**.
+    ///
     /// Empty means "keep the stored password", matching the bridge's own
-    /// `ProxySettingsInput` contract.
+    /// `ProxySettingsInput` contract. `skip_serializing` is what makes it
+    /// write-only: this struct is persisted to `cursor-bridge.json` *and*
+    /// embedded in [`CursorBridgeStatus`], so without it the password would sit
+    /// in cleartext on disk and be echoed straight into the WebView's controlled
+    /// `<input type="password">`. The bridge keeps the only stored copy and
+    /// reports merely [`CursorBridgeStatus::has_proxy_password`].
+    ///
+    /// Sending a password still works: `skip_serializing` does not affect
+    /// deserialization, so the frontend can hand one in on save.
+    #[serde(skip_serializing)]
     pub proxy_password: String,
     /// Empty means 直连: forward Cursor's own commit RPC untouched.
     pub commit_model_id: String,
@@ -264,7 +275,21 @@ pub struct CursorBridgeStatus {
     pub bindings: Vec<CursorBinding>,
     pub preferences: CursorBridgePreferences,
     pub install_command: Option<String>,
+    /// The matching "remove this root again" command, shown next to the install
+    /// one. Without it the CA is a one-way door: the trusted root outlives the
+    /// feature and the user has no documented way to withdraw it.
+    pub uninstall_command: Option<String>,
     pub proxy_url: Option<String>,
+    /// Whether the bridge holds an outbound-proxy password.
+    ///
+    /// `None` means the bridge could not be reached, so the answer is *unknown*
+    /// rather than "no". Reporting `false` in that case would be a lie the user
+    /// could act on: they might conclude no password is stored and be surprised
+    /// when the proxy still authenticates. The password value itself never
+    /// returns — this flag is the only signal the UI gets, and it is what lets
+    /// the settings page say "a password is stored" instead of leaving the user
+    /// to infer it from an empty box.
+    pub has_proxy_password: Option<bool>,
     pub last_error: Option<String>,
     /// Display names of bindings that were skipped because their API key is
     /// missing or disabled. Surfaced so the user is told rather than left
@@ -361,6 +386,19 @@ async fn fetch_commit_default_prompt(port: u16) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|prompt| !prompt.trim().is_empty())
         .map(str::to_string)
+}
+
+/// Whether the bridge holds an outbound-proxy password.
+///
+/// `None` when the bridge is unreachable, so the UI shows "unknown" instead of
+/// asserting "no password" — an assertion the user could act on and be wrong
+/// about. The password itself is never requested: the bridge reports
+/// `has_password` and keeps the value.
+async fn fetch_has_proxy_password(port: u16) -> Option<bool> {
+    let client = http_client(HTTP_TIMEOUT).ok()?;
+    let url = format!("{}/settings/proxy", bridge_base(port));
+    let value = fetch_json(&client, &url).await.ok()?;
+    value.get("has_password").and_then(Value::as_bool)
 }
 
 fn json_str(value: &Value, key: &str, fallback: &str) -> String {
@@ -935,7 +973,11 @@ async fn build_status(
         bindings: bindings.clone(),
         preferences: preferences.clone(),
         install_command: None,
+        uninstall_command: None,
         proxy_url: None,
+        // The bridge is not running, so whether it holds a password is unknown
+        // rather than "no".
+        has_proxy_password: None,
         last_error: error,
         unresolved_bindings: unresolved_bindings.clone(),
         commit_default_prompt: None,
@@ -966,6 +1008,7 @@ async fn build_status(
     // rows rather than the binding list (whose ids CodeRelay chose).
     let models = fetch_models(port).await.map(parse_models).unwrap_or_default();
     let commit_default_prompt = fetch_commit_default_prompt(port).await;
+    let has_proxy_password = fetch_has_proxy_password(port).await;
 
     Ok(CursorBridgeStatus {
         running: true,
@@ -992,10 +1035,15 @@ async fn build_status(
             .get("ca_install_command")
             .and_then(Value::as_str)
             .map(str::to_string),
+        uninstall_command: harness
+            .get("ca_uninstall_command")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         proxy_url: harness
             .get("proxy_url")
             .and_then(Value::as_str)
             .map(str::to_string),
+        has_proxy_password,
         last_error,
         unresolved_bindings,
         commit_default_prompt,

@@ -8,6 +8,9 @@ use crate::{Error, Result};
 
 const DATA_DIR_NAME: &str = ".coderelay-cursor-bridge";
 const DATA_DIR_ENV: &str = "CODERELAY_CURSOR_DATA_DIR";
+/// Separate directory for the certificate authority. See [`managed_ca_dir`].
+const CA_DIR_NAME: &str = ".coderelay-cursor-bridge-ca";
+const CA_DIR_ENV: &str = "CODERELAY_CURSOR_CA_DIR";
 const DATABASE_FILE_NAME: &str = "cursor-bridge.db";
 /// Shared secret CodeRelay passes so the control API can tell "the desktop app
 /// asked" from "any local process asked". See [`ControlAuth`](crate::control).
@@ -33,6 +36,87 @@ pub fn managed_data_dir() -> Result<PathBuf> {
     #[cfg(unix)]
     fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700))?;
     Ok(data_dir)
+}
+
+/// Resolves the directory holding the local certificate authority.
+///
+/// Deliberately **not** inside [`managed_data_dir`]. The CA directory contains
+/// the private key that is trusted system-wide, while the data directory holds a
+/// disposable SQLite cache. Keeping them apart means the "zip up
+/// `cursor-bridge/` and send me the logs" debugging workflow cannot accidentally
+/// ship the signing key along with it. `CODERELAY_CURSOR_CA_DIR` overrides,
+/// mirroring the data-dir contract so tests can isolate it.
+pub fn managed_ca_dir() -> Result<PathBuf> {
+    let ca_dir = match std::env::var_os(CA_DIR_ENV) {
+        Some(value) if !value.is_empty() => PathBuf::from(value),
+        _ => {
+            let home_dir = dirs::home_dir()
+                .ok_or_else(|| Error::Config("cannot resolve user home directory".into()))?;
+            home_dir.join(CA_DIR_NAME)
+        }
+    };
+    let created = !ca_dir.is_dir();
+    fs::create_dir_all(&ca_dir)?;
+    #[cfg(unix)]
+    fs::set_permissions(&ca_dir, fs::Permissions::from_mode(0o700))?;
+    // On Windows the mode bits above are inert, so the directory would otherwise
+    // keep whatever the profile inherited. Only done at creation: re-running it
+    // on every access would spawn a process per call for no gain.
+    #[cfg(windows)]
+    if created {
+        restrict_directory_to_current_user(&ca_dir);
+    }
+    Ok(ca_dir)
+}
+
+/// Replaces the inherited ACL on `dir` with one that names this account.
+///
+/// Windows ignores the `0o700` that the unix path applies, so without this the
+/// CA directory simply inherits the profile's ACL. In practice that already
+/// excludes other standard users, so this is defence in depth rather than the
+/// load-bearing control — the load-bearing ones are DPAPI on the key and the
+/// CurrentUser trust scope. It is stated plainly here so nobody reads
+/// "hardened" as stronger than it is: **any process running as this user can
+/// still read the key**, and that is inherent to a local MITM proxy.
+///
+/// `icacls` is used instead of `SetNamedSecurityInfoW` because building the ACL
+/// by hand needs the current user's SID, and the short path to that is
+/// `OpenProcessToken` + `GetTokenInformation` + `CopySid` — considerably more
+/// unsafe surface than one documented command line. Failure is logged and
+/// ignored: a CA that works with inherited permissions beats a bridge that will
+/// not start because `icacls` was unavailable.
+#[cfg(windows)]
+fn restrict_directory_to_current_user(dir: &std::path::Path) {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    /// Keeps the console from flashing on screen for a windowless sidecar.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let Ok(user) = std::env::var("USERNAME") else {
+        return;
+    };
+    if user.trim().is_empty() {
+        return;
+    }
+    // `*S-1-5-18` is SYSTEM by well-known SID: naming it as a literal would break
+    // on a non-English Windows, where the account is not called "SYSTEM".
+    let outcome = Command::new("icacls")
+        .arg(dir)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{user}:(OI)(CI)F"))
+        .arg("*S-1-5-18:(OI)(CI)F")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    match outcome {
+        Ok(status) if status.success() => {}
+        Ok(status) => tracing::warn!(%status, "icacls could not restrict the CA directory ACL"),
+        Err(error) => tracing::warn!(%error, "could not run icacls to restrict the CA directory ACL"),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

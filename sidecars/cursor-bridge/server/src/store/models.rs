@@ -113,7 +113,7 @@ impl Store {
         .bind(input.model_type.as_str())
         .bind(&input.base_url)
         .bind(input.use_full_url)
-        .bind(&input.api_key)
+        .bind(crate::secret::protect_string(&input.api_key)?)
         .bind(&input.tooltip_data)
         .bind(&input.model_id)
         .bind(&input.reasoning_effort)
@@ -318,7 +318,7 @@ async fn insert_model_with_conflict(
         .bind(input.model_type.as_str())
         .bind(&input.base_url)
         .bind(input.use_full_url)
-        .bind(&input.api_key)
+        .bind(crate::secret::protect_string(&input.api_key)?)
         .bind(&input.tooltip_data)
         .bind(&input.model_id)
         .bind(&input.reasoning_effort)
@@ -342,7 +342,10 @@ async fn insert_model_with_conflict(
 }
 
 fn model_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ModelConfig> {
-    let api_key: String = row.try_get("api_key")?;
+    // The column is sealed at rest (see `crate::secret`); unprotect before the
+    // derived fields are computed so `has_api_key` and the fingerprint describe
+    // the real credential. A legacy plaintext row passes through unchanged.
+    let api_key = crate::secret::unprotect_string(&row.try_get::<String, _>("api_key")?)?;
     Ok(ModelConfig {
         model_hash: row.try_get("model_hash")?,
         sort_order: row.try_get("sort_order")?,

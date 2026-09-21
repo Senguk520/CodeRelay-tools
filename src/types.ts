@@ -237,7 +237,16 @@ export interface CursorBridgeStatus {
   bindings: CursorBinding[];
   preferences: CursorBridgePreferences;
   installCommand: string | null;
+  /** 与安装命令配对的卸载命令：把根证书从信任库里撤下来。 */
+  uninstallCommand: string | null;
   proxyUrl: string | null;
+  /**
+   * bridge 是否持有出站代理密码。
+   *
+   * `null` 表示 bridge 不可达、答案**未知**，而不是「没有密码」——把未知显示成
+   * 「未设置」会让用户据此做出错误判断。密码本身永不下发。
+   */
+  hasProxyPassword: boolean | null;
   lastError: string | null;
   /** 因 API Key 缺失或停用而被跳过的绑定显示名。 */
   unresolvedBindings: string[];
@@ -269,7 +278,9 @@ export const defaultCursorBridgeStatus: CursorBridgeStatus = {
   bindings: [],
   preferences: defaultCursorBridgePreferences,
   installCommand: null,
+  uninstallCommand: null,
   proxyUrl: null,
+  hasProxyPassword: null,
   lastError: null,
   unresolvedBindings: [],
   commitDefaultPrompt: null,

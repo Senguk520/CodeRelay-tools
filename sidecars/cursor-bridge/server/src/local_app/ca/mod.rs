@@ -11,17 +11,44 @@ mod windows;
 use std::os::unix::fs::PermissionsExt;
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose, RsaKeySize, PKCS_RSA_SHA256,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, GeneralSubtree, IsCa, Issuer,
+    KeyPair, KeyUsagePurpose, NameConstraints, RsaKeySize, PKCS_RSA_SHA256,
 };
 #[cfg(target_os = "macos")]
 use sha1::{Digest, Sha1};
 use time::{Duration, OffsetDateTime};
 use x509_parser::prelude::FromDer;
 
-use crate::{config::managed_data_dir, Error, Result};
+use crate::{config::managed_ca_dir, secret, Error, Result};
 
 use super::CaState;
+
+/// The DNS subtree the CA is allowed to sign for.
+///
+/// The proxy already restricts interception to `*.cursor.sh` at runtime
+/// (`local_app::proxy::is_cursor_host`), but that is a *code* check: it stops
+/// being a limit the moment someone adds an upstream host or the matching logic
+/// regresses, and it does nothing at all if the private key leaks. Encoding the
+/// same boundary in the certificate turns "this CA happens to only be used for
+/// Cursor" into "this CA *cannot* vouch for anything else", so a leaked key buys
+/// an attacker no trusted certificate for any other domain.
+///
+/// Both spellings are listed: `cursor.sh` covers the bare apex, and
+/// `.cursor.sh` the subdomains (`api2.cursor.sh`, `api3.cursor.sh`). TLS stacks
+/// treat a leading dot as "subdomains only", so the apex needs its own entry.
+fn permitted_subtrees() -> Vec<GeneralSubtree> {
+    vec![
+        GeneralSubtree::DnsName("cursor.sh".into()),
+        GeneralSubtree::DnsName(".cursor.sh".into()),
+    ]
+}
+
+/// Subject common name of the generated CA.
+///
+/// Shared with the uninstall command, which removes the root *by name*: a
+/// literal repeated in two places is exactly how "uninstall" quietly stops
+/// matching the certificate it is supposed to remove.
+const CA_COMMON_NAME: &str = "CodeRelay Cursor Bridge CA";
 
 #[derive(Clone)]
 pub struct CaManager {
@@ -34,9 +61,9 @@ pub struct LoadedCa {
 
 impl CaManager {
     pub fn managed() -> Result<Self> {
-        Ok(Self {
-            dir: managed_data_dir()?.join("ca"),
-        })
+        let dir = managed_ca_dir()?;
+        migrate_legacy_location(&dir)?;
+        Ok(Self { dir })
     }
 
     fn cert_path(&self) -> PathBuf {
@@ -48,7 +75,7 @@ impl CaManager {
 
     pub fn state(&self) -> Result<CaState> {
         let cert = fs::read_to_string(self.cert_path());
-        let key = fs::read_to_string(self.key_path());
+        let key = self.read_key();
         match (cert, key) {
             (Err(cert_error), Err(key_error))
                 if cert_error.kind() == std::io::ErrorKind::NotFound
@@ -70,9 +97,27 @@ impl CaManager {
         }
     }
 
+    /// Reads the private key, unsealing it if it was stored protected.
+    ///
+    /// A failure to unseal becomes `NotFound` rather than being propagated, so
+    /// `state()` reports `Invalid` — the same outcome as any other unreadable
+    /// key. That keeps the recovery path ("regenerate the CA") reachable instead
+    /// of wedging the settings page on an error the user cannot act on.
+    fn read_key(&self) -> std::io::Result<String> {
+        let stored = fs::read(self.key_path())?;
+        secret::unprotect(&stored)
+            .and_then(|bytes| {
+                String::from_utf8(bytes)
+                    .map_err(|error| Error::Config(format!("decode CA key: {error}")))
+            })
+            .map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })
+    }
+
     pub fn load(&self) -> Result<LoadedCa> {
         let cert = fs::read_to_string(self.cert_path())?;
-        let key = fs::read_to_string(self.key_path())?;
+        let key = self.read_key()?;
         Ok(LoadedCa {
             issuer: parse_issuer(&cert, &key)?,
         })
@@ -87,8 +132,15 @@ impl CaManager {
                     path
                 )
             }),
+            // `-user` targets the CurrentUser store rather than LocalMachine.
+            // That is what makes this runnable **without administrator
+            // privileges** — CodeRelay deliberately never elevates — and it
+            // narrows the trust to the account actually running the bridge,
+            // which is the same account that can read the DPAPI-protected key.
+            // A machine-wide root would let a key only this user holds MITM
+            // every other account on the box.
             "windows" => Some(format!(
-                "certutil -addstore -f Root \"{}\"",
+                "certutil -user -addstore -f Root \"{}\"",
                 self.cert_path().display()
             )),
             "linux" => {
@@ -96,6 +148,34 @@ impl CaManager {
                 Some(format!(
                     "sudo cp '{}' '{}' && sudo {}",
                     path,
+                    anchor.display(),
+                    linux_refresh_command()
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// The command that withdraws the trusted root again.
+    ///
+    /// Shown beside [`Self::install_command`] so the trust is not a one-way
+    /// door: without it the root stays trusted on the user's machine after they
+    /// stop using the feature, and there is no documented way to remove it.
+    /// Each arm mirrors the scope its install counterpart uses — CurrentUser on
+    /// Windows, the machine keychain on macOS, the same anchor file on Linux —
+    /// so "uninstall" undoes exactly what "install" did.
+    pub fn uninstall_command(&self) -> Option<String> {
+        match std::env::consts::OS {
+            "macos" => dirs::home_dir().map(|_| format!("sudo security delete-certificate -c \"{CA_COMMON_NAME}\" /Library/Keychains/System.keychain")),
+            // `-user -delstore` pairs with the `-user -addstore` above; a
+            // machine-store delete would target a store the install no longer
+            // writes to, and would silently report success while changing
+            // nothing.
+            "windows" => Some(format!("certutil -user -delstore Root \"{CA_COMMON_NAME}\"")),
+            "linux" => {
+                let anchor = linux_anchor_file();
+                Some(format!(
+                    "sudo rm -f '{}' && sudo {}",
                     anchor.display(),
                     linux_refresh_command()
                 ))
@@ -126,7 +206,7 @@ impl CaManager {
         let mut params = CertificateParams::new(Vec::<String>::new())
             .map_err(|error| Error::Config(format!("create CA parameters: {error}")))?;
         let mut name = DistinguishedName::new();
-        name.push(DnType::CommonName, "CodeRelay Cursor Bridge CA");
+        name.push(DnType::CommonName, CA_COMMON_NAME);
         name.push(DnType::OrganizationName, "CodeRelay");
         params.distinguished_name = name;
         params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
@@ -135,15 +215,59 @@ impl CaManager {
             KeyUsagePurpose::KeyCertSign,
             KeyUsagePurpose::CrlSign,
         ];
+        // Bound the CA to the one domain tree it exists to intercept. See
+        // [`permitted_subtrees`] for why this lives in the certificate and not
+        // only in the proxy's host check.
+        params.name_constraints = Some(NameConstraints {
+            permitted_subtrees: permitted_subtrees(),
+            excluded_subtrees: Vec::new(),
+        });
         params.not_before = OffsetDateTime::now_utc() - Duration::minutes(5);
         params.not_after = OffsetDateTime::now_utc() + Duration::days(3652);
         let cert = params
             .self_signed(&key)
             .map_err(|error| Error::Config(format!("generate CA certificate: {error}")))?;
-        write_atomic(&self.key_path(), key.serialize_pem().as_bytes(), 0o600)?;
+        // The private key is wrapped with DPAPI on Windows, where the unix mode
+        // bits below are ignored and an unwrapped PEM would be readable by any
+        // process running as this user. See [`secret`].
+        write_atomic(&self.key_path(), &secret::protect(key.serialize_pem().as_bytes())?, 0o600)?;
         write_atomic(&self.cert_path(), cert.pem().as_bytes(), 0o644)?;
         Ok(())
     }
+}
+
+/// Moves a CA left behind by an older build out of the data directory.
+///
+/// The CA used to live at `<data dir>/ca`, next to the disposable SQLite cache.
+/// That is exactly the pairing that makes "zip the data directory and send it
+/// over" leak the signing key, so it now has its own directory. Rather than
+/// regenerating — which would silently invalidate a root the user already
+/// trusted, leaving them with a broken proxy and a stale trusted certificate —
+/// an existing pair is moved across. The old directory is only removed once both
+/// files are safely in the new one.
+fn migrate_legacy_location(new_dir: &std::path::Path) -> Result<()> {
+    let legacy = crate::config::managed_data_dir()?.join("ca");
+    if !legacy.is_dir() {
+        return Ok(());
+    }
+    for name in ["ca.crt", "ca.key"] {
+        let source = legacy.join(name);
+        let destination = new_dir.join(name);
+        // Never overwrite: a CA already in the new location is the live one, and
+        // the leftover is a duplicate.
+        if source.is_file() && !destination.exists() {
+            fs::rename(&source, &destination)?;
+        }
+    }
+    // Only drop the directory when it is genuinely empty of the pair; a partial
+    // move leaves it in place so nothing is lost.
+    let remaining = ["ca.crt", "ca.key"]
+        .iter()
+        .any(|name| legacy.join(name).exists());
+    if !remaining {
+        let _ = fs::remove_dir(&legacy);
+    }
+    Ok(())
 }
 
 fn parse_issuer(cert: &str, key: &str) -> Result<Issuer<'static, KeyPair>> {
