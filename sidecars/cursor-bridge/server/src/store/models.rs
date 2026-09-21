@@ -342,6 +342,7 @@ async fn insert_model_with_conflict(
 }
 
 fn model_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ModelConfig> {
+    let api_key: String = row.try_get("api_key")?;
     Ok(ModelConfig {
         model_hash: row.try_get("model_hash")?,
         sort_order: row.try_get("sort_order")?,
@@ -350,7 +351,9 @@ fn model_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ModelConfig> {
         model_type: ModelType::from_str(row.try_get("model_type")?)?,
         base_url: row.try_get("base_url")?,
         use_full_url: row.try_get("use_full_url")?,
-        api_key: row.try_get("api_key")?,
+        has_api_key: !api_key.trim().is_empty(),
+        api_key_fingerprint: ModelConfig::api_key_fingerprint(&api_key),
+        api_key,
         tooltip_data: row.try_get("tooltip_data")?,
         model_id: row.try_get("model_id")?,
         reasoning_effort: row.try_get("reasoning_effort")?,

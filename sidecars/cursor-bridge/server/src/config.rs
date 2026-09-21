@@ -9,6 +9,9 @@ use crate::{Error, Result};
 const DATA_DIR_NAME: &str = ".coderelay-cursor-bridge";
 const DATA_DIR_ENV: &str = "CODERELAY_CURSOR_DATA_DIR";
 const DATABASE_FILE_NAME: &str = "cursor-bridge.db";
+/// Shared secret CodeRelay passes so the control API can tell "the desktop app
+/// asked" from "any local process asked". See [`ControlAuth`](crate::control).
+const CONTROL_TOKEN_ENV: &str = "CODERELAY_CURSOR_CONTROL_TOKEN";
 const DEFAULT_PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -68,6 +71,14 @@ pub struct Config {
     /// and the Cursor injection. Same flag and semantics as the Go relay
     /// sidecar.
     pub parent_pid: Option<u32>,
+    /// Shared secret required on every control-API request.
+    ///
+    /// `None` means the token was **not configured**, and in that case the
+    /// control API refuses every request rather than falling open. The control
+    /// API shares its port with the Cursor protocol and can read model
+    /// credentials and toggle the system-wide MITM injection, so "no token" has
+    /// to mean "closed", not "unauthenticated but available".
+    pub control_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -82,6 +93,7 @@ impl Config {
             .unwrap_or_else(|_| "127.0.0.1:3000".into())
             .parse()
             .map_err(|error| error_config("CODERELAY_CURSOR_LISTEN_ADDR", error))?;
+        require_loopback(listen_addr)?;
         let request_timeout = match env::var("CODERELAY_CURSOR_PROVIDER_TIMEOUT_SECONDS") {
             Ok(value) => Duration::from_secs(value.parse().map_err(|error| {
                 error_config("CODERELAY_CURSOR_PROVIDER_TIMEOUT_SECONDS", error)
@@ -120,6 +132,7 @@ impl Config {
             use_persisted_ports: false,
             app_version: env!("CARGO_PKG_VERSION").into(),
             parent_pid: parent_pid_from_args()?,
+            control_token: control_token_from_env(),
         })
     }
 
@@ -135,7 +148,45 @@ impl Config {
             use_persisted_ports: true,
             app_version: env!("CARGO_PKG_VERSION").into(),
             parent_pid: parent_pid_from_args()?,
+            control_token: control_token_from_env(),
         })
+    }
+}
+
+/// Rejects a listen address that would expose the server beyond this machine.
+///
+/// The control API shares this port with the Cursor protocol, and it can be
+/// used to read model credentials and toggle the system-wide MITM injection. The
+/// CORS allowlist and the control token are the browser-side and local-process
+/// defences; binding is what keeps the whole thing off the network, and it must
+/// therefore fail closed at startup rather than accept `0.0.0.0`.
+fn require_loopback(address: SocketAddr) -> Result<()> {
+    if address.ip().is_loopback() {
+        return Ok(());
+    }
+    Err(Error::Config(format!(
+        "CODERELAY_CURSOR_LISTEN_ADDR must be a loopback address, got {address}; the control API \
+         must not be reachable from the network"
+    )))
+}
+
+/// Reads the control-API token from the environment.
+fn control_token_from_env() -> Option<String> {
+    parse_control_token(env::var(CONTROL_TOKEN_ENV).ok())
+}
+
+/// The testable half of [`control_token_from_env`].
+///
+/// An empty value is treated as "not configured" rather than as a valid
+/// zero-length secret, because `set FOO=` is a common way to clear a variable
+/// and must not silently produce a token that any caller can guess.
+fn parse_control_token(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
     }
 }
 
@@ -269,5 +320,50 @@ mod tests {
         assert!(parse_parent_pid(vec!["--parent-pid".to_string()]).is_err());
         assert!(parse_parent_pid(vec!["--parent-pid".to_string(), "abc".to_string()]).is_err());
         assert!(parse_parent_pid(vec!["--parent-pid=0".to_string()]).is_err());
+    }
+
+    #[test]
+    fn an_absent_or_blank_control_token_means_unconfigured() {
+        // `None` is what makes the control API refuse every request, so these
+        // must not accidentally become `Some("")` — an empty secret that any
+        // caller could guess.
+        assert_eq!(parse_control_token(None), None);
+        assert_eq!(parse_control_token(Some(String::new())), None);
+        assert_eq!(parse_control_token(Some("   ".to_string())), None);
+        // `set FOO=` on Windows and `FOO=` on POSIX both land here.
+        assert_eq!(parse_control_token(Some("\t\n ".to_string())), None);
+    }
+
+    #[test]
+    fn a_configured_control_token_is_trimmed_not_dropped() {
+        // Surrounding whitespace is an artifact of how the variable was set (a
+        // shell quirk or a trailing newline in a script), not part of the
+        // secret, so it is stripped rather than rejecting a usable token.
+        assert_eq!(
+            parse_control_token(Some("s3cret".to_string())),
+            Some("s3cret".to_string())
+        );
+        assert_eq!(
+            parse_control_token(Some(" s3cret \n".to_string())),
+            Some("s3cret".to_string())
+        );
+        // Interior whitespace is significant; only the ends are trimmed.
+        assert_eq!(
+            parse_control_token(Some(" s3 cret ".to_string())),
+            Some("s3 cret".to_string())
+        );
+    }
+
+    #[test]
+    fn only_loopback_listen_addresses_are_accepted() {
+        // The control API shares this port and can toggle a system-wide MITM, so
+        // a routable bind has to be a startup error rather than a warning.
+        assert!(require_loopback("127.0.0.1:3000".parse().unwrap()).is_ok());
+        assert!(require_loopback("127.0.0.1:0".parse().unwrap()).is_ok());
+        assert!(require_loopback("[::1]:3000".parse().unwrap()).is_ok());
+
+        assert!(require_loopback("0.0.0.0:3000".parse().unwrap()).is_err());
+        assert!(require_loopback("192.168.1.10:3000".parse().unwrap()).is_err());
+        assert!(require_loopback("[::]:3000".parse().unwrap()).is_err());
     }
 }

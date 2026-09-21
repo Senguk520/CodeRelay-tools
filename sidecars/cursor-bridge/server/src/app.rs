@@ -63,13 +63,17 @@ impl App {
         }
         let mut router = api::router(registry.clone(), clients)?;
         router = match &config.console {
-            Some(ConsoleSource::Directory(directory)) => {
-                router.merge(control::web_router(control.clone(), directory))
-            }
-            Some(ConsoleSource::Proxy(target)) => {
-                router.merge(control::proxy_web_router(control.clone(), target.clone()))
-            }
-            None => router.merge(control::api_router(control.clone())),
+            Some(ConsoleSource::Directory(directory)) => router.merge(control::web_router(
+                control.clone(),
+                directory,
+                config.control_token.clone(),
+            )),
+            Some(ConsoleSource::Proxy(target)) => router.merge(control::proxy_web_router(
+                control.clone(),
+                target.clone(),
+                config.control_token.clone(),
+            )),
+            None => router.merge(control::api_router(control.clone(), config.control_token.clone())),
         };
         Ok(Self {
             router,

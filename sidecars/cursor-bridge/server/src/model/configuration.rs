@@ -127,7 +127,25 @@ pub struct ModelConfig {
     pub model_type: ModelType,
     pub base_url: String,
     pub use_full_url: bool,
+    /// The provider credential. **Never serialized.**
+    ///
+    /// This struct is the response body of the control API, and that API is
+    /// reachable by any local process. Returning the key here handed the user's
+    /// relay credential to anyone who could open a socket, which is why the
+    /// wire form carries [`Self::has_api_key`] and
+    /// [`Self::api_key_fingerprint`] instead. The value is still needed
+    /// in-process for request routing.
+    #[serde(skip_serializing)]
     pub api_key: String,
+    /// Whether a credential is present, so the UI can say "set" / "not set"
+    /// without being told what it is.
+    pub has_api_key: bool,
+    /// Short digest of `api_key`, letting CodeRelay detect a key rotation
+    /// without the key itself crossing the wire.
+    ///
+    /// Kept stable for the same input so the drift check compares equal across
+    /// reads. `None` for an empty key, matching [`Self::has_api_key`].
+    pub api_key_fingerprint: Option<String>,
     pub tooltip_data: String,
     pub model_id: String,
     pub reasoning_effort: Option<String>,
@@ -148,6 +166,21 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    /// Digest of the provider credential, for drift detection without disclosure.
+    ///
+    /// `None` for an absent/blank key so the UI can distinguish "no key" from
+    /// "key present". The digest is truncated because it only has to detect a
+    /// *change*; it is never used as an authentication value, so 8 bytes of
+    /// SHA-256 is plenty and keeps the response small.
+    pub fn api_key_fingerprint(api_key: &str) -> Option<String> {
+        let api_key = api_key.trim();
+        if api_key.is_empty() {
+            return None;
+        }
+        let digest = Sha256::digest(api_key.as_bytes());
+        Some(hex::encode(&digest[..8]))
+    }
+
     pub fn provider_type(&self) -> ProviderType {
         match self.model_type {
             ModelType::Anthropic => ProviderType::Anthropic,

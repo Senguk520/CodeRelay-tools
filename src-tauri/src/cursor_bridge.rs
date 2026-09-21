@@ -27,7 +27,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
@@ -42,6 +42,10 @@ const BRIDGE_DATA_DIR: &str = "cursor-bridge";
 const API_PREFIX: &str = "/__byok-api__/api";
 /// Default per-request timeout for control-API calls.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Environment variable carrying the control-API token to the bridge. The name
+/// is shared with the bridge's side of the contract
+/// (`server/src/config.rs::CONTROL_TOKEN_ENV`).
+const CONTROL_TOKEN_ENV: &str = "CODERELAY_CURSOR_CONTROL_TOKEN";
 /// CA generation is CPU-bound and enabling takeover may terminate Cursor, so
 /// those two calls get a much longer budget than a plain status read.
 const SLOW_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -53,6 +57,25 @@ const SLOW_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 /// reach `state.json`. CodeRelay enforces a single instance, so one bridge per
 /// process is the actual invariant.
 static BRIDGE_PORT: AtomicU16 = AtomicU16::new(0);
+
+/// Shared secret for the bridge's control API.
+///
+/// Generated once per CodeRelay process and handed to the bridge through the
+/// environment, then echoed on every control call. The control API shares a port
+/// with the Cursor protocol and can read model credentials and toggle the
+/// system-wide MITM injection, so without this any local process could drive it
+/// with a single `curl`.
+///
+/// A process-global for the same reason `BRIDGE_PORT` is one: it must never be
+/// serialized into `state.json`. Regenerating per CodeRelay launch (rather than
+/// persisting) is deliberate — the secret only has to live as long as the bridge
+/// it guards, and a persisted one would leak through config backups.
+static CONTROL_TOKEN: OnceLock<String> = OnceLock::new();
+
+/// The control token for this process, created on first use.
+fn control_token() -> &'static str {
+    CONTROL_TOKEN.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+}
 
 /// `Some(port)` while the bridge is serving; the value placed on the read-only
 /// `AppState::cursor_bridge_port` derived field.
@@ -256,9 +279,20 @@ pub struct CursorBridgeStatus {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
+/// Builds the HTTP client used for **control-API** calls.
+///
+/// Every control endpoint requires the per-process token, so it is attached here
+/// as a default header rather than at each call site: one place to get right,
+/// and no future call can silently forget it. The Cursor protocol routes do not
+/// go through this client and are unaffected.
 fn http_client(timeout: Duration) -> Result<reqwest::Client, String> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", control_token()))
+        .map_err(|error| format!("构造 Cursor 桥接鉴权头失败：{error}"))?;
+    headers.insert(reqwest::header::AUTHORIZATION, value);
     reqwest::Client::builder()
         .timeout(timeout)
+        .default_headers(headers)
         .build()
         .map_err(|error| format!("创建 Cursor 桥接 HTTP 客户端失败：{error}"))
 }
@@ -501,6 +535,11 @@ fn start_process_locked(app: &AppHandle, inner: &Arc<CursorBridgeInner>) -> Resu
     command
         .env("CODERELAY_CURSOR_DATA_DIR", &data_dir)
         .env("CODERELAY_CURSOR_LISTEN_ADDR", &listen_addr)
+        // Per-process shared secret for the control API. Regenerated each launch
+        // rather than persisted, so it cannot leak through a config backup, and
+        // rotated by simply restarting. The bridge refuses all control requests
+        // when this is absent, so a failure to pass it is fail-closed.
+        .env(CONTROL_TOKEN_ENV, control_token())
         // Hand the bridge our own pid so it can outlive-proof itself: if
         // CodeRelay dies without running its exit hook (crash, Task Manager
         // kill), the bridge notices the parent handle signalling and shuts down
@@ -744,6 +783,12 @@ fn parse_models(items: Vec<Value>) -> Vec<CursorBridgeModel> {
 /// though the *set* of models is nominally unchanged. `model_hash` itself is
 /// deliberately excluded: CodeRelay cannot recompute it (it hashes a normalized
 /// form it does not model), and comparing the inputs that feed it is equivalent.
+///
+/// The key is compared as a **fingerprint**, never as the key itself: the bridge
+/// stopped returning `api_key` precisely so a local process cannot read the
+/// credential out of this endpoint, and CodeRelay must not depend on a field
+/// that no longer exists. Comparing digests preserves the semantics — a rotated
+/// key still changes the value — without needing the cleartext back.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct ModelFingerprint {
     base_url: String,
@@ -752,8 +797,23 @@ struct ModelFingerprint {
     reasoning_effort: String,
     context_window_tokens: Option<u64>,
     max_completion_tokens: Option<u64>,
-    api_key: String,
+    api_key_fingerprint: Option<String>,
     extra_params: String,
+}
+
+/// Digest of a provider credential, used only to notice that it changed.
+///
+/// Must stay byte-for-byte identical to the bridge's
+/// `ModelConfig::api_key_fingerprint` (`sha256(key.trim())[..8]`, lowercase hex),
+/// or every status read would report drift and force a pointless reconcile.
+fn api_key_fingerprint(api_key: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return None;
+    }
+    let digest = Sha256::digest(api_key.as_bytes());
+    Some(hex::encode(&digest[..8]))
 }
 
 fn fingerprint(value: &Value) -> ModelFingerprint {
@@ -765,6 +825,14 @@ fn fingerprint(value: &Value) -> ModelFingerprint {
             .to_string()
     };
     let number = |key: &str| value.get(key).and_then(Value::as_u64);
+    // The stored side (a bridge response) carries the digest; the desired side
+    // (a payload CodeRelay built) carries the key and is digested here. Treating
+    // both through one helper is what keeps the two sides comparable.
+    let key_fingerprint = value
+        .get("api_key_fingerprint")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| api_key_fingerprint(&text("api_key")));
     ModelFingerprint {
         base_url: text("base_url"),
         model_id: text("model_id"),
@@ -772,7 +840,7 @@ fn fingerprint(value: &Value) -> ModelFingerprint {
         reasoning_effort: text("reasoning_effort"),
         context_window_tokens: number("context_window_tokens"),
         max_completion_tokens: number("max_completion_tokens"),
-        api_key: text("api_key"),
+        api_key_fingerprint: key_fingerprint,
         // Compared as text so an absent and an empty object both compare equal.
         extra_params: value
             .get("openai_extra_params")

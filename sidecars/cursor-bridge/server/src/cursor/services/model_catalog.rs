@@ -679,6 +679,8 @@ mod tests {
             model_type: ModelType::OpenAi,
             base_url: "https://provider.example/v1/chat/completions".into(),
             use_full_url: true,
+            has_api_key: true,
+            api_key_fingerprint: ModelConfig::api_key_fingerprint("provider-secret"),
             api_key: "provider-secret".into(),
             tooltip_data: "Local Model".into(),
             model_id: "upstream-model".into(),
