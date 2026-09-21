@@ -1345,6 +1345,8 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
 
     {status.lastError && <div className="inline-warning"><AlertTriangle size={15} />{status.lastError}</div>}
 
+    {status.cursorTerminateFailed && <div className="inline-warning"><AlertTriangle size={15} />上次尝试关闭 Cursor 失败，代理设置可能尚未生效：请手动退出 Cursor 后重新开启注入。账号库写入也已因此被拒绝。</div>}
+
     {!caReady && status.running && <div className="model-notice">
       <ShieldCheck size={17} />
       <div>

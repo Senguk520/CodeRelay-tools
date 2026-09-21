@@ -290,6 +290,14 @@ pub struct CursorBridgeStatus {
     /// the settings page say "a password is stored" instead of leaving the user
     /// to infer it from an empty box.
     pub has_proxy_password: Option<bool>,
+    /// Whether the last attempt to close Cursor before applying the proxy
+    /// settings failed.
+    ///
+    /// Surfaced so the page can say why the injection may not have taken effect
+    /// instead of leaving the user to notice that Cursor is still running on the
+    /// old settings. It is also the signal that the account database write was
+    /// refused for this reason.
+    pub cursor_terminate_failed: bool,
     pub last_error: Option<String>,
     /// Display names of bindings that were skipped because their API key is
     /// missing or disabled. Surfaced so the user is told rather than left
@@ -978,6 +986,8 @@ async fn build_status(
         // The bridge is not running, so whether it holds a password is unknown
         // rather than "no".
         has_proxy_password: None,
+        // Nothing is running, so no shutdown could have failed.
+        cursor_terminate_failed: false,
         last_error: error,
         unresolved_bindings: unresolved_bindings.clone(),
         commit_default_prompt: None,
@@ -1044,6 +1054,10 @@ async fn build_status(
             .and_then(Value::as_str)
             .map(str::to_string),
         has_proxy_password,
+        cursor_terminate_failed: harness
+            .get("cursor_terminate_failed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         last_error,
         unresolved_bindings,
         commit_default_prompt,

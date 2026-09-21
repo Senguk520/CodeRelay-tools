@@ -226,29 +226,24 @@ impl CursorHarness {
             .read()
             .ok_or_else(|| Error::Config("desktop management server is not ready".into()))?;
         let mut proxy = self.inner.proxy.lock().await;
-        let settings_applied = proxy
-            .url()
-            .as_deref()
-            .map(settings::settings_match)
-            .transpose()?
-            .unwrap_or(false);
-        if !settings_applied {
-            // Terminating Cursor only makes the freshly written http.proxy take effect
-            // sooner; it is optional, so a failed probe or kill must not block takeover.
-            // It is reported through `status()` instead: the user needs to know that
-            // Cursor is still running with the old settings if the shutdown failed.
-            let terminated = process::terminate_cursor().await;
-            self.inner
-                .cursor_terminate_failed
-                .store(terminated.is_err(), std::sync::atomic::Ordering::SeqCst);
-            if let Err(error) = terminated {
-                tracing::warn!(%error, "could not terminate Cursor before applying proxy settings");
-            }
-        } else {
-            self.inner
-                .cursor_terminate_failed
-                .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // Cursor is closed before anything under its profile is written, and
+        // that ordering is unconditional. `state.vscdb` is written by the account
+        // injection below, and Cursor holds that database open for as long as it
+        // runs — writing into it while the process is live is how the file ends
+        // up needing recovery. An earlier version skipped the shutdown whenever
+        // the proxy settings already matched, which still left the account write
+        // racing a running Cursor on every re-attach. A failure to close is
+        // recorded here and reported through `status()`; the write that follows
+        // then fails closed rather than proceeding anyway.
+        let terminated = process::terminate_cursor().await;
+        self.inner
+            .cursor_terminate_failed
+            .store(terminated.is_err(), std::sync::atomic::Ordering::SeqCst);
+        if let Err(error) = terminated {
+            tracing::warn!(%error, "could not terminate Cursor before applying proxy settings");
         }
+
         if proxy.running() {
             if let Some(url) = proxy.url() {
                 apply_cursor_configuration(&url).await?;
@@ -284,6 +279,17 @@ impl CursorHarness {
 }
 
 async fn apply_cursor_configuration(proxy_url: &str) -> Result<()> {
+    // The account database is written next, and Cursor keeps `state.vscdb` open
+    // for as long as it runs. `enable()` already asked Cursor to close; this is
+    // the verification that it actually did, and it fails closed rather than
+    // writing on the assumption that a best-effort request succeeded. A write
+    // against a live process is exactly how a profile ends up needing recovery.
+    if process::cursor_running().await? {
+        return Err(Error::Config(
+            "Cursor is still running; close it and let it finish saving before enabling injection"
+                .into(),
+        ));
+    }
     account::inject_if_missing().await?;
     settings::write_proxy_settings(proxy_url)
 }

@@ -247,6 +247,13 @@ export interface CursorBridgeStatus {
    * 「未设置」会让用户据此做出错误判断。密码本身永不下发。
    */
   hasProxyPassword: boolean | null;
+  /**
+   * 上一次为应用代理设置而关闭 Cursor 是否失败。
+   *
+   * 失败时页面需要明确告诉用户：注入可能还没生效，因为 Cursor 仍在用旧设置运行。
+   * 它同时也是「账号库写入被拒绝」的信号。
+   */
+  cursorTerminateFailed: boolean;
   lastError: string | null;
   /** 因 API Key 缺失或停用而被跳过的绑定显示名。 */
   unresolvedBindings: string[];
@@ -281,6 +288,7 @@ export const defaultCursorBridgeStatus: CursorBridgeStatus = {
   uninstallCommand: null,
   proxyUrl: null,
   hasProxyPassword: null,
+  cursorTerminateFailed: false,
   lastError: null,
   unresolvedBindings: [],
   commitDefaultPrompt: null,
