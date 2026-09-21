@@ -4,9 +4,9 @@
   "version": "0.3.1",
   "identifier": "com.coderelay.desktop",
   "build": {
-    "beforeDevCommand": "npm run sync-version && npm run build:sidecar && npm run dev",
+    "beforeDevCommand": "npm run sync-version && npm run build:sidecar && npm run build:cursor-bridge && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run sync-version && npm run build:sidecar && npm run build",
+    "beforeBuildCommand": "npm run sync-version && npm run build:sidecar && npm run build:cursor-bridge && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -38,7 +38,8 @@
       "icons/128x128.png"
     ],
     "externalBin": [
-      "../sidecars/coderelay-proxy/bin/coderelay-proxy"
+      "../sidecars/coderelay-proxy/bin/coderelay-proxy",
+      "../sidecars/cursor-bridge/bin/cursor-bridge"
     ]
   }
 }
