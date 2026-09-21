@@ -5,17 +5,16 @@ import {
   Activity, AlertTriangle, Ban, CalendarCheck, CalendarDays, Check, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, Clipboard, Cloud,
   Copy, Database, Download, Eye, EyeOff, FileJson, Flame, FolderOpen, Gauge, Gift, Globe2, KeyRound,
   Layers3, LayoutDashboard, ListFilter, LockKeyhole, LogOut, Menu, Minus, MoreHorizontal,
-  Network, Pause, Pencil, Play, Plus, RefreshCw, Search, Server, Settings2,
+  MousePointer2, Network, Pause, Pencil, Play, Plus, RefreshCw, Search, Server, Settings2,
   ShieldCheck, SlidersHorizontal, Sparkles, Square, Terminal, Trash2, Upload,
   Users, X, Zap,
 } from 'lucide-react';
-import type { Account, ApiKey, AppState, CheckinResponse, CheckinStatusResponse, DayStats, ModelInfo, OAuthCompleteResponse, PageId, RequestLog, ServiceConfig, ThemeMode, UpdateCheckResult } from './types';
-import { defaultState, emptyDayStats } from './types';
+import type { Account, ApiKey, AppState, CheckinResponse, CheckinStatusResponse, CursorBinding, CursorBridgePreferences, CursorBridgeStatus, DayStats, ModelInfo, OAuthCompleteResponse, PageId, RequestLog, ServiceConfig, ThemeMode, UpdateCheckResult } from './types';
+import { defaultCursorBridgePreferences, defaultCursorBridgeStatus, defaultState, emptyDayStats } from './types';
 import { applyTheme } from './theme';
 import {
-  cancelOAuth, checkForUpdate, checkinAccount, clearLogs, completeOAuth, exportAccounts, getCheckinStatus, getState, listModels, openExternal,
-  refreshAccountQuota, refreshAllQuotas, resetLocalState, saveAccounts, syncModels,
-  saveConfig, saveKeys, startOAuth, startService, stopService, validateToken,
+  cancelOAuth, checkForUpdate, checkinAccount, clearLogs, completeOAuth, exportAccounts, getCheckinStatus, getCursorBridgeInstallCommand, getCursorBridgeStatus, getState, initCursorBridgeCa, listModels, openExternal,
+  refreshAccountQuota, refreshAllQuotas, resetLocalState, saveAccounts, saveCursorBridgeBindings, saveCursorBridgePreferences, saveConfig, saveKeys, setCursorBridgeEnabled, startCursorBridge, startOAuth, startService, stopCursorBridge, stopService, syncCursorBridgeModels, syncModels, validateToken,
 } from './services';
 
 import { listen } from '@tauri-apps/api/event';
@@ -40,6 +39,9 @@ const navGroups: NavGroup[] = [
   { id: 'codebuddy', label: 'CodeBuddy', icon: Sparkles, items: [
     { id: 'accounts', label: '账号池', icon: Users },
     { id: 'models', label: '模型管理', icon: Layers3 },
+  ] },
+  { id: 'cursor', label: 'Cursor', icon: MousePointer2, items: [
+    { id: 'cursor', label: 'Cursor 服务', icon: MousePointer2 },
   ] },
   { id: 'settings', label: '设置', icon: Settings2, items: [{ id: 'settings', label: '应用设置', icon: Settings2 }] },
 ];
@@ -339,9 +341,13 @@ export function App() {
   };
 
   const selected = navGroups.flatMap((group) => group.items).find((item) => item.id === page);
+  // 面包屑取所在导航分组名。三分支三元表达式已取消：分组名直接来自 navGroups，
+  // 否则新增 Cursor 分组时会显示成「反代服务 / Cursor 服务」。settings 分组刻意
+  // 不出现在路径里（与原先一致）。
+  const groupLabel = navGroups.find((group) => group.items.some((item) => item.id === page))?.label ?? '';
   const titlePath = page === 'overview'
     ? '总览'
-    : `${selected?.id === 'accounts' || selected?.id === 'models' ? 'CodeBuddy' : selected?.id === 'settings' ? '' : '反代服务'} / ${selected?.label ?? ''}`.replace(/^ \/ /, '');
+    : [groupLabel === '设置' ? '' : groupLabel, selected?.label ?? ''].filter(Boolean).join(' / ');
 
   const closeWindow = async () => {
     if (!hasTauri()) {
@@ -411,6 +417,7 @@ export function App() {
         {page === 'logs' && <LogsPage state={state} onClear={() => void runAction(clearLogs, '请求日志已清理', 'save')} notify={notify} />}
         {page === 'accounts' && <AccountsPage state={state} blocked={busy !== null} onAdd={() => { setAccountModalMode('browser'); setShowAccountModal(true); }} onImport={() => { setAccountModalMode('file'); setShowAccountModal(true); }} onSave={(accounts) => void runAction(() => saveAccounts(accounts), '账号列表已更新', 'save')} onRefresh={handleRefreshAccount} onRefreshAll={handleRefreshAll} onCheckin={() => setShowCheckinModal(true)} notify={notify} />}
         {page === 'models' && <ModelsPage state={state} notify={notify} />}
+        {page === 'cursor' && <CursorPage state={state} notify={notify} />}
         {page === 'settings' && <SettingsPage onReset={resetLocalState} notify={notify} updateInfo={updateInfo} updateError={updateError} checkingUpdate={checkingUpdate} onCheckUpdate={() => { void handleCheckUpdate(); }} onShowUpdate={() => setShowUpdateModal(true)} />}
       </div></div>
       <footer className="statusbar"><div className="statusbar-left"><span className="secure-note"><LockKeyhole size={13} />本地数据</span><span className="divider" /><span>CodeRelay {APP_VERSION}</span></div><div className="statusbar-right"><StatusPill tone={busy === 'start' || busy === 'stop' ? 'warning' : state.running ? 'success' : 'muted'}>{busy === 'start' ? '启动中…' : busy === 'stop' ? '停止中…' : state.running ? `运行中 · ${state.actualPort ?? state.config.port}` : '已停止'}</StatusPill>{state.running ? <button className="button compact ghost" disabled={busy !== null} onClick={() => void runAction(stopService, '反代服务已停止', 'stop')}><Pause size={14} />停止服务</button> : <button className="button compact primary" disabled={busy !== null} onClick={() => void runAction(startService, '反代服务已启动', 'start')}><Play size={14} />启动服务</button>}<button className="status-chevron" aria-label="更多服务操作" onClick={() => setPage('service')}><ChevronDown size={15} /></button></div></footer>
@@ -1202,13 +1209,538 @@ function ModelsPage({ state, notify }: { state: AppState; notify: NoticeHandler 
   return <><SectionHeader eyebrow="CodeBuddy / 能力目录" title="模型管理" description="从运行中的 CodeBuddy CN sidecar 获取模型目录和能力信息。" action={<div className="header-actions"><span className="sync-time"><RefreshCw size={13} />{lastSync ? `上次同步：${formatDate(lastSync)}` : '尚未同步'}</span><button className="button ghost" onClick={() => { void sync(); }} disabled={syncing}><RefreshCw size={15} />{syncing ? '同步中…' : '立即同步'}</button></div>} /><div className="model-notice"><Sparkles size={17} /><div><strong>模型目录来自 CodeBuddy CN 后端</strong><span>没有运行服务或有效 API Key 时，不会显示伪造的模型列表。</span></div><StatusPill tone={models.length ? 'success' : 'muted'}>{models.length ? '已同步' : '等待同步'}</StatusPill></div><div className="panel table-panel"><div className="table-toolbar"><div className="toolbar-title"><Layers3 size={17} /><strong>模型目录</strong><span>{filtered.length} 个模型</span></div><div className="search-box compact-search"><Search size={15} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索模型" /></div></div>{filtered.length ? <div className="data-table models-table"><div className="table-head"><span>模型</span><span>能力</span><span>可用状态</span><span>来源</span><span>别名</span><span /></div>{filtered.map((model) => { const capabilities = ['文本', ...(model.supportsImages || model.inputModalities?.includes('image') ? ['视觉'] : []), ...(model.supportsToolCall ? ['工具'] : [])]; return <div className="table-row" key={model.id}><div className="model-name"><span className="model-glyph"><Sparkles size={14} /></span><div><strong>{model.id}</strong><code>{model.ownedBy ?? 'codebuddy'}</code></div></div><div className="capability-list">{capabilities.map((capability) => <span key={capability} className={capability === '视觉' ? 'vision' : ''}>{capability}</span>)}</div><StatusPill tone="success">可用</StatusPill><span className="muted-text">CodeBuddy CN</span><button className="alias-button" onClick={() => notify('模型别名持久化命令尚未接入')}><span>未设置</span><Pencil size={13} /></button><IconButton label="模型详情" onClick={() => notify(`${model.id}：上下文 ${model.contextLength ?? '未知'}`)}><MoreHorizontal size={16} /></IconButton></div>; })}</div> : <EmptyState icon={Layers3} title="还没有模型目录" description="启动服务并点击“立即同步”，从 CodeBuddy CN 后端读取模型。" action={<button className="button primary" onClick={() => { void sync(); }} disabled={syncing}><RefreshCw size={15} />同步模型</button>} />}</div><div className="model-footnote"><span><Eye size={14} />视觉能力由在线模型目录与实测校正表决定。</span></div></>;
 }
 
+/** 推理强度选项。`''` 表示不设置，bridge 端会省略该字段。 */
+const CURSOR_EFFORT_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: '', label: '不设置' },
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+  { value: 'xhigh', label: 'Extra High' },
+  { value: 'max', label: 'Max' },
+];
+
+const CURSOR_CA_LABELS: Record<string, string> = {
+  missing: '未初始化',
+  untrusted: '等待信任',
+  ready: '已就绪',
+  invalid: '证书无效',
+  unknown: '未知',
+};
+
+const CURSOR_INTEGRATION_LABELS: Record<string, string> = {
+  disabled: '未注入',
+  enabled: '已注入',
+  degraded: '部分生效',
+  unknown: '未知',
+};
+
+/**
+ * 「Cursor 服务」页。
+ *
+ * 页面驱动 cursor-bridge sidecar：启动/停止进程、开关注入、维护模型绑定列表。
+ * 所有 bridge 通讯都经 Tauri 命令（见 services.ts 的说明），前端不需要知道端口。
+ */
+function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler }) {
+  const [status, setStatus] = useState<CursorBridgeStatus>(defaultCursorBridgeStatus);
+  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [showBindingModal, setShowBindingModal] = useState(false);
+  const [editingBinding, setEditingBinding] = useState<CursorBinding | null>(null);
+  const [showInstall, setShowInstall] = useState(false);
+
+  const enabledKeys = state.keys.filter((key) => key.enabled);
+  const keyName = (keyId: string) => state.keys.find((key) => key.id === keyId)?.name ?? '（Key 已删除）';
+
+  const load = useCallback(async () => {
+    if (!hasTauri()) { setLoading(false); return; }
+    try {
+      setStatus(await getCursorBridgeStatus());
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setLoading(false);
+    }
+  }, [notify]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  // 模型清单取自与「模型管理」相同的来源（relay 的 /v1/models），因此需要 relay
+  // 正在运行。这与 bridge 是否启动无关：bridge 只是把模型转发给 Cursor。
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      if (!state.running) { if (!cancelled) setModels([]); return; }
+      try {
+        const next = await listModels(state.actualPort ?? state.config.port, enabledKeys[0]?.key);
+        if (!cancelled) setModels(next);
+      } catch {
+        if (!cancelled) setModels([]);
+      }
+    };
+    void run();
+    return () => { cancelled = true; };
+  }, [state.running, state.actualPort, state.config.port, state.keys]);
+
+  const withBusy = async (action: () => Promise<CursorBridgeStatus>, success: string) => {
+    setBusy(true);
+    try {
+      setStatus(await action());
+      notify(success);
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const persist = async (bindings: CursorBinding[], success: string) => {
+    setBusy(true);
+    try {
+      setStatus(await saveCursorBridgeBindings(bindings));
+      notify(success);
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removeBinding = (binding: CursorBinding) => {
+    const label = binding.displayName || binding.modelId;
+    if (!window.confirm(`确认删除「${label}」？删除后该模型会从 Cursor 的模型选择器中移除。`)) return;
+    void persist(status.bindings.filter((item) => item.id !== binding.id), '绑定已删除');
+  };
+
+  const injected = status.integration === 'enabled';
+  const caReady = status.ca === 'ready';
+
+  const header = <div className="header-actions">
+    <label className="toggle-row compact-toggle">
+      <span className="toggle-copy"><strong>注入 Cursor</strong><small>{injected ? '已接管模型请求' : '未接管，Cursor 仍走官方'}</small></span>
+      <input type="checkbox" checked={injected} disabled={busy || !status.running || !caReady} onChange={(event) => { void withBusy(() => setCursorBridgeEnabled(event.target.checked), event.target.checked ? '已开启注入' : '已关闭注入'); }} />
+      <span className="toggle-track"><span /></span>
+    </label>
+    <IconButton label="添加绑定" onClick={() => { setEditingBinding(null); setShowBindingModal(true); }} disabled={busy || !status.running || enabledKeys.length === 0}><Plus size={16} /></IconButton>
+  </div>;
+
+  return <>
+    <SectionHeader eyebrow="Cursor / 本地桥接" title="Cursor 服务" description="把 CodeRelay 的账号与模型接入 Cursor：由本地 sidecar 接管 Agent 请求并转发到反代服务。" action={header} />
+
+    <div className="model-notice">
+      <MousePointer2 size={17} />
+      <div>
+        <strong>{status.running ? `桥接运行中 · 端口 ${status.port ?? '—'}` : '桥接未运行'}</strong>
+        <span>{status.running ? `已配置 ${status.configuredModels} 个模型供 Cursor 使用。` : '启动桥接后才能把模型同步给 Cursor。'}</span>
+      </div>
+      <StatusPill tone={injected ? 'success' : status.running ? 'warning' : 'muted'}>{CURSOR_INTEGRATION_LABELS[status.integration] ?? status.integration}</StatusPill>
+    </div>
+
+    {status.lastError && <div className="inline-warning"><AlertTriangle size={15} />{status.lastError}</div>}
+
+    {!caReady && status.running && <div className="model-notice">
+      <ShieldCheck size={17} />
+      <div>
+        <strong>证书状态：{CURSOR_CA_LABELS[status.ca] ?? status.ca}</strong>
+        <span>{status.installCommand ? '把根证书安装进系统信任库后即可开启注入。安装需要管理员权限，CodeRelay 不会自动提权。' : '先生成根证书，再按提示安装进系统信任库。'}</span>
+      </div>
+      <div className="header-actions">
+        {!status.installCommand && <button className="button ghost" disabled={busy} onClick={() => { void withBusy(initCursorBridgeCa, '根证书已生成'); }}><ShieldCheck size={15} />生成证书</button>}
+        {status.installCommand && <button className="button ghost" onClick={() => setShowInstall(true)}><Terminal size={15} />查看安装命令</button>}
+      </div>
+    </div>}
+
+    {status.unresolvedBindings.length > 0 && <div className="inline-warning">
+      <AlertTriangle size={15} />以下绑定使用的 API Key 已删除或停用，暂未生效：{status.unresolvedBindings.join('、')}
+    </div>}
+
+    <div className="panel table-panel">
+      <div className="table-toolbar">
+        <div className="toolbar-title"><MousePointer2 size={17} /><strong>模型绑定</strong><span>{status.bindings.length} 个</span></div>
+        <div className="header-actions">
+          <button className="button ghost" disabled={busy} onClick={() => { void withBusy(status.running ? stopCursorBridge : startCursorBridge, status.running ? '桥接已停止' : '桥接已启动'); }}>
+            {status.running ? <Pause size={15} /> : <Play size={15} />}{status.running ? '停止桥接' : '启动桥接'}
+          </button>
+          <button className="button ghost" disabled={busy || !status.running} onClick={() => { void withBusy(syncCursorBridgeModels, '模型已同步到桥接'); }}><RefreshCw size={15} />同步模型</button>
+        </div>
+      </div>
+      {loading ? <EmptyState icon={MousePointer2} title="正在读取桥接状态" description="请稍候。" /> : status.bindings.length ? <div className="data-table key-table">
+        <div className="table-head"><span>显示名称</span><span>模型</span><span>绑定 Key</span><span>推理强度</span><span>备注</span><span /></div>
+        {status.bindings.map((binding) => <div className="table-row" key={binding.id}>
+          <div className="key-name"><span className="key-avatar"><MousePointer2 size={14} /></span><div><strong>{binding.displayName || binding.modelId}</strong><small>{binding.displayName ? binding.modelId : '未设置显示名称'}</small></div></div>
+          <div className="model-name"><code>{binding.modelId}</code></div>
+          <span className="muted-text">{keyName(binding.keyId)}</span>
+          <span className="muted-text">{CURSOR_EFFORT_OPTIONS.find((option) => option.value === binding.reasoningEffort)?.label ?? (binding.reasoningEffort || '不设置')}</span>
+          <span className="muted-text">{binding.remark || '—'}</span>
+          <div className="row-actions">
+            <IconButton label="编辑绑定" onClick={() => { setEditingBinding(binding); setShowBindingModal(true); }} disabled={busy}><Pencil size={15} /></IconButton>
+            <IconButton label="删除绑定" danger onClick={() => removeBinding(binding)} disabled={busy}><Trash2 size={15} /></IconButton>
+          </div>
+        </div>)}
+      </div> : <EmptyState
+        icon={MousePointer2}
+        title="还没有可供 Cursor 使用的模型"
+        description={!status.running
+          ? '先启动桥接，再把账号池里的 Key 与模型配对。'
+          : enabledKeys.length === 0
+            ? '先在「API Key」页创建一个启用的 Key，再回来添加绑定。'
+            : '选择一个 API Key 与一个模型，使其出现在 Cursor 的模型选择器中。'}
+        action={status.running && enabledKeys.length > 0 ? <button className="button primary" disabled={busy} onClick={() => { setEditingBinding(null); setShowBindingModal(true); }}><Plus size={15} />添加绑定</button> : undefined}
+      />}
+    </div>
+
+    <div className="model-footnote">
+      <span><ShieldCheck size={14} />开启注入会改写 Cursor 的 settings.json 并结束 Cursor 进程，需先在 Cursor 中完全退出后重新打开。</span>
+    </div>
+
+    {showBindingModal && <CursorBindingModal
+      binding={editingBinding}
+      keys={enabledKeys}
+      models={models}
+      onClose={() => { setShowBindingModal(false); setEditingBinding(null); }}
+      onSave={(binding) => {
+        const exists = status.bindings.some((item) => item.id === binding.id);
+        const next = exists ? status.bindings.map((item) => item.id === binding.id ? binding : item) : [...status.bindings, binding];
+        setShowBindingModal(false);
+        setEditingBinding(null);
+        void persist(next, exists ? '绑定已更新' : '绑定已添加');
+      }}
+    />}
+
+    {showInstall && <Modal title="安装根证书" onClose={() => setShowInstall(false)} wide>
+      <div className="detail-view">
+        <p className="settings-note"><ShieldCheck size={15} />CodeRelay 不会自动提权。请以管理员身份打开终端，手动执行下面的命令，把根证书加入系统信任库。</p>
+        <pre className="code-block">{status.installCommand ?? '（尚无安装命令，请先生成根证书）'}</pre>
+        <div className="modal-footer">
+          <button className="button ghost" onClick={() => setShowInstall(false)}>关闭</button>
+          <button className="button primary" disabled={!status.installCommand} onClick={() => { if (status.installCommand) void copyText(status.installCommand).then(() => notify('安装命令已复制')); }}><Copy size={15} />复制命令</button>
+        </div>
+      </div>
+    </Modal>}
+  </>;
+}
+
+/**
+ * 「添加 / 编辑绑定」弹窗。
+ *
+ * Key 与 Model 均为纯下拉选择，没有自由文本输入：绑定只允许指向已经存在的
+ * Key 与模型，任何需要手填 URL 的设计都会让端口漂移与鉴权错误无从排查。
+ */
+function CursorBindingModal({ binding, keys, models, onClose, onSave }: {
+  binding: CursorBinding | null;
+  keys: ApiKey[];
+  models: ModelInfo[];
+  onClose: () => void;
+  onSave: (binding: CursorBinding) => void;
+}) {
+  const [keyId, setKeyId] = useState(binding?.keyId ?? keys[0]?.id ?? '');
+  const [modelId, setModelId] = useState(binding?.modelId ?? models[0]?.id ?? '');
+  const [displayName, setDisplayName] = useState(binding?.displayName ?? '');
+  const [remark, setRemark] = useState(binding?.remark ?? '');
+  const [effort, setEffort] = useState(binding?.reasoningEffort ?? '');
+  const [contextWindow, setContextWindow] = useState(binding?.contextWindowTokens ? String(binding.contextWindowTokens) : '');
+  const [maxOutput, setMaxOutput] = useState(binding?.maxOutputTokens ? String(binding.maxOutputTokens) : '');
+  const [extraEnabled, setExtraEnabled] = useState(Boolean(binding?.extraParams));
+  const [extraText, setExtraText] = useState(binding?.extraParams ? JSON.stringify(binding.extraParams, null, 2) : '');
+  const [error, setError] = useState<string | null>(null);
+
+  // 选中模型后按目录信息预填上下文窗口与最大输出；用户仍可手动改写。
+  const chooseModel = (id: string) => {
+    setModelId(id);
+    const model = models.find((item) => item.id === id);
+    setContextWindow(model?.contextLength ? String(model.contextLength) : '');
+    setMaxOutput(model?.maxCompletionTokens ? String(model.maxCompletionTokens) : '');
+  };
+
+  const submit = () => {
+    if (!keyId) { setError('请选择一个 API Key。'); return; }
+    if (!modelId) { setError('请选择一个模型。'); return; }
+    let contextWindowTokens: number | null = null;
+    let maxOutputTokens: number | null = null;
+    try {
+      const parseTokens = (raw: string, label: string) => {
+        if (!raw.trim()) return null;
+        const value = Number(raw);
+        if (!Number.isInteger(value) || value <= 0) throw new Error(`${label}必须是正整数。`);
+        return value;
+      };
+      contextWindowTokens = parseTokens(contextWindow, '上下文窗口 Token');
+      maxOutputTokens = parseTokens(maxOutput, '最大输出 Token');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      return;
+    }
+    let extraParams: Record<string, unknown> | null = null;
+    if (extraEnabled && extraText.trim()) {
+      try {
+        const parsed: unknown = JSON.parse(extraText);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('额外参数必须是 JSON 对象。');
+        extraParams = parsed as Record<string, unknown>;
+      } catch (reason) {
+        setError(`额外参数不是合法 JSON 对象：${reason instanceof Error ? reason.message : String(reason)}`);
+        return;
+      }
+    }
+    onSave({
+      // 编辑时保留原 id，新增时生成一个会话内唯一 id；后端会校验 id 不重复。
+      id: binding?.id ?? `binding-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      keyId,
+      modelId,
+      displayName: displayName.trim(),
+      remark: remark.trim(),
+      reasoningEffort: effort,
+      extraParams,
+      contextWindowTokens,
+      maxOutputTokens,
+    });
+  };
+
+  return <Modal title={binding ? '编辑绑定' : '添加账号'} onClose={onClose} wide>
+    <div className="form-grid">
+      <Field label="API Key" hint="仅列出已启用的 Key。">
+        <select value={keyId} onChange={(event) => setKeyId(event.target.value)}>
+          {keys.length ? keys.map((key) => <option key={key.id} value={key.id}>{key.name}</option>) : <option value="">（没有已启用的 Key）</option>}
+        </select>
+      </Field>
+      <Field label="模型" hint={models.length ? '来自「模型管理」的模型目录。' : '反代服务未运行或目录为空，请先启动服务并同步模型。'}>
+        <select value={modelId} onChange={(event) => chooseModel(event.target.value)}>
+          {models.length ? models.map((model) => <option key={model.id} value={model.id}>{model.id}</option>) : <option value="">（没有可用模型）</option>}
+        </select>
+      </Field>
+      <Field label="显示名称" hint="留空时显示为模型 id。">
+        <input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="例如：Claude Sonnet（团队）" />
+      </Field>
+      <Field label="推理强度" hint="不设置时由模型默认值决定。">
+        <select value={effort} onChange={(event) => setEffort(event.target.value)}>
+          {CURSOR_EFFORT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+        </select>
+      </Field>
+      <Field label="上下文窗口 Token" hint="从模型目录预填，可覆盖。">
+        <input value={contextWindow} onChange={(event) => setContextWindow(event.target.value)} inputMode="numeric" placeholder="例如 200000" />
+      </Field>
+      <Field label="最大输出 Token" hint="从模型目录预填，可覆盖。">
+        <input value={maxOutput} onChange={(event) => setMaxOutput(event.target.value)} inputMode="numeric" placeholder="例如 64000" />
+      </Field>
+      <Field label="备注" wide>
+        <input value={remark} onChange={(event) => setRemark(event.target.value)} placeholder="仅自己可见，例如用途或额度说明" />
+      </Field>
+    </div>
+    <Toggle label="额外参数" description="以 JSON 对象追加到请求体，仅在模型支持时使用。" checked={extraEnabled} onChange={setExtraEnabled} />
+    {extraEnabled && <Field label="额外参数 JSON" wide hint="必须是 JSON 对象，例如 {&quot;top_p&quot;: 0.9}。">
+      <textarea value={extraText} onChange={(event) => setExtraText(event.target.value)} rows={5} placeholder="" />
+    </Field>}
+    <p className="settings-note">选择一个 API Key 与一个模型，使其出现在 Cursor 的模型选择器中。</p>
+    {error && <div className="inline-warning"><AlertTriangle size={15} />{error}</div>}
+    <div className="modal-footer">
+      <button className="button ghost" onClick={onClose}>取消</button>
+      <button className="button primary" onClick={submit}><Check size={15} />{binding ? '保存修改' : '添加'}</button>
+    </div>
+  </Modal>;
+}
+
 function SettingsPage({ onReset, notify, updateInfo, updateError, checkingUpdate, onCheckUpdate, onShowUpdate }: { onReset: () => void; notify: NoticeHandler; updateInfo: UpdateCheckResult | null; updateError: string | null; checkingUpdate: boolean; onCheckUpdate: () => void; onShowUpdate: () => void }) {
-  const [tab, setTab] = useState<'general' | 'network' | 'data' | 'about'>('general');
+  const [tab, setTab] = useState<'general' | 'network' | 'cursor' | 'data' | 'about'>('general');
   const [prefs, setPrefs] = useState<AppPreferences>(readPreferences);
   const update = (changes: Partial<typeof prefs>) => setPrefs((current) => ({ ...current, ...changes }));
   const changeTheme = (theme: ThemeMode) => { update({ theme }); applyTheme(theme); };
   const save = () => { localStorage.setItem('coderelay-preferences', JSON.stringify(prefs)); applyTheme(prefs.theme ?? 'system'); notify('应用设置已保存'); };
-  return <><SectionHeader eyebrow="应用 / 偏好" title="设置" description="调整 CodeRelay 的桌面行为、数据保留和隐私选项。" action={<button className="button primary" onClick={save}><Check size={15} />保存设置</button>} /><div className="settings-layout"><div className="settings-tabs">{([['general', '常规', Settings2], ['network', '网络', Network], ['data', '数据与隐私', Database], ['about', '关于', CircleHelp]] as Array<[typeof tab, string, LucideIcon]>).map(([id, label, Icon]) => <button key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)}><Icon size={16} />{label}</button>)}</div><div className="panel settings-panel">{tab === 'general' && <><div className="settings-section"><h3>启动行为</h3><Toggle label="启动时打开总览" description="软件启动后默认显示总览页。" checked={prefs.openOverview ?? true} onChange={(value) => update({ openOverview: value })} /><Toggle label="启动时自动刷新账号额度" description="启动后读取最近保存的账号并刷新配额。" checked={prefs.refreshAccounts ?? false} onChange={(value) => update({ refreshAccounts: value })} /><Toggle label="启动时检测更新" description="启动后静默查询 GitHub 最新发布，发现新版本时在侧边栏与总览页提示。" checked={prefs.autoCheckUpdate ?? false} onChange={(value) => update({ autoCheckUpdate: value })} /></div><div className="settings-section"><h3>外观</h3><Field label="主题模式" hint="选择后立即预览，点击“保存设置”持久化。"><div className="segmented theme-segmented"><button className={(prefs.theme ?? 'system') === 'system' ? 'active' : ''} onClick={() => changeTheme('system')}>跟随系统</button><button className={(prefs.theme ?? 'system') === 'light' ? 'active' : ''} onClick={() => changeTheme('light')}>浅色</button><button className={(prefs.theme ?? 'system') === 'dark' ? 'active' : ''} onClick={() => changeTheme('dark')}>深色</button></div></Field></div><div className="settings-section"><h3>关闭窗口</h3><Field label="服务运行时点击关闭" hint="此设置用于后续窗口关闭流程"><select value={prefs.closeBehavior ?? 'ask'} onChange={(e) => update({ closeBehavior: e.target.value })}><option value="ask">每次询问</option><option value="tray">最小化到系统托盘</option><option value="exit">停止服务后退出</option></select></Field></div></>}{tab === 'network' && <div className="settings-section"><h3>网络安全</h3><p className="settings-note"><ShieldCheck size={15} />默认监听 localhost。局域网入口需要在“服务配置”中单独开启，所有请求仍需有效 API Key。</p></div>}{tab === 'data' && <div className="settings-section"><h3>本地数据</h3><Field label="请求日志保留时间"><select value={prefs.retention ?? '7'} onChange={(e) => update({ retention: e.target.value })}><option value="7">最近 7 天</option><option value="30">最近 30 天</option></select></Field><div className="danger-zone"><div><h3>重置浏览器预览数据</h3><p>仅清理当前 Web 预览中的本地状态，不会删除桌面端凭据文件。</p></div><button className="button danger-button" onClick={onReset}><Trash2 size={15} />重置数据</button></div></div>}{tab === 'about' && <div className="about-block"><div className="about-logo">CR</div><h3>CodeRelay</h3><p>面向高级用户的 CodeBuddy CN 账号池和本地 OpenAI 兼容反代管理工具。</p><div className="about-meta"><span>版本 {APP_VERSION}</span><span>Windows 桌面端</span><span>本地优先</span></div><div className="update-check"><div className="update-check-row"><button className="button ghost" onClick={onCheckUpdate} disabled={checkingUpdate}><RefreshCw size={15} className={checkingUpdate ? 'spin' : ''} />{checkingUpdate ? '检测中…' : '检测更新'}</button>{updateInfo && <span className={`update-status ${updateInfo.hasUpdate ? 'has-update' : 'up-to-date'}`}>{updateInfo.hasUpdate ? <><Sparkles size={13} />发现新版本 {updateInfo.latestVersion}</> : <><Check size={13} />已是最新版本 {updateInfo.currentVersion}</>}</span>}{!updateInfo && !checkingUpdate && !updateError && <span className="update-status muted">尚未检测</span>}{updateError && <span className="update-status failed"><AlertTriangle size={13} />检测失败</span>}</div>{updateError && <p className="update-hint">{updateError}</p>}{updateInfo?.hasUpdate && <div className="update-actions"><button className="button primary" onClick={onShowUpdate}><Download size={15} />查看更新详情</button><button className="button ghost" onClick={() => { void openExternal(updateInfo.releaseUrl); }}><Globe2 size={15} />打开发布页</button></div>}{updateInfo && !updateInfo.hasUpdate && <p className="update-hint">当前版本 {updateInfo.currentVersion} 已经是 GitHub 上发布的最新版本。</p>}</div><button className="inline-link" onClick={() => notify('第三方组件许可见项目根目录 NOTICE.md')}>查看第三方许可 <span>→</span></button></div>}</div></div></>;
+  return <><SectionHeader eyebrow="应用 / 偏好" title="设置" description="调整 CodeRelay 的桌面行为、数据保留和隐私选项。" action={<button className="button primary" onClick={save}><Check size={15} />保存设置</button>} /><div className="settings-layout"><div className="settings-tabs">{([['general', '常规', Settings2], ['network', '网络', Network], ['cursor', 'Cursor', MousePointer2], ['data', '数据与隐私', Database], ['about', '关于', CircleHelp]] as Array<[typeof tab, string, LucideIcon]>).map(([id, label, Icon]) => <button key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)}><Icon size={16} />{label}</button>)}</div><div className="panel settings-panel">{tab === 'general' && <><div className="settings-section"><h3>启动行为</h3><Toggle label="启动时打开总览" description="软件启动后默认显示总览页。" checked={prefs.openOverview ?? true} onChange={(value) => update({ openOverview: value })} /><Toggle label="启动时自动刷新账号额度" description="启动后读取最近保存的账号并刷新配额。" checked={prefs.refreshAccounts ?? false} onChange={(value) => update({ refreshAccounts: value })} /><Toggle label="启动时检测更新" description="启动后静默查询 GitHub 最新发布，发现新版本时在侧边栏与总览页提示。" checked={prefs.autoCheckUpdate ?? false} onChange={(value) => update({ autoCheckUpdate: value })} /></div><div className="settings-section"><h3>外观</h3><Field label="主题模式" hint="选择后立即预览，点击“保存设置”持久化。"><div className="segmented theme-segmented"><button className={(prefs.theme ?? 'system') === 'system' ? 'active' : ''} onClick={() => changeTheme('system')}>跟随系统</button><button className={(prefs.theme ?? 'system') === 'light' ? 'active' : ''} onClick={() => changeTheme('light')}>浅色</button><button className={(prefs.theme ?? 'system') === 'dark' ? 'active' : ''} onClick={() => changeTheme('dark')}>深色</button></div></Field></div><div className="settings-section"><h3>关闭窗口</h3><Field label="服务运行时点击关闭" hint="此设置用于后续窗口关闭流程"><select value={prefs.closeBehavior ?? 'ask'} onChange={(e) => update({ closeBehavior: e.target.value })}><option value="ask">每次询问</option><option value="tray">最小化到系统托盘</option><option value="exit">停止服务后退出</option></select></Field></div></>}{tab === 'network' && <><div className="settings-section"><h3>网络安全</h3><p className="settings-note"><ShieldCheck size={15} />默认监听 localhost。局域网入口需要在“服务配置”中单独开启，所有请求仍需有效 API Key。</p></div><CertificateSection notify={notify} /></>}{tab === 'cursor' && <CursorSettingsSection notify={notify} />}{tab === 'data' && <div className="settings-section"><h3>本地数据</h3><Field label="请求日志保留时间"><select value={prefs.retention ?? '7'} onChange={(e) => update({ retention: e.target.value })}><option value="7">最近 7 天</option><option value="30">最近 30 天</option></select></Field><div className="danger-zone"><div><h3>重置浏览器预览数据</h3><p>仅清理当前 Web 预览中的本地状态，不会删除桌面端凭据文件。</p></div><button className="button danger-button" onClick={onReset}><Trash2 size={15} />重置数据</button></div></div>}{tab === 'about' && <div className="about-block"><div className="about-logo">CR</div><h3>CodeRelay</h3><p>面向高级用户的 CodeBuddy CN 账号池和本地 OpenAI 兼容反代管理工具。</p><div className="about-meta"><span>版本 {APP_VERSION}</span><span>Windows 桌面端</span><span>本地优先</span></div><div className="update-check"><div className="update-check-row"><button className="button ghost" onClick={onCheckUpdate} disabled={checkingUpdate}><RefreshCw size={15} className={checkingUpdate ? 'spin' : ''} />{checkingUpdate ? '检测中…' : '检测更新'}</button>{updateInfo && <span className={`update-status ${updateInfo.hasUpdate ? 'has-update' : 'up-to-date'}`}>{updateInfo.hasUpdate ? <><Sparkles size={13} />发现新版本 {updateInfo.latestVersion}</> : <><Check size={13} />已是最新版本 {updateInfo.currentVersion}</>}</span>}{!updateInfo && !checkingUpdate && !updateError && <span className="update-status muted">尚未检测</span>}{updateError && <span className="update-status failed"><AlertTriangle size={13} />检测失败</span>}</div>{updateError && <p className="update-hint">{updateError}</p>}{updateInfo?.hasUpdate && <div className="update-actions"><button className="button primary" onClick={onShowUpdate}><Download size={15} />查看更新详情</button><button className="button ghost" onClick={() => { void openExternal(updateInfo.releaseUrl); }}><Globe2 size={15} />打开发布页</button></div>}{updateInfo && !updateInfo.hasUpdate && <p className="update-hint">当前版本 {updateInfo.currentVersion} 已经是 GitHub 上发布的最新版本。</p>}</div><button className="inline-link" onClick={() => notify('第三方组件许可见项目根目录 NOTICE.md')}>查看第三方许可 <span>→</span></button></div>}</div></div></>;
+}
+
+/**
+ * 「设置 → 网络」的证书管理区块。
+ *
+ * 只展示安装命令，**不自动提权**：把根证书装进系统信任库属于高影响操作，沿用
+ * 上游设计交由用户在管理员终端里自行执行。CodeRelay 现无提权流程，这里也不新增。
+ */
+function CertificateSection({ notify }: { notify: NoticeHandler }) {
+  const [status, setStatus] = useState<CursorBridgeStatus>(defaultCursorBridgeStatus);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [command, setCommand] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    if (!hasTauri()) { setLoading(false); return; }
+    try {
+      const next = await getCursorBridgeStatus();
+      setStatus(next);
+      setCommand(next.installCommand ?? await getCursorBridgeInstallCommand());
+    } catch {
+      // 桥接未运行时状态读取会失败，此处不打扰用户：证书区块显示为未初始化即可。
+      setStatus(defaultCursorBridgeStatus);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const initialize = async () => {
+    setBusy(true);
+    try {
+      const next = await initCursorBridgeCa();
+      setStatus(next);
+      setCommand(next.installCommand ?? await getCursorBridgeInstallCommand());
+      notify('根证书已生成，请按下方命令安装到系统信任库');
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const caLabel = CURSOR_CA_LABELS[status.ca] ?? status.ca;
+  const tone = status.ca === 'ready' ? 'success' : status.ca === 'invalid' ? 'danger' : 'warning';
+
+  return <div className="settings-section">
+    <h3>证书管理</h3>
+    <div className="panel-heading">
+      <div>
+        <span className="panel-kicker">根证书</span>
+        <p className="settings-note" style={{ marginTop: 6 }}>
+          <ShieldCheck size={15} />Cursor 桥接通过本地 MITM 代理接管 Agent 请求，需要一张本机根证书被系统信任。
+        </p>
+      </div>
+      <StatusPill tone={tone}>{loading ? '读取中…' : caLabel}</StatusPill>
+    </div>
+    <div className="form-actions" style={{ justifyContent: 'flex-start', marginTop: 16 }}>
+      <button className="button ghost" disabled={busy || !status.running} onClick={() => { void initialize(); }}>
+        <ShieldCheck size={15} />{busy ? '生成中…' : status.ca === 'missing' ? '生成根证书' : '重新生成根证书'}
+      </button>
+      {!status.running && <span className="save-hint">桥接未运行，请先在「Cursor 服务」页启动桥接。</span>}
+    </div>
+    {command && <>
+      <p className="settings-note"><Terminal size={15} />以管理员身份打开终端后执行（CodeRelay 不会自动提权）：</p>
+      <pre className="code-block">{command}</pre>
+      <button className="button ghost" onClick={() => { void copyText(command).then(() => notify('安装命令已复制')); }}><Copy size={15} />复制命令</button>
+    </>}
+  </div>;
+}
+
+/**
+ * 「设置 → Cursor」。
+ *
+ * 承载接口设置、代理方式与 Commit 提交代码模型。偏好持久化在 CodeRelay 侧的
+ * `cursor-bridge.json`（经 `cursor_bridge_save_preferences` 落盘），不走
+ * localStorage：bridge 才是执行这些设置的一方，第二套偏好会与之漂移。
+ */
+function CursorSettingsSection({ notify }: { notify: NoticeHandler }) {
+  const [status, setStatus] = useState<CursorBridgeStatus>(defaultCursorBridgeStatus);
+  const [draft, setDraft] = useState<CursorBridgePreferences>(defaultCursorBridgePreferences);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [showPromptModal, setShowPromptModal] = useState(false);
+
+  const load = useCallback(async () => {
+    if (!hasTauri()) { setLoading(false); return; }
+    try {
+      const next = await getCursorBridgeStatus();
+      setStatus(next);
+      setDraft(next.preferences);
+    } catch {
+      setStatus(defaultCursorBridgeStatus);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const update = (changes: Partial<CursorBridgePreferences>) => setDraft((current) => ({ ...current, ...changes }));
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      // 端口必须是 0（自动）或合法端口：bridge 用一个非法端口会直接启动失败。
+      for (const [label, value] of [['桥接服务端口', draft.servicePort], ['代理端口', draft.proxyPort]] as Array<[string, number]>) {
+        if (!Number.isInteger(value) || value < 0 || value > 65535) throw new Error(`${label}必须是 0 到 65535 之间的整数（0 表示自动分配）。`);
+      }
+      if (draft.proxyMode === 'custom' && !draft.proxyAddress.trim()) throw new Error('自定义代理方式必须填写代理地址。');
+      setStatus(await saveCursorBridgePreferences(draft));
+      notify('Cursor 设置已保存');
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const commitLabel = (modelId: string) => {
+    if (!modelId) return '直连（使用 Cursor 官方）';
+    const model = status.models.find((item) => item.modelHash === modelId);
+    return model ? `${model.displayName || model.modelId}` : modelId;
+  };
+
+  if (loading) return <div className="settings-section"><h3>Cursor 桥接</h3><p className="settings-note">正在读取桥接设置…</p></div>;
+
+  return <>
+    <div className="settings-section">
+      <h3>接口设置</h3>
+      <div className="form-grid">
+        <Field label="桥接服务端口" hint="0 表示由系统自动分配；改动后需重启桥接生效。">
+          <input type="number" min={0} max={65535} value={draft.servicePort} onChange={(e) => update({ servicePort: Number(e.target.value) })} />
+        </Field>
+        <Field label="代理端口" hint="本地 MITM 代理监听端口；0 表示由系统自动分配。">
+          <input type="number" min={0} max={65535} value={draft.proxyPort} onChange={(e) => update({ proxyPort: Number(e.target.value) })} />
+        </Field>
+      </div>
+    </div>
+
+    <div className="settings-section">
+      <h3>代理方式</h3>
+      <Field label="出站代理" hint="桥接访问上游时使用的网络代理。">
+        <select value={draft.proxyMode} onChange={(e) => update({ proxyMode: e.target.value })}>
+          <option value="default">默认（不使用代理）</option>
+          <option value="custom">自定义代理</option>
+        </select>
+      </Field>
+      {draft.proxyMode === 'custom' && <>
+        <Field label="代理地址" hint="例如 http://127.0.0.1:7890" wide>
+          <input value={draft.proxyAddress} onChange={(e) => update({ proxyAddress: e.target.value })} placeholder="http://127.0.0.1:7890" />
+        </Field>
+        <Toggle label="代理认证" description="代理需要用户名密码时开启。" checked={draft.proxyAuthEnabled} onChange={(value) => update({ proxyAuthEnabled: value })} />
+        {draft.proxyAuthEnabled && <div className="form-grid">
+          <Field label="用户名"><input value={draft.proxyUsername} onChange={(e) => update({ proxyUsername: e.target.value })} /></Field>
+          <Field label="密码" hint="留空表示保留已保存的密码。"><input type="password" value={draft.proxyPassword} onChange={(e) => update({ proxyPassword: e.target.value })} placeholder="留空则不修改" /></Field>
+        </div>}
+      </>}
+    </div>
+
+    <div className="settings-section">
+      <h3>Commit 提交代码模型</h3>
+      <Field label="模型" hint="用于生成 Git 提交信息；选择「直连」时由 Cursor 官方处理。">
+        <select value={draft.commitModelId} onChange={(e) => update({ commitModelId: e.target.value })}>
+          <option value="">直连（使用 Cursor 官方）</option>
+          {status.models.map((model) => <option key={model.modelHash} value={model.modelHash}>{model.displayName || model.modelId}</option>)}
+        </select>
+      </Field>
+      <div className="form-actions" style={{ justifyContent: 'flex-start', marginTop: 12 }}>
+        <button className="button ghost" onClick={() => setShowPromptModal(true)}><Pencil size={15} />编辑提示词</button>
+        <button className="button ghost" onClick={() => update({ commitPrompt: '' })}><RefreshCw size={15} />恢复默认</button>
+        <span className="save-hint">{draft.commitPrompt ? '使用自定义提示词' : '使用内置提示词'}</span>
+      </div>
+      {!status.models.length && <p className="settings-note"><AlertTriangle size={15} />暂无可选模型：请先在「Cursor 服务」页启动桥接并同步模型。</p>}
+    </div>
+
+    <div className="form-actions">
+      <span className="save-hint">当前 Commit 模型：{commitLabel(draft.commitModelId)}</span>
+      <button className="button primary" disabled={busy} onClick={() => { void save(); }}><Check size={15} />{busy ? '保存中…' : '保存 Cursor 设置'}</button>
+    </div>
+
+    {showPromptModal && <Modal title="Commit 提示词" onClose={() => setShowPromptModal(false)} wide>
+      <Field label="提示词" wide hint="留空即使用内置默认提示词。">
+        <textarea rows={12} value={draft.commitPrompt} onChange={(e) => update({ commitPrompt: e.target.value })} placeholder={status.commitDefaultPrompt ?? '（内置默认提示词）'} />
+      </Field>
+      {status.commitDefaultPrompt && <details>
+        <summary className="settings-note">查看内置默认提示词</summary>
+        <pre className="code-block">{status.commitDefaultPrompt}</pre>
+      </details>}
+      <div className="modal-footer">
+        <button className="button ghost" onClick={() => setShowPromptModal(false)}>取消</button>
+        <button className="button primary" onClick={() => setShowPromptModal(false)}><Check size={15} />完成</button>
+      </div>
+    </Modal>}
+  </>;
 }
 
 interface ParsedAccount {

@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import type { Account, ApiKey, AppState, CheckinResponse, CheckinStatusResponse, ModelInfo, OAuthCompleteResponse, OAuthStartResponse, ServiceConfig, UpdateCheckResult } from './types';
+import type { Account, ApiKey, AppState, CheckinResponse, CheckinStatusResponse, CursorBinding, CursorBridgePreferences, CursorBridgeStatus, ModelInfo, OAuthCompleteResponse, OAuthStartResponse, ServiceConfig, UpdateCheckResult } from './types';
 import { defaultState } from './types';
 
 const STORAGE_KEY = 'coderelay-app-state';
@@ -191,6 +191,60 @@ export async function validateToken(accessToken: string): Promise<OAuthCompleteR
 export async function openExternal(url: string): Promise<void> {
   requireTauri('打开系统浏览器');
   await openUrl(url);
+}
+
+// ---------------------------------------------------------------------------
+// Cursor 服务（cursor-bridge sidecar）
+//
+// bridge 的控制 API 走 HTTP，但端口只由后端知道（启动时由 bridge 的 ready 行
+// 上报），前端因此不直接 fetch bridge，而是走下面这组 Tauri 命令。这样做的
+// 直接收益：前端不必知道端口，也就不存在 CORS 与端口漂移问题——所有 HTTP 调用
+// 都由 Rust 侧发出。
+// ---------------------------------------------------------------------------
+
+export async function getCursorBridgeStatus(): Promise<CursorBridgeStatus> {
+  requireTauri('Cursor 服务');
+  return invoke<CursorBridgeStatus>('cursor_bridge_status');
+}
+
+export async function startCursorBridge(): Promise<CursorBridgeStatus> {
+  requireTauri('Cursor 服务');
+  return invoke<CursorBridgeStatus>('cursor_bridge_start');
+}
+
+export async function stopCursorBridge(): Promise<CursorBridgeStatus> {
+  requireTauri('Cursor 服务');
+  return invoke<CursorBridgeStatus>('cursor_bridge_stop');
+}
+
+export async function initCursorBridgeCa(): Promise<CursorBridgeStatus> {
+  requireTauri('Cursor 证书管理');
+  return invoke<CursorBridgeStatus>('cursor_bridge_init_ca');
+}
+
+export async function getCursorBridgeInstallCommand(): Promise<string | null> {
+  requireTauri('Cursor 证书管理');
+  return invoke<string | null>('cursor_bridge_install_command');
+}
+
+export async function setCursorBridgeEnabled(enabled: boolean): Promise<CursorBridgeStatus> {
+  requireTauri('Cursor 注入');
+  return invoke<CursorBridgeStatus>('cursor_bridge_set_enabled', { enabled });
+}
+
+export async function syncCursorBridgeModels(): Promise<CursorBridgeStatus> {
+  requireTauri('Cursor 模型同步');
+  return invoke<CursorBridgeStatus>('cursor_bridge_sync_models');
+}
+
+export async function saveCursorBridgeBindings(bindings: CursorBinding[]): Promise<CursorBridgeStatus> {
+  requireTauri('Cursor 绑定');
+  return invoke<CursorBridgeStatus>('cursor_bridge_save_bindings', { bindings });
+}
+
+export async function saveCursorBridgePreferences(preferences: CursorBridgePreferences): Promise<CursorBridgeStatus> {
+  requireTauri('Cursor 设置');
+  return invoke<CursorBridgeStatus>('cursor_bridge_save_preferences', { preferences });
 }
 
 /**

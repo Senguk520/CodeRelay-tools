@@ -392,3 +392,15 @@ html[data-theme='dark'] .nav-badge { box-shadow: 0 0 0 2px #23241f; }
 .update-notes-section h3 { margin: 0; color: var(--ink-strong); font-size: 12px; }
 /* 发布说明保留原文换行；限制高度并单独滚动，避免长说明把弹窗撑出屏幕。 */
 .update-notes { max-height: 260px; overflow: auto; padding: 12px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink-soft); background: var(--surface-soft); font-size: 11px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
+/* 命令展示块（Cursor 证书安装命令）。等宽字体 + 横向滚动，长命令不撑破弹窗。 */
+.code-block { margin: 0 0 14px; padding: 12px; overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; color: var(--ink-soft); background: var(--surface-soft); font-family: 'DM Mono', monospace; font-size: 11px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; }
+/* 区块内联警告：用于「桥接报错」「绑定引用了已删除的 Key」这类需要立刻可见的提示。 */
+.inline-warning { display: flex; align-items: flex-start; gap: 8px; margin: 12px 0; padding: 11px 12px; border: 1px solid #f1e2bd; border-radius: 8px; color: #8d6a18; background: #fffaf0; font-size: 10px; line-height: 1.55; }
+.inline-warning svg { flex: 0 0 auto; margin-top: 1px; }
+/* 页头里紧凑排列的开关：去掉 toggle-row 的上边框与最小高度，避免撑高标题行。 */
+.compact-toggle { min-height: 0; min-width: 205px; padding: 0; border-top: 0; }
+.compact-toggle .toggle-copy { gap: 1px; }
+.compact-toggle .toggle-copy strong { font-size: 10px; }
+.compact-toggle .toggle-copy small { font-size: 9px; }
+.compact-toggle:has(input:disabled) { opacity: .5; }
+html[data-theme='dark'] .inline-warning { color: #ddc07a; background: rgba(221, 175, 75, .1); border-color: rgba(221, 175, 75, .28); }

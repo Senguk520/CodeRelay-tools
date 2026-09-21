@@ -206,6 +206,17 @@ fn save_config(app: &AppHandle, config: &CursorBridgeConfig) -> Result<(), Strin
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CursorBridgeModel {
+    /// The bridge keys its commit-message setting by `model_hash`, not by model
+    /// id, so the selector has to offer these values (see
+    /// `commit_message.rs::ensure_configured_model`).
+    pub model_hash: String,
+    pub model_id: String,
+    pub display_name: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CursorBridgeStatus {
     pub running: bool,
     pub port: Option<u16>,
@@ -216,6 +227,8 @@ pub struct CursorBridgeStatus {
     pub integration: String,
     pub settings_applied: bool,
     pub configured_models: usize,
+    /// Models the bridge currently holds, for the commit-model selector.
+    pub models: Vec<CursorBridgeModel>,
     pub bindings: Vec<CursorBinding>,
     pub preferences: CursorBridgePreferences,
     pub install_command: Option<String>,
@@ -225,6 +238,9 @@ pub struct CursorBridgeStatus {
     /// missing or disabled. Surfaced so the user is told rather than left
     /// wondering why a model they configured never reaches Cursor.
     pub unresolved_bindings: Vec<String>,
+    /// The bridge's built-in commit prompt. The settings UI needs it so
+    /// "restore default" can put the real text back rather than an empty box.
+    pub commit_default_prompt: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +306,18 @@ async fn fetch_harness_status(port: u16) -> Result<Value, String> {
     let client = http_client(HTTP_TIMEOUT)?;
     let url = format!("{}/harness/cursor/status", bridge_base(port));
     fetch_json(&client, &url).await
+}
+
+/// Reads the built-in commit prompt, so the UI can restore it.
+async fn fetch_commit_default_prompt(port: u16) -> Option<String> {
+    let client = http_client(HTTP_TIMEOUT).ok()?;
+    let url = format!("{}/settings/commit", bridge_base(port));
+    let value = fetch_json(&client, &url).await.ok()?;
+    value
+        .get("default_prompt")
+        .and_then(Value::as_str)
+        .filter(|prompt| !prompt.trim().is_empty())
+        .map(str::to_string)
 }
 
 fn json_str(value: &Value, key: &str, fallback: &str) -> String {
@@ -656,6 +684,34 @@ async fn fetch_models(port: u16) -> Result<Vec<Value>, String> {
     }
 }
 
+/// Projects the bridge's model rows onto what the UI needs.
+///
+/// `model_hash` is included because the commit-message setting is keyed by it,
+/// not by `model_id` (`commit_message.rs::ensure_configured_model`).
+fn parse_models(items: Vec<Value>) -> Vec<CursorBridgeModel> {
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let model_hash = item.get("model_hash")?.as_str()?.to_string();
+            let model_id = item
+                .get("model_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let display_name = item
+                .get("display_name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Some(CursorBridgeModel {
+                model_hash,
+                model_id,
+                display_name,
+            })
+        })
+        .collect()
+}
+
 /// A comparable projection of one model, used to decide whether the bridge
 /// still matches what CodeRelay wants.
 ///
@@ -781,12 +837,15 @@ async fn build_status(
         integration: "unknown".into(),
         settings_applied: false,
         configured_models: 0,
+        // No process means no stored rows to report; the selector is empty.
+        models: Vec::new(),
         bindings: bindings.clone(),
         preferences: preferences.clone(),
         install_command: None,
         proxy_url: None,
         last_error: error,
         unresolved_bindings: unresolved_bindings.clone(),
+        commit_default_prompt: None,
     };
 
     let Some(port) = current_port() else {
@@ -810,6 +869,11 @@ async fn build_status(
         harness
     };
 
+    // The commit model is stored by `model_hash`, so the selector needs the real
+    // rows rather than the binding list (whose ids CodeRelay chose).
+    let models = fetch_models(port).await.map(parse_models).unwrap_or_default();
+    let commit_default_prompt = fetch_commit_default_prompt(port).await;
+
     Ok(CursorBridgeStatus {
         running: true,
         port: Some(port),
@@ -823,6 +887,7 @@ async fn build_status(
             .get("configured_models")
             .and_then(Value::as_u64)
             .unwrap_or(0) as usize,
+        models,
         bindings,
         preferences,
         install_command: harness
@@ -835,6 +900,7 @@ async fn build_status(
             .map(str::to_string),
         last_error,
         unresolved_bindings,
+        commit_default_prompt,
     })
 }
 

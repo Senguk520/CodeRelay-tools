@@ -1,4 +1,4 @@
-export type PageId = 'overview' | 'service' | 'keys' | 'logs' | 'accounts' | 'models' | 'settings';
+export type PageId = 'overview' | 'service' | 'keys' | 'logs' | 'accounts' | 'models' | 'cursor' | 'settings';
 export type ThemeMode = 'light' | 'dark' | 'system';
 export type ServiceScope = 'localhost' | 'lan';
 export type RoutingStrategy = 'auto' | 'random' | 'single_account' | 'quota_high_first' | 'custom';
@@ -166,7 +166,107 @@ export interface AppState {
    * 也不会写进 state.json。
    */
   lanBaseUrl: string | null;
+  /**
+   * 只读派生值：cursor-bridge sidecar 当前监听的端口；bridge 未运行时为 null。
+   * 与 lanBaseUrl 同样不参与持久化，也不会写进 state.json。
+   */
+  cursorBridgePort: number | null;
 }
+
+/**
+ * Cursor 服务的一条「绑定」：把一个 API Key 和一个模型配对，使其出现在
+ * Cursor 的模型选择器中。不含 relay 地址——该地址由后端在同步时从 relay 的
+ * 实际端口派生，因此端口漂移不会在配置里留下过期 URL。
+ */
+export interface CursorBinding {
+  id: string;
+  keyId: string;
+  modelId: string;
+  /** 留空时后端回落为 modelId；Cursor 中显示的名称。 */
+  displayName: string;
+  remark: string;
+  /** 空字符串表示不设置；否则为 one of low/medium/high/xhigh/max。 */
+  reasoningEffort: string;
+  extraParams?: Record<string, unknown> | null;
+  contextWindowTokens?: number | null;
+  maxOutputTokens?: number | null;
+}
+
+/** cursor-bridge 的偏好设置，由「设置 → Cursor」页维护，持久化在 CodeRelay 侧。 */
+export interface CursorBridgePreferences {
+  servicePort: number;
+  proxyPort: number;
+  proxyMode: 'default' | 'custom' | string;
+  proxyAddress: string;
+  proxyAuthEnabled: boolean;
+  proxyUsername: string;
+  /** 留空表示保留既有密码，不会清空。 */
+  proxyPassword: string;
+  /** 留空表示「直连」，即直接转发 Cursor 自己的提交请求。 */
+  commitModelId: string;
+  commitPrompt: string;
+}
+
+/** bridge 当前持有的一个模型行，供「Commit 提交代码模型」下拉使用。 */
+export interface CursorBridgeModel {
+  /** Commit 设置按 model_hash 索引模型，下拉必须提供该值。 */
+  modelHash: string;
+  modelId: string;
+  displayName: string;
+}
+
+/** `cursor_bridge_status` 的返回。 */
+export interface CursorBridgeStatus {
+  running: boolean;
+  port: number | null;
+  /** missing / untrusted / ready / invalid / unknown。 */
+  ca: string;
+  /** disabled / enabled / degraded / unknown。 */
+  integration: string;
+  settingsApplied: boolean;
+  configuredModels: number;
+  /** bridge 当前持有的模型行，供 Commit 模型下拉使用。 */
+  models: CursorBridgeModel[];
+  bindings: CursorBinding[];
+  preferences: CursorBridgePreferences;
+  installCommand: string | null;
+  proxyUrl: string | null;
+  lastError: string | null;
+  /** 因 API Key 缺失或停用而被跳过的绑定显示名。 */
+  unresolvedBindings: string[];
+  /** bridge 内置的 Commit 提示词，「恢复默认」需要它。 */
+  commitDefaultPrompt: string | null;
+}
+
+export const defaultCursorBridgePreferences: CursorBridgePreferences = {
+  servicePort: 0,
+  proxyPort: 0,
+  proxyMode: 'default',
+  proxyAddress: '',
+  proxyAuthEnabled: false,
+  proxyUsername: '',
+  proxyPassword: '',
+  commitModelId: '',
+  commitPrompt: '',
+};
+
+export const defaultCursorBridgeStatus: CursorBridgeStatus = {
+  running: false,
+  port: null,
+  ca: 'unknown',
+  integration: 'unknown',
+  settingsApplied: false,
+  configuredModels: 0,
+  models: [],
+  bindings: [],
+  preferences: defaultCursorBridgePreferences,
+  installCommand: null,
+  proxyUrl: null,
+  lastError: null,
+  unresolvedBindings: [],
+  commitDefaultPrompt: null,
+};
+
 
 /** 安装包下载地址的来源。`asset` 为 GitHub Release 附件，`releaseBody` 为说明正文里的历史链接。 */
 export type InstallerSource = 'asset' | 'releaseBody';
@@ -250,4 +350,6 @@ export const defaultState: AppState = {
   lastError: null,
   // 派生值：预览模式（无 Tauri）下没有真实网卡，保持空；正式运行时由后端下发。
   lanBaseUrl: null,
+  // 派生值：预览模式没有 cursor-bridge 进程，恒为 null。
+  cursorBridgePort: null,
 };
