@@ -170,9 +170,18 @@ impl CursorHarness {
 
     pub async fn set_enabled(&self, enabled: bool) -> Result<CursorHarnessStatus> {
         if enabled {
-            self.inner.store.set_cursor_takeover_enabled(true).await?;
+            // Persist the intent *after* the takeover actually took effect.
+            // Writing it first is what made a failed enable (missing CA, dead
+            // backend) leave a `true` row behind, so the next start would
+            // re-attach a takeover the user never successfully got — and every
+            // later attempt would fail the same way. Absent/false must mean
+            // "not currently taken over".
             self.enable().await?;
+            self.inner.store.set_cursor_takeover_enabled(true).await?;
         } else {
+            // For disable the order is reversed on purpose: the user asked to
+            // stop, so the intent is recorded even if the cleanup itself trips.
+            // Otherwise a failed revert would be re-attached on the next launch.
             self.inner.store.set_cursor_takeover_enabled(false).await?;
             self.disable().await?;
         }
