@@ -159,13 +159,20 @@ go test ./...
 
 本项目参考了 [cockpit-tools](https://github.com/jlcodes99/cockpit-tools) 的技术选型，并基于众多优秀的开源项目构建。完整的上游致谢与第三方依赖归属清单见 [ACKNOWLEDGMENTS.md](./ACKNOWLEDGMENTS.md)。
 
+「Cursor 服务」所使用的本地桥接 sidecar，是 [cursor_byok](https://github.com/leookun/cursor-byok)（MIT License，Copyright (c) 2026 leookun）服务端的修改副本，固定在上游 commit `2068ab20513288e6a0289d33febe872a30608610`。上游版权与许可声明已逐字保留，改动清单与详细来源记录见 [sidecars/cursor-bridge/UPSTREAM.md](./sidecars/cursor-bridge/UPSTREAM.md)。
+
+> **排障提示**：该桥接通过 Cursor 的私有 protobuf 协议工作，Cursor 更新后可能失效。升级 Cursor 后请**完全退出并重新启动** Cursor，再重新开启注入。
+>
+> **Tab 补全说明**：本桥接不再提供 Tab 内联补全，相关请求会原样转发给 Cursor 官方服务，因此其可用性取决于你自己的 Cursor 账号额度。这是预期行为，不是缺陷。
+
 ## 第三方组件与许可
 
-本项目反代 sidecar 基于 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)（MIT License）构建。第三方组件的许可与归属信息见：
+本项目反代 sidecar 基于 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)（MIT License）构建；Cursor 桥接 sidecar 基于 [cursor_byok](https://github.com/leookun/cursor-byok)（MIT License）构建。第三方组件的许可与归属信息见：
 
 - [NOTICE.md](./NOTICE.md)
 - [ACKNOWLEDGMENTS.md](./ACKNOWLEDGMENTS.md)
 - `sidecars/coderelay-proxy/third_party/CLIProxyAPI/LICENSE`
+- `sidecars/cursor-bridge/LICENSE`、`sidecars/cursor-bridge/UPSTREAM.md`
 
 ---
 

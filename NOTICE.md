@@ -1,5 +1,26 @@
 # CodeRelay third-party notices
 
+## cursor_byok (Cursor bridge sidecar)
+
+`sidecars/cursor-bridge` is a modified copy of the server component of
+**cursor_byok**, baseline commit `2068ab20513288e6a0289d33febe872a30608610`,
+distributed under the MIT License (Copyright (c) 2026 leookun). The original
+copyright and permission notice is preserved verbatim in
+`sidecars/cursor-bridge/LICENSE`.
+
+The CodeRelay bridge removes the plugin system, ad placements, legacy config
+import, home statistics and token pricing, and the Tab completion subsystem; it
+also renames the data directory, environment variables, and certificate
+authority to CodeRelay-specific values. Those changes are maintained separately
+from the upstream snapshot. See `sidecars/cursor-bridge/UPSTREAM.md` for the full
+provenance record and `sidecars/cursor-bridge/README.md` for the change list.
+
+`sidecars/cursor-bridge/crates/semble-core` is in turn derived from
+[MinishLab/semble](https://github.com/MinishLab/semble) (MIT), baseline commit
+`921849164e2632dd4f0e1c1370f82cfe15ed6d6c`; see that directory's `UPSTREAM.md`.
+Its embedding model (`minishlab/potion-code-16M-v2`, MIT) is downloaded at
+runtime, not bundled.
+
 ## CLIProxyAPI
 
 `sidecars/coderelay-proxy/third_party/CLIProxyAPI` is based on CLIProxyAPI

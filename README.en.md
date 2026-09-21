@@ -161,13 +161,20 @@ Update results are session state and are not written to `state.json`. "Check for
 
 This project takes inspiration from the technology choices of [cockpit-tools](https://github.com/jlcodes99/cockpit-tools) and is built on many excellent open-source projects. See [ACKNOWLEDGMENTS.md](./ACKNOWLEDGMENTS.md) for the full upstream attribution and third-party dependency list.
 
+The local bridge sidecar behind the "Cursor service" page is a modified copy of the server component of [cursor_byok](https://github.com/leookun/cursor-byok) (MIT License, Copyright (c) 2026 leookun), pinned to upstream commit `2068ab20513288e6a0289d33febe872a30608610`. The upstream copyright and license notices are preserved verbatim; see [sidecars/cursor-bridge/UPSTREAM.md](./sidecars/cursor-bridge/UPSTREAM.md) for the provenance record and change list.
+
+> **Troubleshooting note**: this bridge works by speaking Cursor's private protobuf protocol, which Cursor may change at any time. After upgrading Cursor, fully quit and restart it, then re-enable injection.
+>
+> **Tab completion note**: this bridge no longer provides inline Tab completion. Those requests are forwarded to Cursor's official backend unchanged, so their availability depends on your own Cursor account quota. This is expected behavior, not a defect.
+
 ## Third-Party Components & Licenses
 
-The reverse proxy sidecar is built on [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (MIT License). For third-party license and attribution information, see:
+The reverse proxy sidecar is built on [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (MIT License); the Cursor bridge sidecar is built on [cursor_byok](https://github.com/leookun/cursor-byok) (MIT License). For third-party license and attribution information, see:
 
 - [NOTICE.md](./NOTICE.md)
 - [ACKNOWLEDGMENTS.md](./ACKNOWLEDGMENTS.md)
 - `sidecars/coderelay-proxy/third_party/CLIProxyAPI/LICENSE`
+- `sidecars/cursor-bridge/LICENSE`, `sidecars/cursor-bridge/UPSTREAM.md`
 
 ---
 

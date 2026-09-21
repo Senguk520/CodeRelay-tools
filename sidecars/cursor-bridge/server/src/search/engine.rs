@@ -263,7 +263,7 @@ fn search_url(template: &str, query: &str) -> String {
 }
 
 fn user_agent() -> &'static str {
-    "Mozilla/5.0 (compatible; CursorBYOK/0.1; +https://github.com)"
+    "Mozilla/5.0 (compatible; CodeRelay-CursorBridge/0.1)"
 }
 
 fn json_text(value: &Value) -> String {

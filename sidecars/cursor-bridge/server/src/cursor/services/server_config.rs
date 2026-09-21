@@ -32,7 +32,7 @@ pub async fn get() -> Result<Response<Body>> {
 
 fn server_config() -> ServerConfigResponse {
     ServerConfigResponse {
-        config_version: "cursor_byok_local_agent_v1".into(),
+        config_version: "coderelay_cursor_bridge_local_agent_v1".into(),
         http2_config: HTTP2_CONFIG_FORCE_ALL_DISABLED,
         cli_sandbox_default_enabled: Some(true),
     }

@@ -142,7 +142,7 @@ impl WebFetch {
             .get(url.clone())
             .header(
                 USER_AGENT,
-                "Mozilla/5.0 (compatible; CursorBYOK/0.1; +https://github.com)",
+                "Mozilla/5.0 (compatible; CodeRelay-CursorBridge/0.1)",
             )
             .header(
                 ACCEPT,
