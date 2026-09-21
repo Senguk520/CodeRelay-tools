@@ -51,6 +51,16 @@ impl App {
         );
         let control = control::ControlService::new(store.clone(), provider, clients.clone())?;
         let harness = control.cursor_harness().clone();
+        // Self-heal: a previous run may have died (crash, taskkill, power loss)
+        // while Cursor's settings.json still pointed at its in-process proxy.
+        // The port is gone with the process, so those settings only mean "Cursor
+        // has no working network". Clearing them here — before anything can serve
+        // a status read — is what makes the failure recoverable without the user
+        // having to know what happened. The persisted takeover flag is left
+        // alone, so CodeRelay can re-attach the injection deliberately.
+        if let Err(error) = harness.cleanup_stale_settings().await {
+            tracing::warn!(%error, "failed to clear stale Cursor proxy settings");
+        }
         let mut router = api::router(registry.clone(), clients)?;
         router = match &config.console {
             Some(ConsoleSource::Directory(directory)) => {

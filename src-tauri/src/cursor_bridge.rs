@@ -31,7 +31,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
-
 const CONFIG_FILE: &str = "cursor-bridge.json";
 /// Subdirectory of the app data dir handed to the bridge. It keeps the bridge's
 /// SQLite file and CA away from CodeRelay's own `state.json`, and it is *not*
@@ -174,9 +173,13 @@ struct CursorBridgeConfig {
     version: u32,
     bindings: Vec<CursorBinding>,
     preferences: CursorBridgePreferences,
-    /// Relay base URL the bindings were last reconciled against. Persisted so a
-    /// restart can distinguish "already converged" from "relay moved".
-    reconciled_base_url: String,
+    /// The user's explicit takeover intent, owned by CodeRelay.
+    ///
+    /// Persisted so the injection can be re-attached after a CodeRelay restart
+    /// without asking the user again, and so a failure to attach is visible
+    /// rather than silently reinterpreted as "the user never wanted it". Never
+    /// defaulted to `true`: an absent value means "never asked".
+    takeover_enabled: bool,
 }
 
 impl Default for CursorBridgeConfig {
@@ -185,7 +188,7 @@ impl Default for CursorBridgeConfig {
             version: 1,
             bindings: Vec::new(),
             preferences: CursorBridgePreferences::default(),
-            reconciled_base_url: String::new(),
+            takeover_enabled: false,
         }
     }
 }
@@ -226,6 +229,12 @@ pub struct CursorBridgeStatus {
     /// `disabled` / `enabled` / `degraded` / `unknown`.
     pub integration: String,
     pub settings_applied: bool,
+    /// The user's persisted intent to inject, as recorded by CodeRelay.
+    ///
+    /// Distinct from `integration`, which is what the bridge reports about
+    /// right now. The switch in the UI follows this value, because it is the
+    /// one that survives a restart and the one a re-attach acts on.
+    pub takeover_requested: bool,
     pub configured_models: usize,
     /// Models the bridge currently holds, for the commit-model selector.
     pub models: Vec<CursorBridgeModel>,
@@ -627,8 +636,14 @@ fn relay_base_url(state: &AppState) -> String {
     format!("http://127.0.0.1:{port}/v1")
 }
 
+/// One reconcile request plus what the UI needs to explain it.
+///
+/// There is deliberately no `base_url` field: the URL is derived inside
+/// [`model_payload`] and only ever appears in the models themselves. Keeping a
+/// second copy here is what previously left an unread `reconciled_base_url` on
+/// the persisted config — drift is detected by comparing the bridge's rows
+/// (`fingerprints_match`), not by remembering a URL.
 struct SyncPayload {
-    base_url: String,
     models: Vec<Value>,
     /// Display names of bindings skipped because their API key is gone or
     /// disabled. Surfaced to the user instead of failing silently.
@@ -657,7 +672,6 @@ fn build_sync_payload(config: &CursorBridgeConfig, state: &AppState) -> SyncPayl
         models.push(model_payload(binding, secret, &base_url, models.len() as i64));
     }
     SyncPayload {
-        base_url,
         models,
         unresolved,
     }
@@ -776,14 +790,11 @@ fn fingerprints_match(stored: &[Value], desired: &[Value]) -> bool {
 /// itself instead of leaving a second copy of every model behind.
 async fn reconcile(port: u16, app: &AppHandle, inner: &Arc<CursorBridgeInner>) -> Result<usize, String> {
     let state = app_state_snapshot(app)?;
-    let (payload, mut config) = {
+    let payload = {
         let config = locked(&inner.config, "Cursor 桥接配置")?.clone();
-        (build_sync_payload(&config, &state), config)
+        build_sync_payload(&config, &state)
     };
     push_models(port, &payload.models).await?;
-    config.reconciled_base_url = payload.base_url;
-    save_config(app, &config)?;
-    *locked(&inner.config, "Cursor 桥接配置")? = config;
     Ok(payload.models.len())
 }
 
@@ -817,9 +828,13 @@ async fn build_status(
     app: &AppHandle,
     inner: &Arc<CursorBridgeInner>,
 ) -> Result<CursorBridgeStatus, String> {
-    let (bindings, preferences) = {
+    let (bindings, preferences, takeover_requested) = {
         let config = locked(&inner.config, "Cursor 桥接配置")?;
-        (config.bindings.clone(), config.preferences.clone())
+        (
+            config.bindings.clone(),
+            config.preferences.clone(),
+            config.takeover_enabled,
+        )
     };
     // Computed from the live state rather than remembered from the last sync, so
     // deleting an API key shows up immediately even if no reconcile ran.
@@ -836,6 +851,7 @@ async fn build_status(
         ca: "unknown".into(),
         integration: "unknown".into(),
         settings_applied: false,
+        takeover_requested,
         configured_models: 0,
         // No process means no stored rows to report; the selector is empty.
         models: Vec::new(),
@@ -883,6 +899,13 @@ async fn build_status(
             .get("settings_applied")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // The bridge is the source of truth for what it is doing; CodeRelay's
+        // recorded intent is normalized against it after a re-attach attempt so
+        // the UI never claims a takeover that the bridge rejected.
+        takeover_requested: harness
+            .get("takeover_requested")
+            .and_then(Value::as_bool)
+            .unwrap_or(takeover_requested),
         configured_models: harness
             .get("configured_models")
             .and_then(Value::as_u64)
@@ -920,16 +943,79 @@ pub fn initialize(app: &AppHandle, state: &CursorBridgeState) -> Result<(), Stri
     Ok(())
 }
 
+/// Re-attaches a takeover the user had explicitly enabled before a restart.
+///
+/// Called right after `start_process_locked` succeeds, so the proxy is already
+/// listening and the settings written below point at a live port. The intent
+/// comes from CodeRelay's own record (`takeover_enabled`), never from the
+/// bridge's database: a missing row there means "never asked", and treating it
+/// as "asked for" is exactly the implicit takeover this function must not
+/// reintroduce.
+///
+/// Best-effort: a failure is reported through the returned status rather than
+/// propagated, because the bridge itself started fine and the user needs to see
+/// a working page with an explanation, not an error page.
+async fn reattach_takeover(inner: &Arc<CursorBridgeInner>, port: u16) {
+    let run = || async {
+        let enabled = locked(&inner.config, "Cursor 桥接配置")?.takeover_enabled;
+        if !enabled {
+            return Ok::<(), String>(());
+        }
+        let client = http_client(SLOW_HTTP_TIMEOUT)?;
+        let url = format!("{}/harness/cursor/enabled", bridge_base(port));
+        send_json(
+            &client,
+            reqwest::Method::PUT,
+            &url,
+            &json!({ "enabled": true }),
+        )
+        .await?;
+        Ok(())
+    };
+    if let Err(error) = run().await {
+        eprintln!("cursor-bridge: re-attaching the enabled takeover failed: {error}");
+    }
+}
+
 /// Tears the bridge down. Called from the app's exit hook so quitting CodeRelay
 /// never orphans the process.
 ///
-/// Only the process is stopped. The Cursor-side proxy settings are left alone on
-/// purpose: the user may still have Cursor open, and clearing the settings here
-/// would silently revert their injection without them asking for it. Turning
-/// injection off explicitly (`cursor_bridge_set_enabled(false)`) is the path
-/// that cleans up `settings.json`, and it is the one the UI exposes.
+/// The Cursor-side injection is cleared **before** the process goes away, and
+/// that ordering is the whole point: the proxy is an in-process instance of the
+/// bridge, so killing the process first would leave `settings.json` pointing at
+/// a port nothing is listening on and take Cursor's network down with it.
+/// Clearing it while the bridge is still alive is the only moment at which the
+/// revert actually works.
+///
+/// The persisted takeover flag is deliberately left set, so the next launch can
+/// re-attach if the user had turned injection on.
 pub fn shutdown(state: &CursorBridgeState) {
-    stop_process_locked(&state.inner);
+    let inner = state.inner.clone();
+    let _lifecycle = match inner.lifecycle.lock() {
+        Ok(guard) => Some(guard),
+        Err(error) => Some(error.into_inner()),
+    };
+    if let Some(port) = current_port() {
+        // The exit hook cannot await: `RunEvent::Exit` runs on the main thread
+        // with the event loop already winding down. A short blocking wait on a
+        // dedicated runtime is the only way to get the clear-injection request
+        // out before the process tree is killed.
+        let _ = tauri::async_runtime::block_on(clear_injection(port, HTTP_TIMEOUT));
+    }
+    stop_process_locked(&inner);
+}
+
+/// Tells the bridge to remove Cursor's managed proxy settings.
+///
+/// Best-effort by contract: the caller is on a shutdown or stop path, where
+/// failing to send the request must never prevent the process from being
+/// stopped. A failure here means the next launch's `cleanup_stale_settings()`
+/// self-heal is the thing that repairs the residue.
+async fn clear_injection(port: u16, timeout: Duration) -> Result<(), String> {
+    let client = http_client(timeout)?;
+    let url = format!("{}/harness/cursor/injection", bridge_base(port));
+    send_json(&client, reqwest::Method::DELETE, &url, &json!({})).await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -966,6 +1052,10 @@ pub async fn cursor_bridge_start(
     // Push the binding list immediately: a fresh bridge has an empty (or stale)
     // model set, and Cursor would otherwise show nothing.
     let _ = reconcile(port, &app, &inner).await;
+    // Re-attach the injection the user had explicitly enabled before. Done here
+    // rather than from a status read, so nothing can take Cursor over as a side
+    // effect of the UI asking what the state is.
+    reattach_takeover(&inner, port).await;
     build_status(&app, &inner).await
 }
 
@@ -976,6 +1066,16 @@ pub async fn cursor_bridge_stop(
 ) -> Result<CursorBridgeStatus, String> {
     let inner = runtime.inner.clone();
     drop(runtime);
+    // Hand the Cursor-side revert to the bridge *before* the process dies. The
+    // proxy lives inside that process, so once it is gone the settings.json it
+    // wrote point at a dead port and Cursor stops being able to reach anything.
+    // A failure here is logged, not fatal: stopping the bridge is what the user
+    // asked for, and the next start's self-heal repairs the residue.
+    if let Some(port) = current_port() {
+        if let Err(error) = clear_injection(port, HTTP_TIMEOUT).await {
+            eprintln!("cursor-bridge: clearing Cursor injection before stop failed: {error}");
+        }
+    }
     tauri::async_runtime::spawn_blocking({
         let inner = inner.clone();
         move || {
@@ -1041,6 +1141,18 @@ pub async fn cursor_bridge_set_enabled(
         &json!({ "enabled": enabled }),
     )
     .await?;
+    // Record the intent *after* the bridge accepted it, so a rejected enable
+    // cannot leave CodeRelay remembering a takeover that never happened. This is
+    // the only writer of the flag: a later launch re-attaches from here, and
+    // nothing derives it from the bridge's own database.
+    {
+        let mut config = locked(&inner.config, "Cursor 桥接配置")?.clone();
+        if config.takeover_enabled != enabled {
+            config.takeover_enabled = enabled;
+            save_config(&app, &config)?;
+            *locked(&inner.config, "Cursor 桥接配置")? = config;
+        }
+    }
     build_status(&app, &inner).await
 }
 

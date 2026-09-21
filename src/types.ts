@@ -224,6 +224,13 @@ export interface CursorBridgeStatus {
   /** disabled / enabled / degraded / unknown。 */
   integration: string;
   settingsApplied: boolean;
+  /**
+   * 用户显式开启注入的意图，由 CodeRelay 侧持久化并在重启后据此重新挂载。
+   *
+   * 与 `integration` 的区别：后者是 bridge 此刻的实际情况，前者是用户的选择。
+   * UI 的开关跟这个值走，这样重启后开关不会因为 bridge 还没重挂而回弹成「关闭」。
+   */
+  takeoverRequested: boolean;
   configuredModels: number;
   /** bridge 当前持有的模型行，供 Commit 模型下拉使用。 */
   models: CursorBridgeModel[];
@@ -256,6 +263,7 @@ export const defaultCursorBridgeStatus: CursorBridgeStatus = {
   ca: 'unknown',
   integration: 'unknown',
   settingsApplied: false,
+  takeoverRequested: false,
   configuredModels: 0,
   models: [],
   bindings: [],

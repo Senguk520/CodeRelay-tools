@@ -1313,12 +1313,19 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
   };
 
   const injected = status.integration === 'enabled';
+  /** 开关跟用户意图走，而不是 bridge 此刻的瞬时状态。 */
+  const injectedIntent = status.takeoverRequested || injected;
   const caReady = status.ca === 'ready';
 
   const header = <div className="header-actions">
     <label className="toggle-row compact-toggle">
-      <span className="toggle-copy"><strong>注入 Cursor</strong><small>{injected ? '已接管模型请求' : '未接管，Cursor 仍走官方'}</small></span>
-      <input type="checkbox" checked={injected} disabled={busy || !status.running || !caReady} onChange={(event) => { void withBusy(() => setCursorBridgeEnabled(event.target.checked), event.target.checked ? '已开启注入' : '已关闭注入'); }} />
+      <span className="toggle-copy"><strong>注入 Cursor</strong><small>{injectedIntent ? '已接管模型请求' : '未接管，Cursor 仍走官方'}</small></span>
+      <input type="checkbox" checked={injectedIntent} disabled={busy || !status.running || !caReady} onChange={(event) => {
+        const next = event.target.checked;
+        // 开启会强制关闭 Cursor 并要求它重启：这是有破坏性的操作，必须先确认。
+        if (next && !window.confirm('开启注入会改写 Cursor 的 settings.json，并强制结束 Cursor 进程以让代理设置生效。\n\n未保存的编辑内容可能丢失，请先在 Cursor 中保存。确认继续？')) return;
+        void withBusy(() => setCursorBridgeEnabled(next), next ? '已开启注入' : '已关闭注入');
+      }} />
       <span className="toggle-track"><span /></span>
     </label>
     <IconButton label="添加绑定" onClick={() => { setEditingBinding(null); setShowBindingModal(true); }} disabled={busy || !status.running || enabledKeys.length === 0}><Plus size={16} /></IconButton>
@@ -1358,7 +1365,13 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
       <div className="table-toolbar">
         <div className="toolbar-title"><MousePointer2 size={17} /><strong>模型绑定</strong><span>{status.bindings.length} 个</span></div>
         <div className="header-actions">
-          <button className="button ghost" disabled={busy} onClick={() => { void withBusy(status.running ? stopCursorBridge : startCursorBridge, status.running ? '桥接已停止' : '桥接已启动'); }}>
+          <button className="button ghost" disabled={busy} onClick={() => {
+            if (!status.running) { void withBusy(startCursorBridge, '桥接已启动'); return; }
+            // 停止桥接会连带关闭注入：代理是 bridge 进程内的实例，进程一走注入
+            // 就必然失效。先说清楚，避免用户以为只是「停个服务」。
+            if (injectedIntent && !window.confirm('停止桥接会同时关闭 Cursor 注入，并清除 Cursor 的代理设置。\n\n停止后 Cursor 将回到官方模型。确认继续？')) return;
+            void withBusy(stopCursorBridge, '桥接已停止');
+          }}>
             {status.running ? <Pause size={15} /> : <Play size={15} />}{status.running ? '停止桥接' : '启动桥接'}
           </button>
           <button className="button ghost" disabled={busy || !status.running} onClick={() => { void withBusy(syncCursorBridgeModels, '模型已同步到桥接'); }}><RefreshCw size={15} />同步模型</button>
@@ -1389,8 +1402,12 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
       />}
     </div>
 
+    {status.running && !injected && status.proxyUrl && <div className="inline-warning">
+      <AlertTriangle size={15} />Cursor 的代理设置仍指向 {status.proxyUrl}，但注入未开启。请点「停止桥接」或「注入 Cursor」开关以清理，否则 Cursor 会连不上网络。
+    </div>}
+
     <div className="model-footnote">
-      <span><ShieldCheck size={14} />开启注入会改写 Cursor 的 settings.json 并结束 Cursor 进程，需先在 Cursor 中完全退出后重新打开。</span>
+      <span><ShieldCheck size={14} />开启注入会改写 Cursor 的 settings.json 并结束 Cursor 进程，需先在 Cursor 中完全退出后重新打开；停止桥接或退出 CodeRelay 会自动清除这些设置。</span>
     </div>
 
     {showBindingModal && <CursorBindingModal

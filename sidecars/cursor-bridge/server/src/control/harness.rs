@@ -26,3 +26,16 @@ pub async fn set_enabled(
         service.cursor_harness().set_enabled(input.enabled).await?,
     ))
 }
+
+/// Removes the Cursor-side injection while keeping the takeover flag.
+///
+/// CodeRelay calls this on "stop bridge" and on application exit: the proxy is
+/// an in-process instance of this server, so once the process is gone the
+/// settings it wrote point at nothing and Cursor loses its network. This is the
+/// last moment at which the revert can still work.
+pub async fn clear_injection(
+    State(service): State<ControlService>,
+) -> Result<Json<CursorHarnessStatus>> {
+    service.cursor_harness().clear_injection_only().await?;
+    Ok(Json(service.cursor_harness().status().await?))
+}
