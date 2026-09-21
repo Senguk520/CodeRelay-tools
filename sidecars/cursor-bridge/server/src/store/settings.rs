@@ -163,6 +163,16 @@ fn read_proxy_settings(value: &str) -> ProxySettingsSecret {
 }
 
 impl Store {
+    /// Whether the user explicitly enabled the Cursor takeover.
+    ///
+    /// A **missing row reads as `false`**. It used to read `true`, which made a
+    /// fresh database mean "already taken over" before the user had done
+    /// anything; combined with `status()` calling `enable()`, merely opening the
+    /// Cursor page was enough to terminate Cursor and rewrite its
+    /// `settings.json`. Absent must mean "never asked", never "asked for".
+    ///
+    /// Only `set_cursor_takeover_enabled(true)`, reached from an explicit
+    /// `PUT /harness/cursor/enabled`, writes `true`.
     pub(crate) async fn cursor_takeover_enabled(&self) -> Result<bool> {
         let value = sqlx::query_scalar::<_, String>(
             "SELECT value_json FROM service_settings WHERE setting_key = ?",
@@ -172,7 +182,7 @@ impl Store {
         .await?;
         value
             .map(|value| serde_json::from_str(&value).map_err(Into::into))
-            .unwrap_or(Ok(true))
+            .unwrap_or(Ok(false))
     }
 
     pub(crate) async fn set_cursor_takeover_enabled(&self, enabled: bool) -> Result<()> {
@@ -428,6 +438,23 @@ mod tests {
         assert_eq!(settings.mode, ProxyMode::Default);
         assert!(settings.address.is_empty());
         assert!(!settings.auth_enabled);
+    }
+
+    #[tokio::test]
+    async fn a_missing_takeover_row_does_not_mean_takeover_was_requested() {
+        // The regression this guards: reading `true` for a missing row turned a
+        // plain status read into a takeover on a fresh database.
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("test.db");
+        let url = ["sqlite://", &database_path.display().to_string()].concat();
+        let store = Store::connect(&url).await.unwrap();
+        assert!(!store.cursor_takeover_enabled().await.unwrap());
+
+        store.set_cursor_takeover_enabled(true).await.unwrap();
+        assert!(store.cursor_takeover_enabled().await.unwrap());
+
+        store.set_cursor_takeover_enabled(false).await.unwrap();
+        assert!(!store.cursor_takeover_enabled().await.unwrap());
     }
 
     #[tokio::test]

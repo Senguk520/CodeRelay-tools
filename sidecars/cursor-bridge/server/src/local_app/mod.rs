@@ -182,12 +182,20 @@ impl CursorHarness {
     /// Removes the Cursor-side injection without touching the persisted
     /// takeover flag.
     ///
-    /// Used by the shutdown and orphan-recovery paths, where the reason to
-    /// clear is "this process is going away and the in-process proxy with it",
-    /// not "the user changed their mind". Keeping the flag means a restart can
-    /// re-attach without the user having to remember the switch.
+    /// Used by the shutdown and stop paths, where the reason to clear is "this
+    /// process is going away and the in-process proxy with it", not "the user
+    /// changed their mind". Keeping the flag means a restart can re-attach
+    /// without the user having to remember the switch.
+    ///
+    /// It goes through `clear_stale_managed_settings` rather than
+    /// `clear_proxy_settings`, and that distinction matters on this path: the
+    /// stale check only removes the keys when they still carry this program's
+    /// signature *and* point at a loopback address, so a proxy configuration the
+    /// user set for their own reasons is left alone. Turning injection off via
+    /// `set_enabled(false)` keeps the unconditional variant, because there the
+    /// user has explicitly said "remove what you applied".
     pub async fn clear_injection_only(&self) -> Result<()> {
-        self.disable().await
+        settings::clear_stale_managed_settings()
     }
 
     async fn enable(&self) -> Result<()> {

@@ -899,13 +899,11 @@ async fn build_status(
             .get("settings_applied")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        // The bridge is the source of truth for what it is doing; CodeRelay's
-        // recorded intent is normalized against it after a re-attach attempt so
-        // the UI never claims a takeover that the bridge rejected.
-        takeover_requested: harness
-            .get("takeover_requested")
-            .and_then(Value::as_bool)
-            .unwrap_or(takeover_requested),
+        // CodeRelay's own record is authoritative for intent. The bridge's copy
+        // is deliberately not consulted: it is written by whichever control call
+        // arrived last, so treating it as the source of truth is how "row missing
+        // means enabled" crept in. Intent lives in exactly one place.
+        takeover_requested,
         configured_models: harness
             .get("configured_models")
             .and_then(Value::as_u64)
