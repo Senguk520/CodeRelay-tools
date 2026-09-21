@@ -69,11 +69,22 @@ fn residue_path() -> Result<PathBuf> {
     Ok(crate::config::managed_data_dir()?.join(RESIDUE_FILE))
 }
 
+/// Strips a UTF-8 BOM, if present.
+///
+/// Both files this module reads are editable by hand, and Windows editors
+/// (Notepad among them) like to prepend a BOM. `serde_json` and `json5` both
+/// reject one, and the failure modes are silent and asymmetric: for the residue
+/// record the parse error is downgraded to "not recorded", which loses the
+/// user's `http.noProxy` list with only a warning in a log they will never read.
+fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
+}
+
 fn read_residue(residue_path: &Path) -> SettingsResidue {
     let Ok(text) = fs::read_to_string(residue_path) else {
         return SettingsResidue::default();
     };
-    serde_json::from_str(&text).unwrap_or_else(|error| {
+    serde_json::from_str(strip_bom(&text)).unwrap_or_else(|error| {
         // A corrupt record must not block the takeover; the cost is a lost
         // `http.noProxy`, which is recoverable by hand.
         tracing::warn!(%error, "ignoring an unreadable settings-residue record");
@@ -121,7 +132,7 @@ fn read_at(path: &Path) -> Result<BTreeMap<String, Value>> {
     if data.trim().is_empty() {
         return Ok(BTreeMap::new());
     }
-    json5::from_str(&data)
+    json5::from_str(strip_bom(&data))
         .map_err(|error| Error::Config(format!("parse Cursor settings JSONC: {error}")))
 }
 
@@ -462,6 +473,46 @@ mod tests {
         assert!(
             fixture.raw().contains("\"http.noProxy\": \"localhost\""),
             "the exclusion list must be present after the round trip"
+        );
+    }
+
+    #[test]
+    fn a_settings_file_with_a_byte_order_mark_is_still_read() {
+        let fixture = Fixture::new();
+        // Windows editors prepend a BOM; json5 rejects it, and the failure would
+        // present as "the user's settings were treated as empty" — i.e. a
+        // takeover that silently drops every other key they had.
+        fixture.seed("\u{feff}{\n  \"editor.fontSize\": 15\n}\n");
+
+        write_proxy_settings_at(&fixture.locations(), MANAGED_URL).unwrap();
+
+        let settings = fixture.settings();
+        assert_eq!(
+            settings.get("editor.fontSize"),
+            Some(&Value::from(15)),
+            "a BOM must not make the file look empty"
+        );
+        assert_eq!(settings.get(KEYS[0]), Some(&Value::String(MANAGED_URL.into())));
+    }
+
+    #[test]
+    fn a_residue_record_with_a_byte_order_mark_is_still_honoured() {
+        let fixture = Fixture::new();
+        fixture.seed("{\n  \"http.proxy\": \"http://127.0.0.1:8080\"\n}\n");
+        let locations = fixture.locations();
+        fs::create_dir_all(locations.residue.parent().unwrap()).unwrap();
+        fs::write(
+            &locations.residue,
+            "\u{feff}{\"recorded\":true,\"no_proxy\":\"localhost\"}",
+        )
+        .unwrap();
+
+        clear_proxy_settings_at(&locations).unwrap();
+
+        assert_eq!(
+            fixture.settings().get(NO_PROXY_KEY),
+            Some(&Value::String("localhost".into())),
+            "a BOM must not silently discard the recorded noProxy"
         );
     }
 }
