@@ -1,0 +1,24 @@
+# Build configuration scoped to the cursor-bridge workspace.
+#
+# This file is directory-scoped: it applies only to cargo commands run inside
+# `sidecars/cursor-bridge/`, and never to the Tauri build under `src-tauri/`.
+# That separation is deliberate — the bridge has a heavy dependency graph
+# (hudsucker, rcgen, sqlx, prost, ...) and must not contend with the desktop
+# build for the same target directory.
+
+[build]
+# Isolated target directory. Override with CODERELAY_CURSOR_BRIDGE_TARGET_DIR
+# when the default location is not suitable.
+target-dir = "F:/target-cursor-bridge"
+
+# Source replacement for crates.io.
+#
+# Direct downloads from static.crates.io stall repeatedly on this network
+# (observed: ~11 minutes with negligible progress). The mirror below is
+# reachable and fast here. Remove this section to fall back to crates.io —
+# nothing in the source depends on the mirror.
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"

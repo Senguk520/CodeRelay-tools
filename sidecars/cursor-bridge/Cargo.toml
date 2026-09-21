@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "server",
+    "crates/semble-core",
+]
+resolver = "2"
+
+# Keep local Rust builds compact. Full dependency debug info and incremental
+# object caches dominate target/ in this workspace, while line tables for our
+# own crates are enough for normal backtraces and source-level debugging.
+[profile.dev]
+debug = 1
+incremental = false
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.test]
+debug = 1
+incremental = false
+
+[profile.test.package."*"]
+debug = 0
+
+# Release profile for the shipped sidecar binary: tuned for a small install
+# footprint because the binary is bundled into the CodeRelay installer.
+[profile.release]
+debug = 0
+incremental = false
+lto = "thin"
+strip = true
