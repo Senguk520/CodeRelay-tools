@@ -8,6 +8,7 @@ pub mod error;
 pub mod local_app;
 pub mod model;
 pub mod network;
+pub mod parent_monitor;
 pub mod provider;
 pub mod run;
 pub mod search;

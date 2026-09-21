@@ -501,6 +501,15 @@ fn start_process_locked(app: &AppHandle, inner: &Arc<CursorBridgeInner>) -> Resu
     command
         .env("CODERELAY_CURSOR_DATA_DIR", &data_dir)
         .env("CODERELAY_CURSOR_LISTEN_ADDR", &listen_addr)
+        // Hand the bridge our own pid so it can outlive-proof itself: if
+        // CodeRelay dies without running its exit hook (crash, Task Manager
+        // kill), the bridge notices the parent handle signalling and shuts down
+        // on its own. Without this an orphan keeps the SQLite file open and
+        // leaves Cursor pointing at an injection nobody can reach — and the
+        // next launch competes for the same database. Same contract as the Go
+        // relay sidecar.
+        .arg("--parent-pid")
+        .arg(std::process::id().to_string())
         .current_dir(&data_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

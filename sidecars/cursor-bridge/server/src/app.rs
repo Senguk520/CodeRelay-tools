@@ -123,6 +123,15 @@ impl App {
     async fn serve_bound(self, listener: TcpListener) -> Result<()> {
         let shutdown = CancellationToken::new();
         let signal_shutdown = shutdown.clone();
+        // A sidecar must not outlive CodeRelay. If the parent dies
+        // uncooperatively (crash, Task Manager kill, force-terminate), nothing
+        // calls our shutdown hook, so the watchdog is what turns that into a
+        // clean exit instead of an orphan holding the database file and Cursor's
+        // injected proxy settings.
+        if let Some(parent_pid) = self.config.parent_pid {
+            crate::parent_monitor::watch(parent_pid, shutdown.clone());
+        }
+        let parent_shutdown = shutdown.clone();
         let running = self.serve_on(listener, shutdown);
         tokio::pin!(running);
         tokio::select! {
@@ -130,6 +139,13 @@ impl App {
             () = shutdown_signal() => {
                 tracing::info!("shutdown signal received; cancelling active runs");
                 signal_shutdown.cancel();
+                running.await
+            }
+            () = parent_shutdown.cancelled() => {
+                // The watchdog has already logged why. Awaiting `running` lets
+                // `serve_on` run its graceful path, which disables the harness
+                // and reverts Cursor's settings before the process ends.
+                tracing::info!("shutdown requested by the parent watchdog");
                 running.await
             }
         }

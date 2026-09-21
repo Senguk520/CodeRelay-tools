@@ -60,6 +60,14 @@ pub struct Config {
     pub use_persisted_ports: bool,
     /// 面向用户的应用版本;桌面壳会覆盖为自身版本,用于插件 minAppVersion 门控。
     pub app_version: String,
+    /// PID of the process that spawned this bridge, from `--parent-pid`.
+    ///
+    /// `None` means "nobody asked us to watch a parent". When set, the bridge
+    /// shuts itself down if that process disappears, so a CodeRelay crash or a
+    /// Task Manager kill cannot leave an orphaned bridge holding the database
+    /// and the Cursor injection. Same flag and semantics as the Go relay
+    /// sidecar.
+    pub parent_pid: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -111,6 +119,7 @@ impl Config {
             console,
             use_persisted_ports: false,
             app_version: env!("CARGO_PKG_VERSION").into(),
+            parent_pid: parent_pid_from_args()?,
         })
     }
 
@@ -125,8 +134,53 @@ impl Config {
             console: None,
             use_persisted_ports: true,
             app_version: env!("CARGO_PKG_VERSION").into(),
+            parent_pid: parent_pid_from_args()?,
         })
     }
+}
+
+/// Reads `--parent-pid <pid>` from the command line.
+///
+/// Deliberately a hand-parsed scan rather than a CLI framework: the bridge takes
+/// exactly one optional argument beside the environment configuration, and
+/// adding a parser dependency to read one integer would be a poor trade. The
+/// flag name and the "absent means no watchdog" behaviour match
+/// `sidecars/coderelay-proxy`, which is the sidecar CodeRelay already spawns.
+///
+/// `--parent-pid` without a value, or with a value that is not a pid, is an
+/// error rather than a silent ignore: a typo would otherwise disable the
+/// watchdog without anyone noticing until an orphan showed up.
+fn parent_pid_from_args() -> Result<Option<u32>> {
+    parse_parent_pid(env::args_os().skip(1))
+}
+
+/// The testable half of [`parent_pid_from_args`].
+fn parse_parent_pid<I, S>(args: I) -> Result<Option<u32>>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString>,
+{
+    let mut args = args.into_iter().map(Into::into);
+    while let Some(argument) = args.next() {
+        let argument = argument.to_string_lossy().into_owned();
+        let value = match argument.strip_prefix("--parent-pid=") {
+            Some(inline) => inline.to_string(),
+            None if argument == "--parent-pid" => args
+                .next()
+                .map(|value| value.to_string_lossy().into_owned())
+                .ok_or_else(|| Error::Config("--parent-pid requires a value".into()))?,
+            None => continue,
+        };
+        let pid = value
+            .trim()
+            .parse::<u32>()
+            .map_err(|error| error_config("--parent-pid", error))?;
+        if pid == 0 {
+            return Err(Error::Config("--parent-pid must be a positive pid".into()));
+        }
+        return Ok(Some(pid));
+    }
+    Ok(None)
 }
 
 fn database_url_from_env() -> Result<String> {
@@ -173,5 +227,47 @@ mod tests {
             DEFAULT_PROVIDER_REQUEST_TIMEOUT,
             Duration::from_secs(60 * 60)
         );
+    }
+
+    #[test]
+    fn parent_pid_is_absent_unless_requested() {
+        // Absent means "no watchdog", which is what every existing caller that
+        // does not pass the flag must keep meaning.
+        assert_eq!(parse_parent_pid(Vec::<String>::new()).unwrap(), None);
+        assert_eq!(
+            parse_parent_pid(vec!["--other".to_string()]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn parent_pid_accepts_both_flag_spellings() {
+        assert_eq!(
+            parse_parent_pid(vec!["--parent-pid".to_string(), "4242".to_string()]).unwrap(),
+            Some(4242)
+        );
+        assert_eq!(
+            parse_parent_pid(vec!["--parent-pid=4242".to_string()]).unwrap(),
+            Some(4242)
+        );
+        // Order must not matter: the flag is scanned for, not positional.
+        assert_eq!(
+            parse_parent_pid(vec![
+                "--verbose".to_string(),
+                "--parent-pid".to_string(),
+                "7".to_string()
+            ])
+            .unwrap(),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn a_malformed_parent_pid_is_an_error_not_a_silent_ignore() {
+        // Silently dropping these would disable the orphan watchdog without
+        // anyone noticing until a stuck bridge showed up.
+        assert!(parse_parent_pid(vec!["--parent-pid".to_string()]).is_err());
+        assert!(parse_parent_pid(vec!["--parent-pid".to_string(), "abc".to_string()]).is_err());
+        assert!(parse_parent_pid(vec!["--parent-pid=0".to_string()]).is_err());
     }
 }
