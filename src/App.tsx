@@ -2,13 +2,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import {
-  Activity, AlertTriangle, Ban, CalendarCheck, CalendarDays, Check, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, Clipboard, Cloud,
+  Activity, AlertTriangle, Ban, Cable, CalendarCheck, CalendarDays, Check, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, Clipboard, Cloud,
   Copy, Database, Download, Eye, EyeOff, FileJson, Flame, FolderOpen, Gauge, Gift, Globe2, KeyRound,
   Layers3, LayoutDashboard, ListFilter, LockKeyhole, LogOut, Menu, Minus, MoreHorizontal,
-  MousePointer2, Network, Pause, Pencil, Play, Plus, RefreshCw, Search, Server, Settings2,
-  ShieldCheck, SlidersHorizontal, Sparkles, Square, Terminal, Trash2, Upload,
+  Network, Pause, Pencil, Play, Plus, RefreshCw, Search, Server, Settings2,
+  ShieldCheck, SlidersHorizontal, Sparkles, Square, Terminal, Trash2, Unplug, Upload,
   Users, X, Zap,
 } from 'lucide-react';
+// Cursor 标记位图。项目此前没有应用内图片资源（「CR」是纯 CSS 文字、应用图标只在
+// src-tauri/icons 供打包用），故采用 Vite 的默认约定：放 `src/assets/` 并由 ESM
+// 导入，交给构建做内容哈希。理由见文档 §23。
+import cursorMark from './assets/cursor-mark.png';
 import type { Account, ApiKey, AppState, CheckinResponse, CheckinStatusResponse, CursorBinding, CursorBridgePreferences, CursorBridgeStatus, DayStats, ModelInfo, OAuthCompleteResponse, PageId, RequestLog, ServiceConfig, ThemeMode, UpdateCheckResult } from './types';
 import { defaultCursorBridgePreferences, defaultCursorBridgeStatus, defaultState, emptyDayStats } from './types';
 import { applyTheme } from './theme';
@@ -24,10 +28,33 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 // 保持前端展示与打包版本一致，避免多处手动维护。
 const APP_VERSION = __APP_VERSION__;
 
-type NavItem = { id: PageId; label: string; icon: LucideIcon };
-type NavGroup = { id: string; label: string; icon: LucideIcon; items: NavItem[] };
+/** 图标入参：lucide 组件，或 `'cursor-mark'` 这个特殊标记（走 `CursorMark` 位图）。 */
+type IconInput = LucideIcon | 'cursor-mark';
+type NavItem = { id: PageId; label: string; icon: IconInput };
+type NavGroup = { id: string; label: string; icon: IconInput; items: NavItem[] };
 
 type NoticeHandler = (message: string) => void;
+
+/**
+ * Cursor 标记位图（`src/assets/cursor-mark.png`）。
+ *
+ * 素材是黑白灰的等距立体方块，原图同时含接近纯白与接近纯黑的面：直接用在浅色
+ * 主题下白面会融进背景，深色主题下黑面会融进背景。故按浅色主题把灰度整体压到
+ * 22–120，深色主题交给样式里的 `invert(1)` 翻到 135–233，两种主题下轮廓才都成立。
+ *
+ * 以位图而非 SVG：原始 SVG 是这张位图的自动描摹（31482 条 path、4.8 MB），
+ * 用 svgo 最强档也只压到 1.5 MB，且坐标是死色值、无法跟随 `currentColor`。
+ */
+function CursorMark({ size = 19 }: { size?: number }) {
+  return <img className="cursor-mark" src={cursorMark} width={size} height={size} alt="" aria-hidden="true" />;
+}
+
+/** 图标渲染：`'cursor-mark'` 走位图，其余按原样渲染 lucide 组件。 */
+function Glyph({ icon, size, strokeWidth }: { icon: IconInput; size: number; strokeWidth?: number }) {
+  if (icon === 'cursor-mark') return <CursorMark size={size} />;
+  const Icon = icon;
+  return <Icon size={size} strokeWidth={strokeWidth} />;
+}
 
 const navGroups: NavGroup[] = [
   { id: 'workspace', label: '工作台', icon: LayoutDashboard, items: [{ id: 'overview', label: '总览', icon: Gauge }] },
@@ -40,8 +67,8 @@ const navGroups: NavGroup[] = [
     { id: 'accounts', label: '账号池', icon: Users },
     { id: 'models', label: '模型管理', icon: Layers3 },
   ] },
-  { id: 'cursor', label: 'Cursor', icon: MousePointer2, items: [
-    { id: 'cursor', label: 'Cursor 服务', icon: MousePointer2 },
+  { id: 'cursor', label: 'Cursor', icon: 'cursor-mark', items: [
+    { id: 'cursor', label: 'Cursor 服务', icon: 'cursor-mark' },
   ] },
   { id: 'settings', label: '设置', icon: Settings2, items: [{ id: 'settings', label: '应用设置', icon: Settings2 }] },
 ];
@@ -168,8 +195,8 @@ function IconButton({ label, onClick, children, danger = false, disabled = false
 function SectionHeader({ eyebrow, title, description, action }: { eyebrow?: string; title: string; description?: string; action?: ReactNode }) {
   return <div className="section-header"><div><div className="eyebrow">{eyebrow}</div><h2>{title}</h2>{description && <p>{description}</p>}</div>{action}</div>;
 }
-function EmptyState({ icon: Icon, title, description, action }: { icon: LucideIcon; title: string; description: string; action?: ReactNode }) {
-  return <div className="empty-state"><span className="empty-icon"><Icon size={22} /></span><strong>{title}</strong><p>{description}</p>{action}</div>;
+function EmptyState({ icon, title, description, action }: { icon: IconInput; title: string; description: string; action?: ReactNode }) {
+  return <div className="empty-state"><span className="empty-icon"><Glyph icon={icon} size={22} /></span><strong>{title}</strong><p>{description}</p>{action}</div>;
 }
 
 export function App() {
@@ -394,11 +421,10 @@ export function App() {
       <div className="brand-mark" aria-label="CodeRelay">CR</div>
       <nav className="nav-rail">
         {navGroups.map((group) => {
-          const GroupIcon = group.icon;
           const active = group.items.some((item) => item.id === page);
           return <div key={group.id} className="nav-group-wrap" onMouseEnter={() => setOpenGroup(group.id)}>
-            <button className={`nav-icon ${active ? 'active' : ''}`} aria-label={group.label} aria-expanded={openGroup === group.id} onFocus={() => setOpenGroup(group.id)} onClick={() => setOpenGroup(openGroup === group.id ? '' : group.id)}><GroupIcon size={19} strokeWidth={1.8} /></button>
-            {openGroup === group.id && <div className="nav-popover" onMouseLeave={() => setOpenGroup('')}><div className="popover-label">{group.label}</div>{group.items.map((item) => { const ItemIcon = item.icon; return <button key={item.id} className={`nav-item ${page === item.id ? 'selected' : ''}`} onClick={() => { setPage(item.id); setOpenGroup(group.id); }}><ItemIcon size={16} /><span>{item.label}</span>{page === item.id && <Check size={14} />}</button>; })}</div>}
+            <button className={`nav-icon ${active ? 'active' : ''}`} aria-label={group.label} aria-expanded={openGroup === group.id} onFocus={() => setOpenGroup(group.id)} onClick={() => setOpenGroup(openGroup === group.id ? '' : group.id)}><Glyph icon={group.icon} size={19} strokeWidth={1.8} /></button>
+            {openGroup === group.id && <div className="nav-popover" onMouseLeave={() => setOpenGroup('')}><div className="popover-label">{group.label}</div>{group.items.map((item) => <button key={item.id} className={`nav-item ${page === item.id ? 'selected' : ''}`} onClick={() => { setPage(item.id); setOpenGroup(group.id); }}><Glyph icon={item.icon} size={16} /><span>{item.label}</span>{page === item.id && <Check size={14} />}</button>)}</div>}
           </div>;
         })}
       </nav>
@@ -1341,7 +1367,7 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
     <SectionHeader eyebrow="Cursor / 本地桥接" title="Cursor 服务" description="把 CodeRelay 的账号与模型接入 Cursor：由本地 sidecar 接管 Agent 请求并转发到反代服务。" action={header} />
 
     <div className="model-notice">
-      <MousePointer2 size={17} />
+      {status.running ? <Cable size={17} /> : <Unplug size={17} />}
       <div>
         <strong>{status.running ? `桥接运行中 · 端口 ${status.port ?? '—'}` : '桥接未运行'}</strong>
         <span>{status.running ? `已配置 ${status.configuredModels} 个模型供 Cursor 使用。` : '启动桥接后才能把模型同步给 Cursor。'}</span>
@@ -1383,7 +1409,7 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
           </button>
         </div>
       </div>
-      {loading ? <EmptyState icon={MousePointer2} title="正在读取桥接状态" description="请稍候。" /> : status.bindings.length ? <div className="data-table key-table">
+      {loading ? <EmptyState icon={Cable} title="正在读取桥接状态" description="请稍候。" /> : status.bindings.length ? <div className="data-table key-table">
         <div className="table-head"><span>显示名称</span><span>模型</span><span>绑定 Key</span><span>推理强度</span><span>备注</span><span /></div>
         {status.bindings.map((binding) => <div className="table-row" key={binding.id}>
           <div className="key-name"><span className="model-glyph"><Sparkles size={14} /></span><div><strong>{binding.displayName || binding.modelId}</strong><small>{binding.displayName ? binding.modelId : '未设置显示名称'}</small></div></div>
@@ -1397,7 +1423,7 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
           </div>
         </div>)}
       </div> : <EmptyState
-        icon={MousePointer2}
+        icon={Sparkles}
         title="还没有可供 Cursor 使用的模型"
         description={!status.running
           ? '先启动桥接，再把账号池里的 Key 与模型配对。'
@@ -1572,7 +1598,7 @@ function SettingsPage({ onReset, notify, updateInfo, updateError, checkingUpdate
   const update = (changes: Partial<typeof prefs>) => setPrefs((current) => ({ ...current, ...changes }));
   const changeTheme = (theme: ThemeMode) => { update({ theme }); applyTheme(theme); };
   const save = () => { localStorage.setItem('coderelay-preferences', JSON.stringify(prefs)); applyTheme(prefs.theme ?? 'system'); notify('应用设置已保存'); };
-  return <><SectionHeader eyebrow="应用 / 偏好" title="设置" description="调整 CodeRelay 的桌面行为、数据保留和隐私选项。" action={<button className="button primary" onClick={save}><Check size={15} />保存设置</button>} /><div className="settings-layout"><div className="settings-tabs">{([['general', '常规', Settings2], ['network', '网络', Network], ['cursor', 'Cursor', MousePointer2], ['data', '数据与隐私', Database], ['about', '关于', CircleHelp]] as Array<[typeof tab, string, LucideIcon]>).map(([id, label, Icon]) => <button key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)}><Icon size={16} />{label}</button>)}</div><div className="panel settings-panel">{tab === 'general' && <><div className="settings-section"><h3>启动行为</h3><Toggle label="启动时打开总览" description="软件启动后默认显示总览页。" checked={prefs.openOverview ?? true} onChange={(value) => update({ openOverview: value })} /><Toggle label="启动时自动刷新账号额度" description="启动后读取最近保存的账号并刷新配额。" checked={prefs.refreshAccounts ?? false} onChange={(value) => update({ refreshAccounts: value })} /><Toggle label="启动时检测更新" description="启动后静默查询 GitHub 最新发布，发现新版本时在侧边栏与总览页提示。" checked={prefs.autoCheckUpdate ?? false} onChange={(value) => update({ autoCheckUpdate: value })} /></div><div className="settings-section"><h3>外观</h3><Field label="主题模式" hint="选择后立即预览，点击“保存设置”持久化。"><div className="segmented theme-segmented"><button className={(prefs.theme ?? 'system') === 'system' ? 'active' : ''} onClick={() => changeTheme('system')}>跟随系统</button><button className={(prefs.theme ?? 'system') === 'light' ? 'active' : ''} onClick={() => changeTheme('light')}>浅色</button><button className={(prefs.theme ?? 'system') === 'dark' ? 'active' : ''} onClick={() => changeTheme('dark')}>深色</button></div></Field></div><div className="settings-section"><h3>关闭窗口</h3><Field label="服务运行时点击关闭" hint="此设置用于后续窗口关闭流程"><select value={prefs.closeBehavior ?? 'ask'} onChange={(e) => update({ closeBehavior: e.target.value })}><option value="ask">每次询问</option><option value="tray">最小化到系统托盘</option><option value="exit">停止服务后退出</option></select></Field></div></>}{tab === 'network' && <><div className="settings-section"><h3>网络安全</h3><p className="settings-note"><ShieldCheck size={15} />默认监听 localhost。局域网入口需要在“服务配置”中单独开启，所有请求仍需有效 API Key。</p></div><CertificateSection notify={notify} /></>}{tab === 'cursor' && <CursorSettingsSection notify={notify} />}{tab === 'data' && <div className="settings-section"><h3>本地数据</h3><Field label="请求日志保留时间"><select value={prefs.retention ?? '7'} onChange={(e) => update({ retention: e.target.value })}><option value="7">最近 7 天</option><option value="30">最近 30 天</option></select></Field><div className="danger-zone"><div><h3>重置浏览器预览数据</h3><p>仅清理当前 Web 预览中的本地状态，不会删除桌面端凭据文件。</p></div><button className="button danger-button" onClick={onReset}><Trash2 size={15} />重置数据</button></div></div>}{tab === 'about' && <div className="about-block"><div className="about-logo">CR</div><h3>CodeRelay</h3><p>面向高级用户的 CodeBuddy CN 账号池和本地 OpenAI 兼容反代管理工具。</p><div className="about-meta"><span>版本 {APP_VERSION}</span><span>Windows 桌面端</span><span>本地优先</span></div><div className="update-check"><div className="update-check-row"><button className="button ghost" onClick={onCheckUpdate} disabled={checkingUpdate}><RefreshCw size={15} className={checkingUpdate ? 'spin' : ''} />{checkingUpdate ? '检测中…' : '检测更新'}</button>{updateInfo && <span className={`update-status ${updateInfo.hasUpdate ? 'has-update' : 'up-to-date'}`}>{updateInfo.hasUpdate ? <><Sparkles size={13} />发现新版本 {updateInfo.latestVersion}</> : <><Check size={13} />已是最新版本 {updateInfo.currentVersion}</>}</span>}{!updateInfo && !checkingUpdate && !updateError && <span className="update-status muted">尚未检测</span>}{updateError && <span className="update-status failed"><AlertTriangle size={13} />检测失败</span>}</div>{updateError && <p className="update-hint">{updateError}</p>}{updateInfo?.hasUpdate && <div className="update-actions"><button className="button primary" onClick={onShowUpdate}><Download size={15} />查看更新详情</button><button className="button ghost" onClick={() => { void openExternal(updateInfo.releaseUrl); }}><Globe2 size={15} />打开发布页</button></div>}{updateInfo && !updateInfo.hasUpdate && <p className="update-hint">当前版本 {updateInfo.currentVersion} 已经是 GitHub 上发布的最新版本。</p>}</div><button className="inline-link" onClick={() => notify('第三方组件许可见项目根目录 NOTICE.md')}>查看第三方许可 <span>→</span></button></div>}</div></div></>;
+  return <><SectionHeader eyebrow="应用 / 偏好" title="设置" description="调整 CodeRelay 的桌面行为、数据保留和隐私选项。" action={<button className="button primary compact" onClick={save}><Check size={14} />保存设置</button>} /><div className="settings-layout"><div className="settings-tabs">{([['general', '常规', Settings2], ['network', '网络', Network], ['cursor', 'Cursor', 'cursor-mark'], ['data', '数据与隐私', Database], ['about', '关于', CircleHelp]] as Array<[typeof tab, string, IconInput]>).map(([id, label, Icon]) => <button key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)}><Glyph icon={Icon} size={16} />{label}</button>)}</div><div className="panel settings-panel">{tab === 'general' && <><div className="settings-section"><h3>启动行为</h3><Toggle label="启动时打开总览" description="软件启动后默认显示总览页。" checked={prefs.openOverview ?? true} onChange={(value) => update({ openOverview: value })} /><Toggle label="启动时自动刷新账号额度" description="启动后读取最近保存的账号并刷新配额。" checked={prefs.refreshAccounts ?? false} onChange={(value) => update({ refreshAccounts: value })} /><Toggle label="启动时检测更新" description="启动后静默查询 GitHub 最新发布，发现新版本时在侧边栏与总览页提示。" checked={prefs.autoCheckUpdate ?? false} onChange={(value) => update({ autoCheckUpdate: value })} /></div><div className="settings-section"><h3>外观</h3><Field label="主题模式" hint="选择后立即预览，点击“保存设置”持久化。"><div className="segmented theme-segmented"><button className={(prefs.theme ?? 'system') === 'system' ? 'active' : ''} onClick={() => changeTheme('system')}>跟随系统</button><button className={(prefs.theme ?? 'system') === 'light' ? 'active' : ''} onClick={() => changeTheme('light')}>浅色</button><button className={(prefs.theme ?? 'system') === 'dark' ? 'active' : ''} onClick={() => changeTheme('dark')}>深色</button></div></Field></div><div className="settings-section"><h3>关闭窗口</h3><Field label="服务运行时点击关闭" hint="此设置用于后续窗口关闭流程"><select value={prefs.closeBehavior ?? 'ask'} onChange={(e) => update({ closeBehavior: e.target.value })}><option value="ask">每次询问</option><option value="tray">最小化到系统托盘</option><option value="exit">停止服务后退出</option></select></Field></div></>}{tab === 'network' && <><div className="settings-section"><h3>网络安全</h3><p className="settings-note"><ShieldCheck size={15} />默认监听 localhost。局域网入口需要在“服务配置”中单独开启，所有请求仍需有效 API Key。</p></div><CertificateSection notify={notify} /></>}{tab === 'cursor' && <CursorSettingsSection notify={notify} />}{tab === 'data' && <div className="settings-section"><h3>本地数据</h3><Field label="请求日志保留时间"><select value={prefs.retention ?? '7'} onChange={(e) => update({ retention: e.target.value })}><option value="7">最近 7 天</option><option value="30">最近 30 天</option></select></Field><div className="danger-zone"><div><h3>重置浏览器预览数据</h3><p>仅清理当前 Web 预览中的本地状态，不会删除桌面端凭据文件。</p></div><button className="button danger-button compact" onClick={onReset}><Trash2 size={14} />重置数据</button></div></div>}{tab === 'about' && <div className="about-block"><div className="about-logo">CR</div><h3>CodeRelay</h3><p>面向高级用户的 CodeBuddy CN 账号池和本地 OpenAI 兼容反代管理工具。</p><div className="about-meta"><span>版本 {APP_VERSION}</span><span>Windows 桌面端</span><span>本地优先</span></div><div className="update-check"><div className="update-check-row"><button className="button ghost compact" onClick={onCheckUpdate} disabled={checkingUpdate}><RefreshCw size={14} className={checkingUpdate ? 'spin' : ''} />{checkingUpdate ? '检测中…' : '检测更新'}</button>{updateInfo && <span className={`update-status ${updateInfo.hasUpdate ? 'has-update' : 'up-to-date'}`}>{updateInfo.hasUpdate ? <><Sparkles size={13} />发现新版本 {updateInfo.latestVersion}</> : <><Check size={13} />已是最新版本 {updateInfo.currentVersion}</>}</span>}{!updateInfo && !checkingUpdate && !updateError && <span className="update-status muted">尚未检测</span>}{updateError && <span className="update-status failed"><AlertTriangle size={13} />检测失败</span>}</div>{updateError && <p className="update-hint">{updateError}</p>}{updateInfo?.hasUpdate && <div className="update-actions"><button className="button primary compact" onClick={onShowUpdate}><Download size={14} />查看更新详情</button><button className="button ghost compact" onClick={() => { void openExternal(updateInfo.releaseUrl); }}><Globe2 size={14} />打开发布页</button></div>}{updateInfo && !updateInfo.hasUpdate && <p className="update-hint">当前版本 {updateInfo.currentVersion} 已经是 GitHub 上发布的最新版本。</p>}</div><button className="inline-link" onClick={() => notify('第三方组件许可见项目根目录 NOTICE.md')}>查看第三方许可 <span>→</span></button></div>}</div></div></>;
 }
 
 /**
@@ -1632,23 +1658,23 @@ function CertificateSection({ notify }: { notify: NoticeHandler }) {
       <StatusPill tone={tone}>{loading ? '读取中…' : caLabel}</StatusPill>
     </div>
     <div className="form-actions" style={{ justifyContent: 'flex-start', marginTop: 16 }}>
-      <button className="button ghost" disabled={busy || !status.running} onClick={() => { void initialize(); }}>
-        <ShieldCheck size={15} />{busy ? '生成中…' : status.ca === 'missing' ? '生成根证书' : '重新生成根证书'}
+      <button className="button ghost compact" disabled={busy || !status.running} onClick={() => { void initialize(); }}>
+        <ShieldCheck size={14} />{busy ? '生成中…' : status.ca === 'missing' ? '生成根证书' : '重新生成根证书'}
       </button>
-      {!status.running && <span className="save-hint">桥接未运行，请先在「Cursor 服务」页启动桥接。</span>}
+      {!status.running && <span className="save-hint">桥接未运行：安装命令由桥接生成（含实际证书路径），请先在「Cursor 服务」页启动桥接。</span>}
     </div>
     {command && <>
       <p className="settings-note"><Terminal size={15} />在终端中执行（Windows 写入当前用户信任库，无需管理员；macOS/Linux 需 sudo）：</p>
       <pre className="code-block">{command}</pre>
       <div className="form-actions" style={{ justifyContent: 'flex-start' }}>
-        <button className="button ghost" onClick={() => { void copyText(command).then(() => notify('安装命令已复制')); }}><Copy size={15} />复制命令</button>
+        <button className="button ghost compact" onClick={() => { void copyText(command).then(() => notify('安装命令已复制')); }}><Copy size={14} />复制命令</button>
       </div>
     </>}
     {status.uninstallCommand && <>
       <p className="settings-note"><ShieldCheck size={15} />不再需要接管时，用下面的命令把根证书从信任库中撤下。信任不该是单向门：留着它，这张证书会一直在这台机器上被信任。</p>
       <pre className="code-block">{status.uninstallCommand}</pre>
       <div className="form-actions" style={{ justifyContent: 'flex-start' }}>
-        <button className="button ghost" onClick={() => { void copyText(status.uninstallCommand!).then(() => notify('卸载命令已复制')); }}><Copy size={15} />复制卸载命令</button>
+        <button className="button ghost compact" onClick={() => { void copyText(status.uninstallCommand!).then(() => notify('卸载命令已复制')); }}><Copy size={14} />复制卸载命令</button>
       </div>
     </>}
   </div>;
@@ -1758,8 +1784,8 @@ function CursorSettingsSection({ notify }: { notify: NoticeHandler }) {
         </select>
       </Field>
       <div className="form-actions" style={{ justifyContent: 'flex-start', marginTop: 12 }}>
-        <button className="button ghost" onClick={() => setShowPromptModal(true)}><Pencil size={15} />编辑提示词</button>
-        <button className="button ghost" onClick={() => update({ commitPrompt: '' })}><RefreshCw size={15} />恢复默认</button>
+        <button className="button ghost compact" onClick={() => setShowPromptModal(true)}><Pencil size={14} />编辑提示词</button>
+        <button className="button ghost compact" onClick={() => update({ commitPrompt: '' })}><RefreshCw size={14} />恢复默认</button>
         <span className="save-hint">{draft.commitPrompt ? '使用自定义提示词' : '使用内置提示词'}</span>
       </div>
       {!status.models.length && <p className="settings-note"><AlertTriangle size={15} />暂无可选模型：请先在「Cursor 服务」页启动桥接并添加模型绑定。</p>}
@@ -1767,7 +1793,7 @@ function CursorSettingsSection({ notify }: { notify: NoticeHandler }) {
 
     <div className="form-actions">
       <span className="save-hint">当前 Commit 模型：{commitLabel(draft.commitModelId)}</span>
-      <button className="button primary" disabled={busy} onClick={() => { void save(); }}><Check size={15} />{busy ? '保存中…' : '保存 Cursor 设置'}</button>
+      <button className="button primary compact" disabled={busy} onClick={() => { void save(); }}><Check size={14} />{busy ? '保存中…' : '保存 Cursor 设置'}</button>
     </div>
 
     {showPromptModal && <Modal title="Commit 提示词" onClose={() => setShowPromptModal(false)} wide>
