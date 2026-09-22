@@ -77,7 +77,7 @@ async fn generate_local(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
     tracing::info!(?connect_timeout_ms, "write git commit message received");
-    let body = to_bytes(body, usize::MAX)
+    let body = to_bytes(body, crate::limits::MAX_REQUEST_BODY_BYTES)
         .await
         .map_err(|error| Error::Protocol(format!("cannot read request body: {error}")))?;
     let request: ai::WriteGitCommitMessageRequest = connect::decode_unary(&body)?;

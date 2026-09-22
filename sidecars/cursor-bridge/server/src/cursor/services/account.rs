@@ -378,7 +378,7 @@ async fn local_or_forward(
 }
 
 async fn consume_body(request: Request<Body>) -> Result<()> {
-    to_bytes(request.into_body(), usize::MAX)
+    to_bytes(request.into_body(), crate::limits::MAX_REQUEST_BODY_BYTES)
         .await
         .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
     Ok(())

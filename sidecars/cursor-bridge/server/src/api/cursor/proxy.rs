@@ -141,7 +141,7 @@ pub async fn forward_buffered(
         header::ACCEPT_ENCODING,
         axum::http::HeaderValue::from_static("identity"),
     );
-    let body = to_bytes(body, usize::MAX)
+    let body = to_bytes(body, crate::limits::MAX_REQUEST_BODY_BYTES)
         .await
         .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
     let upstream = proxy

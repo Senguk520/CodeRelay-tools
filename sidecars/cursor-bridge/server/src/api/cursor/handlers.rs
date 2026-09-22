@@ -6,7 +6,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use tower_http::decompression::RequestDecompressionLayer;
+use tower_http::{
+    decompression::RequestDecompressionLayer, limit::RequestBodyLimitLayer,
+};
 
 use crate::{
     api::cursor::{
@@ -155,8 +157,23 @@ fn router_with_proxy(
         )
         .route("/auth/full_stripe_profile", get(account::stripe_profile))
         .route("/auth/stripe_profile", get(account::stripe_profile))
-        .route_layer(DefaultBodyLimit::disable())
+        // Three layers, outermost first (`route_layer` runs last-added first):
+        //
+        // 1. `RequestBodyLimitLayer` caps the **compressed** body before
+        //    `Content-Encoding` is undone, so a hostile client cannot stream an
+        //    unbounded amount into the process.
+        // 2. `RequestDecompressionLayer` undoes the encoding.
+        // 3. `DefaultBodyLimit::max` caps the **decompressed** body a handler
+        //    buffers. This is the one that stops a decompression bomb: a few KB
+        //    of gzip can expand far past the compressed cap.
+        //
+        // `DefaultBodyLimit::disable()` used to be here, which left the decoded
+        // read bounded only by `usize::MAX` in each handler.
+        .route_layer(DefaultBodyLimit::max(crate::limits::MAX_REQUEST_BODY_BYTES))
         .route_layer(RequestDecompressionLayer::new())
+        .route_layer(RequestBodyLimitLayer::new(
+            crate::limits::MAX_COMPRESSED_BODY_BYTES,
+        ))
         .fallback(proxy::forward)
         .method_not_allowed_fallback(proxy::forward)
         .layer(Extension(proxy))
@@ -358,7 +375,7 @@ fn trace_outcome(
 
 async fn buffered(request: Request<Body>) -> Result<(axum::http::request::Parts, Bytes)> {
     let (parts, body) = request.into_parts();
-    let body = to_bytes(body, usize::MAX)
+    let body = to_bytes(body, crate::limits::MAX_REQUEST_BODY_BYTES)
         .await
         .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
     Ok((parts, body))

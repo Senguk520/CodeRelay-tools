@@ -80,7 +80,9 @@ async fn proxy_frontend(
             upstream = upstream.header(name, value);
         }
     }
-    let body = match to_bytes(body, 64 * 1024 * 1024).await {
+    // The dev-server proxy streams a body through, so it gets the decoded-size
+    // cap rather than `usize::MAX`.
+    let body = match to_bytes(body, crate::limits::MAX_REQUEST_BODY_BYTES).await {
         Ok(body) => body,
         Err(error) => return proxy_error(error),
     };

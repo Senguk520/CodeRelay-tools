@@ -23,7 +23,11 @@ const RUNTIME_DIR: &str = "sidecar-runtime";
 // 程序清理运行目录时必须保留它：否则每次重启都要靠一次性的后端同步兜底，单次失败
 // 就会让模型目录退化成只剩 auto + codex-auto-review。该文件不含任何凭据。
 const RUNTIME_MODEL_CACHE_FILE: &str = "codebuddy_models_cache.json";
-pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Budget for the relay sidecar's first `ready` line. The cursor-bridge sidecar
+/// deliberately does **not** reuse this value: its startup path is SQLite plus
+/// nine migrations, so it defines a wider budget of its own
+/// (`cursor_bridge::BRIDGE_READY_TIMEOUT`).
+const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_PENDING_REQUESTS: usize = 4096;
 const MAX_STDERR_BYTES: usize = 16 * 1024;
 const STATE_CHANGED_EVENT: &str = "coderelay-state-changed";
@@ -719,9 +723,6 @@ fn lan_base_url_for_state(state: &AppState, inner: &Arc<RuntimeInner>) -> Option
 /// `state.json` 并被误当成配置。这里只处理传值进来的克隆。
 fn with_derived_fields(mut state: AppState, inner: &Arc<RuntimeInner>) -> AppState {
     state.lan_base_url = lan_base_url_for_state(&state, inner);
-    // cursor-bridge 端口来自进程全局量（bridge 的 ready 行上报的真实端口），
-    // 不经过 RuntimeInner，因此这里直接取。它是纯派生值，永不落盘。
-    state.cursor_bridge_port = crate::cursor_bridge::current_port();
     state
 }
 

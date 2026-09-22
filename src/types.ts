@@ -166,11 +166,6 @@ export interface AppState {
    * 也不会写进 state.json。
    */
   lanBaseUrl: string | null;
-  /**
-   * 只读派生值：cursor-bridge sidecar 当前监听的端口；bridge 未运行时为 null。
-   * 与 lanBaseUrl 同样不参与持久化，也不会写进 state.json。
-   */
-  cursorBridgePort: number | null;
 }
 
 /**
@@ -223,7 +218,6 @@ export interface CursorBridgeStatus {
   ca: string;
   /** disabled / enabled / degraded / unknown。 */
   integration: string;
-  settingsApplied: boolean;
   /**
    * 用户显式开启注入的意图，由 CodeRelay 侧持久化并在重启后据此重新挂载。
    *
@@ -278,7 +272,6 @@ export const defaultCursorBridgeStatus: CursorBridgeStatus = {
   port: null,
   ca: 'unknown',
   integration: 'unknown',
-  settingsApplied: false,
   takeoverRequested: false,
   configuredModels: 0,
   models: [],
@@ -377,6 +370,4 @@ export const defaultState: AppState = {
   lastError: null,
   // 派生值：预览模式（无 Tauri）下没有真实网卡，保持空；正式运行时由后端下发。
   lanBaseUrl: null,
-  // 派生值：预览模式没有 cursor-bridge 进程，恒为 null。
-  cursorBridgePort: null,
 };

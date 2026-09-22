@@ -299,7 +299,14 @@ export function App() {
       setBusy(null);
     }
   };
-  const notify: NoticeHandler = (message) => { setError(null); setNotice(message); };
+  // Stable identity on purpose: the section components depend on `notify` inside
+  // their own `useCallback` dependency lists, so a fresh function on every parent
+  // render makes their `load` callbacks — and the effects that run them —
+  // re-execute on every render. `setError`/`setNotice` are stable, so this
+  // callback never changes. Without this, simply living on the Cursor page meant
+  // a full `cursor_bridge_status` re-run (up to five control HTTP calls, and a
+  // write path when drift is detected) on any unrelated state change.
+  const notify: NoticeHandler = useCallback((message) => { setError(null); setNotice(message); }, []);
 
   const handleRefreshAccount = async (account: Account) => {
     try {
@@ -1416,6 +1423,7 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
       binding={editingBinding}
       keys={enabledKeys}
       models={models}
+      siblings={status.bindings}
       onClose={() => { setShowBindingModal(false); setEditingBinding(null); }}
       onSave={(binding) => {
         const exists = status.bindings.some((item) => item.id === binding.id);
@@ -1450,10 +1458,12 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
  * Key 与 Model 均为纯下拉选择，没有自由文本输入：绑定只允许指向已经存在的
  * Key 与模型，任何需要手填 URL 的设计都会让端口漂移与鉴权错误无从排查。
  */
-function CursorBindingModal({ binding, keys, models, onClose, onSave }: {
+function CursorBindingModal({ binding, keys, models, siblings, onClose, onSave }: {
   binding: CursorBinding | null;
   keys: ApiKey[];
   models: ModelInfo[];
+  /** 已保存的其他绑定，用于在提交前就地发现重名。 */
+  siblings: CursorBinding[];
   onClose: () => void;
   onSave: (binding: CursorBinding) => void;
 }) {
@@ -1479,6 +1489,15 @@ function CursorBindingModal({ binding, keys, models, onClose, onSave }: {
   const submit = () => {
     if (!keyId) { setError('请选择一个 API Key。'); return; }
     if (!modelId) { setError('请选择一个模型。'); return; }
+    // 提前在本弹窗里发现重名。后端也做同样的校验（它才是权威），但那里报错时弹窗
+    // 已经关闭、用户得重填一遍表单；在这里拦下能把问题直接落在出错的字段上。
+    // 与后端一致：显示名留空时回落为模型 id，所以「都留空」与「都填同一个值」等价。
+    const effectiveName = displayName.trim() || modelId;
+    const clash = siblings.some((item) => item.id !== (binding?.id ?? '') && item.keyId === keyId && item.modelId === modelId && (item.displayName.trim() || item.modelId) === effectiveName);
+    if (clash) {
+      setError(`已有一条使用相同 Key、模型与显示名称「${effectiveName}」的绑定。这样的两条绑定会在 Cursor 中重名而无法同步，请改掉显示名称。`);
+      return;
+    }
     let contextWindowTokens: number | null = null;
     let maxOutputTokens: number | null = null;
     try {
@@ -1519,7 +1538,7 @@ function CursorBindingModal({ binding, keys, models, onClose, onSave }: {
     });
   };
 
-  return <Modal title={binding ? '编辑绑定' : '添加账号'} onClose={onClose} wide>
+  return <Modal title={binding ? '编辑绑定' : '添加绑定'} onClose={onClose} wide>
     <div className="form-grid">
       <Field label="API Key" hint="仅列出已启用的 Key。">
         <select value={keyId} onChange={(event) => setKeyId(event.target.value)}>
@@ -1713,7 +1732,7 @@ function CursorSettingsSection({ notify }: { notify: NoticeHandler }) {
         <Field label="桥接服务端口" hint="0 表示由系统自动分配；改动后需重启桥接生效。">
           <input type="number" min={0} max={65535} value={draft.servicePort} onChange={(e) => update({ servicePort: Number(e.target.value) })} />
         </Field>
-        <Field label="代理端口" hint="本地 MITM 代理监听端口；0 表示由系统自动分配。">
+        <Field label="代理端口" hint="本地 MITM 代理监听端口；0 表示由系统自动分配。注入已开启时改动需先关注入再重新开启才会生效。">
           <input type="number" min={0} max={65535} value={draft.proxyPort} onChange={(e) => update({ proxyPort: Number(e.target.value) })} />
         </Field>
       </div>

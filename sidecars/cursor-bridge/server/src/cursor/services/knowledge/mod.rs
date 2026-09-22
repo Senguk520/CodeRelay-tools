@@ -327,7 +327,7 @@ pub async fn remove(
 
 async fn buffered(request: Request<Body>) -> Result<(axum::http::request::Parts, Bytes)> {
     let (parts, body) = request.into_parts();
-    let body = to_bytes(body, usize::MAX)
+    let body = to_bytes(body, crate::limits::MAX_REQUEST_BODY_BYTES)
         .await
         .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
     Ok((parts, body))

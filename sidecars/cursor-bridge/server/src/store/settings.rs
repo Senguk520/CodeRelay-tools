@@ -15,10 +15,19 @@ const CURSOR_TAKEOVER_ENABLED_KEY: &str = "cursor_takeover_enabled";
 pub const DEFAULT_COMMIT_PROMPT_ZH_CN: &str = include_str!("../../prompt/cursor/commit/zh-CN.md");
 pub const DEFAULT_COMMIT_PROMPT_EN_US: &str = include_str!("../../prompt/cursor/commit/en-US.md");
 
+/// The port rows the control API exposes.
+///
+/// `service_port` used to live here, written by CodeRelay and read back by
+/// upstream's `use_persisted_ports` path — but nothing in this build ever read
+/// it (see `config.rs`: the persisted-port mode was removed). Keeping it made a
+/// value look live when it was not: the UI's "桥接服务端口" preference is applied
+/// by CodeRelay restarting the bridge with a new `CODERELAY_CURSOR_LISTEN_ADDR`,
+/// and the port actually bound comes back on the `ready` line. It is deliberately
+/// not stored here.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(default)]
 pub struct PortSettings {
     pub proxy_port: u16,
-    pub service_port: u16,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -305,12 +314,6 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    pub async fn set_service_port(&self, port: u16) -> Result<()> {
-        let mut settings = self.port_settings().await?;
-        settings.service_port = port;
-        self.set_port_settings(settings).await
     }
 
     pub async fn set_proxy_port(&self, port: u16) -> Result<()> {

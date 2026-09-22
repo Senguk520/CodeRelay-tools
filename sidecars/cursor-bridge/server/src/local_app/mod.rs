@@ -53,7 +53,6 @@ pub struct CursorHarnessStatus {
     pub platform: &'static str,
     pub ca: CaState,
     pub configured_models: usize,
-    pub enabled_models: usize,
     pub integration: IntegrationState,
     pub settings_applied: bool,
     pub proxy_url: Option<String>,
@@ -134,7 +133,6 @@ impl CursorHarness {
     pub async fn status(&self) -> Result<CursorHarnessStatus> {
         let models = self.inner.store.models().await?;
         let configured_models = models.len();
-        let enabled_models = configured_models;
         let ca = self.inner.ca.state()?;
         let proxy = self.inner.proxy.lock().await;
         let proxy_url = proxy.url();
@@ -152,7 +150,6 @@ impl CursorHarness {
             platform: std::env::consts::OS,
             ca,
             configured_models,
-            enabled_models,
             integration,
             settings_applied,
             proxy_url,

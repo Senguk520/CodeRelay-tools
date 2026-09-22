@@ -5,6 +5,7 @@ pub mod config;
 pub mod control;
 pub mod cursor;
 pub mod error;
+pub mod limits;
 pub mod local_app;
 pub mod model;
 pub mod network;

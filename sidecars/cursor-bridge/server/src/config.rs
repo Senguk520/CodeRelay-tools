@@ -189,12 +189,22 @@ pub struct ProviderConfig {
 
 #[derive(Clone)]
 pub struct Config {
+    /// The address the service binds, from `CODERELAY_CURSOR_LISTEN_ADDR`.
+    ///
+    /// There is deliberately **no** persisted-port mode. Upstream has a
+    /// `Config::desktop()` that read the port back from the settings table and
+    /// a `use_persisted_ports` switch gating it, but nothing in this build ever
+    /// turned it on: CodeRelay always passes an explicit
+    /// `CODERELAY_CURSOR_LISTEN_ADDR` (its own preferences are the source of
+    /// truth for the port) and reads the port the bridge actually bound from
+    /// the `ready` line. Keeping the switch would advertise a second, never
+    /// executed port-resolution path, so it was removed rather than left
+    /// looking live.
     pub listen_addr: SocketAddr,
     pub database_url: String,
     pub provider_request_timeout: Duration,
     pub provider_stream_idle_timeout: Duration,
     pub console: Option<ConsoleSource>,
-    pub use_persisted_ports: bool,
     /// 面向用户的应用版本;桌面壳会覆盖为自身版本,用于插件 minAppVersion 门控。
     pub app_version: String,
     /// PID of the process that spawned this bridge, from `--parent-pid`.
@@ -263,23 +273,6 @@ impl Config {
             provider_request_timeout: request_timeout,
             provider_stream_idle_timeout: DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT,
             console,
-            use_persisted_ports: false,
-            app_version: env!("CARGO_PKG_VERSION").into(),
-            parent_pid: parent_pid_from_args()?,
-            control_token: control_token_from_env(),
-        })
-    }
-
-    pub fn desktop() -> Result<Self> {
-        Ok(Self {
-            listen_addr: "127.0.0.1:0"
-                .parse()
-                .expect("desktop listen address is static"),
-            database_url: default_database_url()?,
-            provider_request_timeout: DEFAULT_PROVIDER_REQUEST_TIMEOUT,
-            provider_stream_idle_timeout: DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT,
-            console: None,
-            use_persisted_ports: true,
             app_version: env!("CARGO_PKG_VERSION").into(),
             parent_pid: parent_pid_from_args()?,
             control_token: control_token_from_env(),

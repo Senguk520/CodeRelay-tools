@@ -17,7 +17,7 @@
 //!   would show up twice in Cursor's picker.
 use crate::gateway::{
     app_data_dir, app_state_snapshot, atomic_write, load_json, spawn_stderr_reader,
-    terminate_child_tree, StartupLatch, StartupResult, READY_TIMEOUT,
+    terminate_child_tree, StartupLatch, StartupResult,
 };
 use crate::models::AppState;
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -49,6 +49,17 @@ const CONTROL_TOKEN_ENV: &str = "CODERELAY_CURSOR_CONTROL_TOKEN";
 /// CA generation is CPU-bound and enabling takeover may terminate Cursor, so
 /// those two calls get a much longer budget than a plain status read.
 const SLOW_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+/// Budget for the bridge's first `ready` line.
+///
+/// Deliberately far wider than the relay sidecar's 15s. The bridge prints ready
+/// only after SQLite connects and all nine migrations have run — including the
+/// whole-table rebuild in `0007` — so on a first launch, or with an antivirus
+/// scanning the freshly written binary, 15s is a race rather than a startup
+/// budget. The relay is a single Go binary with a short startup path and keeps
+/// the tighter value; the two budgets are not comparable. A timeout here reads
+/// as "the bridge failed to start" when the truth is only "the migrations were
+/// still running", which sends the user looking in the wrong place.
+const BRIDGE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Port the bridge is listening on, or 0 when it is not running.
 ///
@@ -77,8 +88,13 @@ fn control_token() -> &'static str {
     CONTROL_TOKEN.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
 }
 
-/// `Some(port)` while the bridge is serving; the value placed on the read-only
-/// `AppState::cursor_bridge_port` derived field.
+/// `Some(port)` while the bridge is serving.
+///
+/// Used internally (the control calls and the start/stop paths all need the live
+/// port). It is deliberately **not** exposed as a derived field on the returned
+/// `AppState`: that mirror was written on every `get_app_state` and never read by
+/// the frontend, so it was pure cost plus a second place for the port to look
+/// authoritative from. The frontend reads the port from the bridge status.
 pub(crate) fn current_port() -> Option<u16> {
     match BRIDGE_PORT.load(Ordering::SeqCst) {
         0 => None,
@@ -100,6 +116,7 @@ impl CursorBridgeState {
                 lifecycle: Mutex::new(()),
                 generation: AtomicU64::new(0),
                 config: Mutex::new(CursorBridgeConfig::default()),
+                preferences_apply_failed: AtomicBool::new(false),
             }),
         }
     }
@@ -116,6 +133,17 @@ struct CursorBridgeInner {
     lifecycle: Mutex<()>,
     generation: AtomicU64,
     config: Mutex<CursorBridgeConfig>,
+    /// Whether the last attempt to push preferences onto the bridge failed.
+    ///
+    /// `apply_preferences` is a one-shot fire-and-forget call, so without a
+    /// record of its failure a transient error (timeout, bridge busy) would leave
+    /// the persisted config and the bridge's own rows disagreeing forever, with
+    /// no path back except the user re-saving. This flag is the path back: it
+    /// makes the next status read re-apply the preferences. It is a flag rather
+    /// than a drift probe on purpose — a probe would add three control HTTP calls
+    /// to every status read, which is exactly the cost `reconcile_if_drifted`
+    /// avoids for models. Healthy operation pays nothing here.
+    preferences_apply_failed: AtomicBool,
 }
 
 fn locked<'a, T>(mutex: &'a Mutex<T>, name: &str) -> Result<MutexGuard<'a, T>, String> {
@@ -237,6 +265,22 @@ fn save_config(app: &AppHandle, config: &CursorBridgeConfig) -> Result<(), Strin
     atomic_write(&config_path(app)?, &data)
 }
 
+/// `save_config` on a blocking thread.
+///
+/// `atomic_write` fsyncs and renames, which is blocking IO; running it directly
+/// in a `#[tauri::command]` puts it on a Tokio worker that is also driving the
+/// bridge's control HTTP calls. The file is small, so this is a convention
+/// matter rather than a bug fix — but `cursor_bridge_start`/`stop` already use
+/// `spawn_blocking` for exactly this, and three commands doing it the other way
+/// is how the next reader concludes both are fine.
+async fn save_config_async(app: &AppHandle, config: &CursorBridgeConfig) -> Result<(), String> {
+    let app = app.clone();
+    let config = config.clone();
+    tauri::async_runtime::spawn_blocking(move || save_config(&app, &config))
+        .await
+        .map_err(|error| format!("保存 Cursor 桥接配置任务执行失败：{error}"))?
+}
+
 // ---------------------------------------------------------------------------
 // Status reported to the frontend
 // ---------------------------------------------------------------------------
@@ -261,8 +305,12 @@ pub struct CursorBridgeStatus {
     /// bridge is unreachable.
     pub ca: String,
     /// `disabled` / `enabled` / `degraded` / `unknown`.
+    ///
+    /// This is the field the UI keys off. The bridge's raw `settings_applied`
+    /// flag is deliberately **not** mirrored onto this struct: it was carried
+    /// across for a while and never consumed, so it was a second copy of a value
+    /// already folded into `integration` and named nowhere.
     pub integration: String,
-    pub settings_applied: bool,
     /// The user's persisted intent to inject, as recorded by CodeRelay.
     ///
     /// Distinct from `integration`, which is what the bridge reports about
@@ -630,7 +678,7 @@ fn start_process_locked(app: &AppHandle, inner: &Arc<CursorBridgeInner>) -> Resu
         thread::spawn(move || read_stdout_loop(stdout, inner, startup, generation));
     }
 
-    match startup.wait(READY_TIMEOUT) {
+    match startup.wait(BRIDGE_READY_TIMEOUT) {
         Some(StartupResult::Ready { port }) => Ok(port),
         Some(StartupResult::Failed(error)) => {
             stop_process_locked(inner);
@@ -643,7 +691,7 @@ fn start_process_locked(app: &AppHandle, inner: &Arc<CursorBridgeInner>) -> Resu
                 .trim()
                 .to_string();
             stop_process_locked(inner);
-            let timeout_seconds = READY_TIMEOUT.as_secs();
+            let timeout_seconds = BRIDGE_READY_TIMEOUT.as_secs();
             Err(if detail.is_empty() {
                 format!("等待 cursor-bridge ready 事件超时（{timeout_seconds} 秒）")
             } else {
@@ -973,7 +1021,6 @@ async fn build_status(
         port: None,
         ca: "unknown".into(),
         integration: "unknown".into(),
-        settings_applied: false,
         takeover_requested,
         configured_models: 0,
         // No process means no stored rows to report; the selector is empty.
@@ -1008,6 +1055,17 @@ async fn build_status(
     if let Err(error) = reconcile_if_drifted(port, app, inner).await {
         last_error = Some(error);
     }
+    // Retry a preference push that failed earlier. Only when the flag is set, so
+    // the healthy path costs nothing. This is the self-heal M3 asked for: a
+    // transient failure on save no longer strands the persisted config and the
+    // bridge's rows in disagreement.
+    if last_error.is_none() && inner.preferences_apply_failed.load(Ordering::SeqCst) {
+        let preferences = locked(&inner.config, "Cursor 桥接配置")?.preferences.clone();
+        match apply_preferences(port, &preferences).await {
+            Ok(()) => inner.preferences_apply_failed.store(false, Ordering::SeqCst),
+            Err(error) => last_error = Some(error),
+        }
+    }
     let harness = if last_error.is_none() {
         fetch_harness_status(port).await.unwrap_or(harness)
     } else {
@@ -1025,10 +1083,6 @@ async fn build_status(
         port: Some(port),
         ca: json_str(&harness, "ca", "unknown"),
         integration: json_str(&harness, "integration", "unknown"),
-        settings_applied: harness
-            .get("settings_applied")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
         // CodeRelay's own record is authoritative for intent. The bridge's copy
         // is deliberately not consulted: it is written by whichever control call
         // arrived last, so treating it as the source of truth is how "row missing
@@ -1286,7 +1340,7 @@ pub async fn cursor_bridge_set_enabled(
         let mut config = locked(&inner.config, "Cursor 桥接配置")?.clone();
         if config.takeover_enabled != enabled {
             config.takeover_enabled = enabled;
-            save_config(&app, &config)?;
+            save_config_async(&app, &config).await?;
             *locked(&inner.config, "Cursor 桥接配置")? = config;
         }
     }
@@ -1323,6 +1377,18 @@ pub async fn cursor_bridge_save_bindings(
     drop(runtime);
     let mut config = locked(&inner.config, "Cursor 桥接配置")?.clone();
     let mut seen = std::collections::HashSet::new();
+    // The bridge derives `model_hash = sha256(base_url + model_id + api_key +
+    // display_name [+ endpoint])` and stores it as a **primary key**. Every
+    // binding in one reconcile shares the same `base_url` and endpoint, and
+    // `api_key` follows from the key, so two bindings collide exactly when their
+    // `(key_id, model_id, effective display name)` triple does.
+    //
+    // `create_models` treats a primary-key clash as a hard error, so the failure
+    // mode is not "one duplicate row" but "the entire reconcile is rejected" —
+    // every model fails to reach Cursor and the user only sees a message about
+    // uniqueness they cannot map back to the two rows that caused it. Catching
+    // it here turns that into a message naming the offending display name.
+    let mut hashes = std::collections::HashMap::new();
     for binding in &bindings {
         if binding.model_id.trim().is_empty() {
             return Err("每个绑定都必须选择一个模型。".to_string());
@@ -1333,9 +1399,26 @@ pub async fn cursor_bridge_save_bindings(
         if !seen.insert(binding.id.clone()) {
             return Err("绑定的标识重复，请刷新页面后重试。".to_string());
         }
+        // Mirrors `model_payload`: an empty display name falls back to the model
+        // id, so "both empty" and "both the same literal" collide identically.
+        let effective_name = if binding.display_name.trim().is_empty() {
+            binding.model_id.trim().to_string()
+        } else {
+            binding.display_name.trim().to_string()
+        };
+        let identity = (
+            binding.key_id.trim().to_string(),
+            binding.model_id.trim().to_string(),
+            effective_name.clone(),
+        );
+        if hashes.insert(identity, ()).is_some() {
+            return Err(format!(
+                "两条绑定使用了相同的 Key、模型与显示名称「{effective_name}」，会在 Cursor 中重名而无法同步。请把其中一条的显示名称改掉。"
+            ));
+        }
     }
     config.bindings = bindings;
-    save_config(&app, &config)?;
+    save_config_async(&app, &config).await?;
     *locked(&inner.config, "Cursor 桥接配置")? = config;
 
     if let Some(port) = current_port() {
@@ -1358,15 +1441,24 @@ pub async fn cursor_bridge_save_preferences(
     drop(runtime);
     let mut config = locked(&inner.config, "Cursor 桥接配置")?.clone();
     config.preferences = preferences;
-    save_config(&app, &config)?;
+    save_config_async(&app, &config).await?;
     let preferences = config.preferences.clone();
     *locked(&inner.config, "Cursor 桥接配置")? = config;
 
     // Preferences are applied to the bridge, not merely stored: the bridge keeps
     // its own copy of the proxy/port/commit rows and would otherwise never see
-    // the change.
+    // the change. The error is still returned so the user learns immediately, but
+    // the failure is also recorded, which is what lets the next status read
+    // retry it instead of leaving the two sides disagreeing until the user
+    // happens to press save again.
     if let Some(port) = current_port() {
-        apply_preferences(port, &preferences).await?;
+        match apply_preferences(port, &preferences).await {
+            Ok(()) => inner.preferences_apply_failed.store(false, Ordering::SeqCst),
+            Err(error) => {
+                inner.preferences_apply_failed.store(true, Ordering::SeqCst);
+                return Err(error);
+            }
+        }
     }
     build_status(&app, &inner).await
 }
@@ -1383,7 +1475,6 @@ async fn apply_preferences(
         &format!("{base}/settings/ports"),
         &json!({
             "proxy_port": preferences.proxy_port,
-            "service_port": preferences.service_port,
         }),
     )
     .await?;

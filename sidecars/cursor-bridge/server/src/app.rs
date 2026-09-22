@@ -1,5 +1,5 @@
 //! Assembles server dependencies and starts the application services.
-use std::{future::IntoFuture, net::SocketAddr, time::Duration};
+use std::{future::IntoFuture, time::Duration};
 
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -27,13 +27,8 @@ pub struct App {
 }
 
 impl App {
-    pub async fn new(mut config: Config) -> Result<Self> {
+    pub async fn new(config: Config) -> Result<Self> {
         let store = Store::connect(&config.database_url).await?;
-        if config.use_persisted_ports {
-            config
-                .listen_addr
-                .set_port(store.port_settings().await?.service_port);
-        }
         let assets = PromptAssets::embedded()?;
         let compiler = PromptCompiler::new(assets);
         let clients = crate::network::NetworkClients::new(store.clone());
@@ -90,14 +85,11 @@ impl App {
     }
 
     pub async fn bind(&self) -> Result<TcpListener> {
-        let requested = self.config.listen_addr;
-        let listener = bind_service_listener(requested, self.config.use_persisted_ports).await?;
-        if self.config.use_persisted_ports {
-            self.store
-                .set_service_port(listener.local_addr()?.port())
-                .await?;
-        }
-        Ok(listener)
+        // Fails closed when the requested port is taken. CodeRelay chose that
+        // port — or left it at 0 for the OS to assign — and learns the bound
+        // value from the `ready` line, so silently binding a different one would
+        // make its own preference look honoured when it was not.
+        Ok(TcpListener::bind(self.config.listen_addr).await?)
     }
 
     pub fn harness(&self) -> CursorHarness {
@@ -189,20 +181,6 @@ impl App {
             }
         }
         Ok(())
-    }
-}
-
-async fn bind_service_listener(
-    requested: SocketAddr,
-    allow_random_fallback: bool,
-) -> Result<TcpListener> {
-    match TcpListener::bind(requested).await {
-        Ok(listener) => Ok(listener),
-        Err(error) if allow_random_fallback && requested.port() != 0 => {
-            tracing::warn!(%requested, %error, "configured service port unavailable; selecting a random port");
-            Ok(TcpListener::bind(SocketAddr::new(requested.ip(), 0)).await?)
-        }
-        Err(error) => Err(error.into()),
     }
 }
 
