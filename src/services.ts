@@ -232,11 +232,6 @@ export async function setCursorBridgeEnabled(enabled: boolean): Promise<CursorBr
   return invoke<CursorBridgeStatus>('cursor_bridge_set_enabled', { enabled });
 }
 
-export async function syncCursorBridgeModels(): Promise<CursorBridgeStatus> {
-  requireTauri('Cursor 模型同步');
-  return invoke<CursorBridgeStatus>('cursor_bridge_sync_models');
-}
-
 export async function saveCursorBridgeBindings(bindings: CursorBinding[]): Promise<CursorBridgeStatus> {
   requireTauri('Cursor 绑定');
   return invoke<CursorBridgeStatus>('cursor_bridge_save_bindings', { bindings });

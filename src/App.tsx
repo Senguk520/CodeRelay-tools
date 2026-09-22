@@ -14,7 +14,7 @@ import { defaultCursorBridgePreferences, defaultCursorBridgeStatus, defaultState
 import { applyTheme } from './theme';
 import {
   cancelOAuth, checkForUpdate, checkinAccount, clearLogs, completeOAuth, exportAccounts, getCheckinStatus, getCursorBridgeInstallCommand, getCursorBridgeStatus, getState, initCursorBridgeCa, listModels, openExternal,
-  refreshAccountQuota, refreshAllQuotas, resetLocalState, saveAccounts, saveCursorBridgeBindings, saveCursorBridgePreferences, saveConfig, saveKeys, setCursorBridgeEnabled, startCursorBridge, startOAuth, startService, stopCursorBridge, stopService, syncCursorBridgeModels, syncModels, validateToken,
+  refreshAccountQuota, refreshAllQuotas, resetLocalState, saveAccounts, saveCursorBridgeBindings, saveCursorBridgePreferences, saveConfig, saveKeys, setCursorBridgeEnabled, startCursorBridge, startOAuth, startService, stopCursorBridge, stopService, syncModels, validateToken,
 } from './services';
 
 import { listen } from '@tauri-apps/api/event';
@@ -1254,7 +1254,6 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
   const [busy, setBusy] = useState(false);
   const [showBindingModal, setShowBindingModal] = useState(false);
   const [editingBinding, setEditingBinding] = useState<CursorBinding | null>(null);
-  const [showInstall, setShowInstall] = useState(false);
 
   const enabledKeys = state.keys.filter((key) => key.enabled);
   const keyName = (keyId: string) => state.keys.find((key) => key.id === keyId)?.name ?? '（Key 已删除）';
@@ -1358,12 +1357,11 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
       <ShieldCheck size={17} />
       <div>
         <strong>证书状态：{CURSOR_CA_LABELS[status.ca] ?? status.ca}</strong>
-        <span>{status.installCommand ? '把根证书安装进系统信任库后即可开启注入。安装需要管理员权限，CodeRelay 不会自动提权。' : '先生成根证书，再按提示安装进系统信任库。'}</span>
+        <span>{status.installCommand ? '把根证书安装进系统信任库后即可开启注入。安装需要管理员权限，CodeRelay 不会自动提权。请到“设置 - 网络”中进行配置。' : '先生成根证书，再按提示安装进系统信任库。请到“设置 - 网络”中进行配置。'}</span>
       </div>
-      <div className="header-actions">
-        {!status.installCommand && <button className="button ghost" disabled={busy} onClick={() => { void withBusy(initCursorBridgeCa, '根证书已生成'); }}><ShieldCheck size={15} />生成证书</button>}
-        {status.installCommand && <button className="button ghost" onClick={() => setShowInstall(true)}><Terminal size={15} />查看安装命令</button>}
-      </div>
+      {!status.installCommand && <div className="header-actions">
+        <button className="button ghost" disabled={busy} onClick={() => { void withBusy(initCursorBridgeCa, '根证书已生成'); }}><ShieldCheck size={15} />生成证书</button>
+      </div>}
     </div>}
 
     {status.unresolvedBindings.length > 0 && <div className="inline-warning">
@@ -1372,24 +1370,23 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
 
     <div className="panel table-panel">
       <div className="table-toolbar">
-        <div className="toolbar-title"><MousePointer2 size={17} /><strong>模型绑定</strong><span>{status.bindings.length} 个</span></div>
+        <div className="toolbar-title"><strong>模型绑定</strong><span>{status.bindings.length} 个</span></div>
         <div className="header-actions">
-          <button className="button ghost" disabled={busy} onClick={() => {
+          <button className="button ghost compact" disabled={busy} onClick={() => {
             if (!status.running) { void withBusy(startCursorBridge, '桥接已启动'); return; }
             // 停止桥接会连带关闭注入：代理是 bridge 进程内的实例，进程一走注入
             // 就必然失效。先说清楚，避免用户以为只是「停个服务」。
             if (injectedIntent && !window.confirm('停止桥接会同时关闭 Cursor 注入，并清除 Cursor 的代理设置。\n\n停止后 Cursor 将回到官方模型。确认继续？')) return;
             void withBusy(stopCursorBridge, '桥接已停止');
           }}>
-            {status.running ? <Pause size={15} /> : <Play size={15} />}{status.running ? '停止桥接' : '启动桥接'}
+            {status.running ? <Pause size={14} /> : <Play size={14} />}{status.running ? '停止桥接' : '启动桥接'}
           </button>
-          <button className="button ghost" disabled={busy || !status.running} onClick={() => { void withBusy(syncCursorBridgeModels, '模型已同步到桥接'); }}><RefreshCw size={15} />同步模型</button>
         </div>
       </div>
       {loading ? <EmptyState icon={MousePointer2} title="正在读取桥接状态" description="请稍候。" /> : status.bindings.length ? <div className="data-table key-table">
         <div className="table-head"><span>显示名称</span><span>模型</span><span>绑定 Key</span><span>推理强度</span><span>备注</span><span /></div>
         {status.bindings.map((binding) => <div className="table-row" key={binding.id}>
-          <div className="key-name"><span className="key-avatar"><MousePointer2 size={14} /></span><div><strong>{binding.displayName || binding.modelId}</strong><small>{binding.displayName ? binding.modelId : '未设置显示名称'}</small></div></div>
+          <div className="key-name"><span className="model-glyph"><Sparkles size={14} /></span><div><strong>{binding.displayName || binding.modelId}</strong><small>{binding.displayName ? binding.modelId : '未设置显示名称'}</small></div></div>
           <div className="model-name"><code>{binding.modelId}</code></div>
           <span className="muted-text">{keyName(binding.keyId)}</span>
           <span className="muted-text">{CURSOR_EFFORT_OPTIONS.find((option) => option.value === binding.reasoningEffort)?.label ?? (binding.reasoningEffort || '不设置')}</span>
@@ -1433,22 +1430,6 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
         void persist(next, exists ? '绑定已更新' : '绑定已添加');
       }}
     />}
-
-    {showInstall && <Modal title="安装根证书" onClose={() => setShowInstall(false)} wide>
-      <div className="detail-view">
-        <p className="settings-note"><ShieldCheck size={15} />CodeRelay 不会自动提权。请在终端中手动执行下面的命令，把根证书加入系统信任库。</p>
-        <pre className="code-block">{status.installCommand ?? '（尚无安装命令，请先生成根证书）'}</pre>
-        {status.uninstallCommand && <>
-          <p className="settings-note">不再需要接管时，用这条命令把根证书撤下来：</p>
-          <pre className="code-block">{status.uninstallCommand}</pre>
-        </>}
-        <div className="modal-footer">
-          <button className="button ghost" onClick={() => setShowInstall(false)}>关闭</button>
-          {status.uninstallCommand && <button className="button ghost" onClick={() => { void copyText(status.uninstallCommand!).then(() => notify('卸载命令已复制')); }}><Copy size={15} />复制卸载命令</button>}
-          <button className="button primary" disabled={!status.installCommand} onClick={() => { if (status.installCommand) void copyText(status.installCommand).then(() => notify('安装命令已复制')); }}><Copy size={15} />复制命令</button>
-        </div>
-      </div>
-    </Modal>}
   </>;
 }
 
@@ -1539,41 +1520,45 @@ function CursorBindingModal({ binding, keys, models, siblings, onClose, onSave }
   };
 
   return <Modal title={binding ? '编辑绑定' : '添加绑定'} onClose={onClose} wide>
-    <div className="form-grid">
-      <Field label="API Key" hint="仅列出已启用的 Key。">
-        <select value={keyId} onChange={(event) => setKeyId(event.target.value)}>
-          {keys.length ? keys.map((key) => <option key={key.id} value={key.id}>{key.name}</option>) : <option value="">（没有已启用的 Key）</option>}
-        </select>
-      </Field>
-      <Field label="模型" hint={models.length ? '来自「模型管理」的模型目录。' : '反代服务未运行或目录为空，请先启动服务并同步模型。'}>
-        <select value={modelId} onChange={(event) => chooseModel(event.target.value)}>
-          {models.length ? models.map((model) => <option key={model.id} value={model.id}>{model.id}</option>) : <option value="">（没有可用模型）</option>}
-        </select>
-      </Field>
-      <Field label="显示名称" hint="留空时显示为模型 id。">
-        <input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="例如：Claude Sonnet（团队）" />
-      </Field>
-      <Field label="推理强度" hint="不设置时由模型默认值决定。">
-        <select value={effort} onChange={(event) => setEffort(event.target.value)}>
-          {CURSOR_EFFORT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-        </select>
-      </Field>
-      <Field label="上下文窗口 Token" hint="从模型目录预填，可覆盖。">
-        <input value={contextWindow} onChange={(event) => setContextWindow(event.target.value)} inputMode="numeric" placeholder="例如 200000" />
-      </Field>
-      <Field label="最大输出 Token" hint="从模型目录预填，可覆盖。">
-        <input value={maxOutput} onChange={(event) => setMaxOutput(event.target.value)} inputMode="numeric" placeholder="例如 64000" />
-      </Field>
-      <Field label="备注" wide>
-        <input value={remark} onChange={(event) => setRemark(event.target.value)} placeholder="仅自己可见，例如用途或额度说明" />
-      </Field>
+    <div className="modal-form">
+      <div className="form-grid">
+        <Field label="API Key" hint="仅列出已启用的 Key。">
+          <select value={keyId} onChange={(event) => setKeyId(event.target.value)}>
+            {keys.length ? keys.map((key) => <option key={key.id} value={key.id}>{key.name}</option>) : <option value="">（没有已启用的 Key）</option>}
+          </select>
+        </Field>
+        <Field label="模型" hint={models.length ? '来自「模型管理」的模型目录。' : '反代服务未运行或目录为空，请先启动服务并同步模型。'}>
+          <select value={modelId} onChange={(event) => chooseModel(event.target.value)}>
+            {models.length ? models.map((model) => <option key={model.id} value={model.id}>{model.id}</option>) : <option value="">（没有可用模型）</option>}
+          </select>
+        </Field>
+        <Field label="显示名称" hint="留空时显示为模型 id。">
+          <input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="例如：Claude Sonnet（团队）" />
+        </Field>
+        <Field label="推理强度" hint="不设置时由模型默认值决定。">
+          <select value={effort} onChange={(event) => setEffort(event.target.value)}>
+            {CURSOR_EFFORT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+          </select>
+        </Field>
+        <Field label="上下文窗口 Token" hint="从模型目录预填，可覆盖。">
+          <input value={contextWindow} onChange={(event) => setContextWindow(event.target.value)} inputMode="numeric" placeholder="例如 200000" />
+        </Field>
+        <Field label="最大输出 Token" hint="从模型目录预填，可覆盖。">
+          <input value={maxOutput} onChange={(event) => setMaxOutput(event.target.value)} inputMode="numeric" placeholder="例如 64000" />
+        </Field>
+        <Field label="备注" wide>
+          <input value={remark} onChange={(event) => setRemark(event.target.value)} placeholder="仅自己可见，例如用途或额度说明" />
+        </Field>
+      </div>
+      <Toggle label="额外参数" description="以 JSON 对象追加到请求体，仅在模型支持时使用。" checked={extraEnabled} onChange={setExtraEnabled} />
+      {extraEnabled && <div className="form-grid">
+        <Field label="额外参数 JSON" wide hint="必须是 JSON 对象，例如 {&quot;top_p&quot;: 0.9}。">
+          <textarea value={extraText} onChange={(event) => setExtraText(event.target.value)} rows={5} placeholder="" />
+        </Field>
+      </div>}
+      <p className="settings-note">选择一个 API Key 与一个模型，使其出现在 Cursor 的模型选择器中。</p>
+      {error && <div className="inline-warning"><AlertTriangle size={15} />{error}</div>}
     </div>
-    <Toggle label="额外参数" description="以 JSON 对象追加到请求体，仅在模型支持时使用。" checked={extraEnabled} onChange={setExtraEnabled} />
-    {extraEnabled && <Field label="额外参数 JSON" wide hint="必须是 JSON 对象，例如 {&quot;top_p&quot;: 0.9}。">
-      <textarea value={extraText} onChange={(event) => setExtraText(event.target.value)} rows={5} placeholder="" />
-    </Field>}
-    <p className="settings-note">选择一个 API Key 与一个模型，使其出现在 Cursor 的模型选择器中。</p>
-    {error && <div className="inline-warning"><AlertTriangle size={15} />{error}</div>}
     <div className="modal-footer">
       <button className="button ghost" onClick={onClose}>取消</button>
       <button className="button primary" onClick={submit}><Check size={15} />{binding ? '保存修改' : '添加'}</button>
@@ -1777,7 +1762,7 @@ function CursorSettingsSection({ notify }: { notify: NoticeHandler }) {
         <button className="button ghost" onClick={() => update({ commitPrompt: '' })}><RefreshCw size={15} />恢复默认</button>
         <span className="save-hint">{draft.commitPrompt ? '使用自定义提示词' : '使用内置提示词'}</span>
       </div>
-      {!status.models.length && <p className="settings-note"><AlertTriangle size={15} />暂无可选模型：请先在「Cursor 服务」页启动桥接并同步模型。</p>}
+      {!status.models.length && <p className="settings-note"><AlertTriangle size={15} />暂无可选模型：请先在「Cursor 服务」页启动桥接并添加模型绑定。</p>}
     </div>
 
     <div className="form-actions">
