@@ -1,2 +1,21 @@
+# Build configuration scoped to the Tauri desktop app.
+#
+# Directory-scoped: applies only to cargo commands run inside `src-tauri/`, and
+# never to the cursor-bridge workspace under `sidecars/cursor-bridge/`. The two
+# builds have separate, heavy dependency graphs and must not evict each other's
+# artifacts from a shared target directory.
+
 [build]
+# Default artifact location. `F:/` is where this checkout builds, but a machine
+# without an F: drive cannot use it.
+#
+# Cargo does not expand environment variables inside this file, so the override
+# does not live here — it is `CARGO_TARGET_DIR`, which takes precedence over this
+# setting (verified: with both set, artifacts land in `CARGO_TARGET_DIR`). For a
+# one-off build, `--target-dir <path>` on the cargo command works too.
+#
+#   $env:CARGO_TARGET_DIR = 'D:/target'; npm run tauri:build
+#
+# Removing this section entirely also works: the build then uses the local
+# `src-tauri/target/`, which `.gitignore` already covers.
 target-dir = "F:/target"

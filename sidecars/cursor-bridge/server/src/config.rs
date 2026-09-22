@@ -1,5 +1,5 @@
 //! Loads and validates process-level server configuration.
-use std::{env, fs, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{env, fs, net::SocketAddr, path::{Path, PathBuf}, time::Duration};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -25,7 +25,19 @@ const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 
 /// separately installed copy of the upstream project.
 pub fn managed_data_dir() -> Result<PathBuf> {
     let data_dir = match std::env::var_os(DATA_DIR_ENV) {
-        Some(value) if !value.is_empty() => PathBuf::from(value),
+        Some(value) if !value.is_empty() => {
+            let path = PathBuf::from(value);
+            // Validated rather than used as-is. `CODERELAY_CURSOR_DATA_DIR` is an
+            // environment variable, so it is attacker-influenced in exactly the
+            // scenario this program has to survive: another local process
+            // spawning the bridge. A relative path resolves against whatever the
+            // working directory happens to be (so the "bridge state lives under
+            // one known directory" contract breaks), and a filesystem root would
+            // have the bridge put its SQLite database — and on unix a `0o700`
+            // directory mode — at `/` or `C:\`. Both are refused at startup.
+            validate_data_dir(&path)?;
+            path
+        }
         _ => {
             let home_dir = dirs::home_dir()
                 .ok_or_else(|| Error::Config("cannot resolve user home directory".into()))?;
@@ -36,6 +48,44 @@ pub fn managed_data_dir() -> Result<PathBuf> {
     #[cfg(unix)]
     fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700))?;
     Ok(data_dir)
+}
+
+/// Refuses a data directory that is relative or is a filesystem root.
+///
+/// The bar is deliberately about *shape* rather than an exhaustive path
+/// allowlist. Refusing relative paths keeps the "all bridge state lives under one
+/// known directory" contract from depending on the working directory, which is
+/// not ours to choose; refusing roots keeps the SQLite database — and on unix the
+/// `0o700` that is applied to this directory — off `/` and `C:\`.
+///
+/// This is not an allowlist of safe locations, and not a blocklist of sensitive
+/// ones: a path like `C:\Windows` passes, and a caller who points the variable
+/// there gets what they asked for. Enumerating sensitive locations would give a
+/// false sense of completeness without changing that.
+fn validate_data_dir(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(Error::Config(format!(
+            "CODERELAY_CURSOR_DATA_DIR must be an absolute path, got {}",
+            path.display()
+        )));
+    }
+    // `Path::parent()` is `None` for a filesystem root: `/`, `C:\`, `C:/`,
+    // `D:/` and `\\server\share` all take that arm. The `file_name()` arm of the
+    // match catches `C:\..`, whose parent (`C:\`) is not empty — a root spelled
+    // by walking up. Relative single-segment paths such as `bridge-data` do leave
+    // an empty parent, but the absolute check above has already refused them.
+    let is_root = match (path.parent(), path.file_name()) {
+        (None, _) => true,
+        (Some(parent), Some(_)) => parent.as_os_str().is_empty(),
+        (Some(_), None) => true,
+    };
+    if is_root {
+        return Err(Error::Config(format!(
+            "CODERELAY_CURSOR_DATA_DIR must not be a filesystem root, got {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Resolves the directory holding the local certificate authority.
@@ -351,6 +401,38 @@ fn error_config(value: &str, error: impl std::fmt::Display) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_dir_rejects_relative_paths() {
+        // A relative path resolves against whatever the working directory
+        // happens to be, which breaks the "state lives in one known directory"
+        // contract — and the working directory is not ours to choose.
+        assert!(validate_data_dir(Path::new("bridge-data")).is_err());
+        assert!(validate_data_dir(Path::new("./bridge-data")).is_err());
+        assert!(validate_data_dir(Path::new("..")).is_err());
+    }
+
+    #[test]
+    fn data_dir_rejects_filesystem_roots() {
+        // Writing the database to a root, and then applying an ACL to it on
+        // Windows, is never the intent.
+        #[cfg(unix)]
+        assert!(validate_data_dir(Path::new("/")).is_err());
+        #[cfg(windows)]
+        {
+            assert!(validate_data_dir(Path::new("C:\\")).is_err());
+            assert!(validate_data_dir(Path::new("C:/")).is_err());
+        }
+    }
+
+    #[test]
+    fn data_dir_accepts_a_normal_absolute_directory() {
+        #[cfg(unix)]
+        let path = Path::new("/var/lib/coderelay-cursor-bridge");
+        #[cfg(windows)]
+        let path = Path::new("C:\\Users\\Example\\AppData\\Roaming\\coderelay");
+        assert!(validate_data_dir(path).is_ok());
+    }
 
     #[test]
     fn provider_timeout_defaults_match_runtime_boundaries() {

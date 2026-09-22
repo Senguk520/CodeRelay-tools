@@ -3554,7 +3554,6 @@ name = "semble-core"
 version = "0.1.0"
 dependencies = [
  "bincode",
- "dirs",
  "half",
  "hex",
  "ignore",

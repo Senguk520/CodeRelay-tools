@@ -20,7 +20,7 @@
 # Usage: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-group6.ps1
 $ErrorActionPreference = 'Continue'
 
-$targetDir = if ($env:CODERELAY_CURSOR_TARGET_DIR) { $env:CODERELAY_CURSOR_TARGET_DIR } else { 'F:/target-cursor-bridge' }
+$targetDir = & (Join-Path $PSScriptRoot 'cursor-bridge-target-dir.ps1')
 $exe = Join-Path $targetDir 'debug\cursor-bridge.exe'
 if (-not (Test-Path $exe)) { throw "bridge debug binary not found: $exe (run cargo build first)" }
 

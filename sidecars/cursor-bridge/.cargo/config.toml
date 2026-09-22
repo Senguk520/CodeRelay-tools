@@ -6,17 +6,35 @@
 # (hudsucker, rcgen, sqlx, prost, ...) and must not contend with the desktop
 # build for the same target directory.
 
-[build]
-# Isolated target directory. Override with CODERELAY_CURSOR_BRIDGE_TARGET_DIR
-# when the default location is not suitable.
-target-dir = "F:/target-cursor-bridge"
+# There is intentionally no `[build] target-dir` here.
+#
+# Cargo does not expand environment variables in this file, so a hardcoded
+# `target-dir = "F:/target-cursor-bridge"` could not be overridden on a machine
+# without an F: drive — the build would simply fail with a confusing path error,
+# and no environment variable could redirect it. The target directory is a
+# build-time choice, so `scripts/cursor-bridge-target-dir.ps1` resolves it
+# instead, and the build script and every `verify-*.ps1` script go through that
+# one helper:
+#
+#   * `CODERELAY_CURSOR_TARGET_DIR`, when set;
+#   * `F:/target-cursor-bridge`, when an F: drive exists;
+#   * the checkout-local `target/` otherwise, which `.gitignore` already covers
+#     via the anchored `/target/`.
+#
+# Keeping the default out of this file also means a contributor with no
+# particular reason to relocate artifacts gets a working build with no setup.
 
 # Source replacement for crates.io.
 #
-# Direct downloads from static.crates.io stall repeatedly on this network
-# (observed: ~11 minutes with negligible progress). The mirror below is
-# reachable and fast here. Remove this section to fall back to crates.io —
-# nothing in the source depends on the mirror.
+# Direct downloads from static.crates.io stall repeatedly on the network this
+# checkout was developed on (observed: ~11 minutes with negligible progress, at
+# which point the build was abandoned). The mirror below is reachable and fast
+# there. **Remove the two `[source.*]` sections to build from crates.io.**
+# Nothing in the source depends on the mirror, and no crate version differs
+# because of it — but a source replacement is a trust decision, so it is called
+# out here rather than left as an unexplained two-line stanza: whoever builds
+# this should know that the tarballs come from rsproxy.cn rather than from the
+# canonical registry.
 [source.crates-io]
 replace-with = "rsproxy-sparse"
 

@@ -14,8 +14,11 @@
 # Usage: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-group1.ps1
 $ErrorActionPreference = 'Continue'
 
-# The bridge keeps its own target directory (see scripts/build-cursor-bridge.ps1).
-$targetDir = if ($env:CODERELAY_CURSOR_TARGET_DIR) { $env:CODERELAY_CURSOR_TARGET_DIR } else { 'F:/target-cursor-bridge' }
+# The bridge keeps its own target directory. Resolved through a shared helper so
+# this verifier and the build script agree on where the binary is: an explicit
+# CODERELAY_CURSOR_TARGET_DIR wins, then F:/target-cursor-bridge, then the
+# checkout-local target/ on a machine with no F: drive.
+$targetDir = & (Join-Path $PSScriptRoot 'cursor-bridge-target-dir.ps1')
 $exe = Join-Path $targetDir 'debug\cursor-bridge.exe'
 if (-not (Test-Path $exe)) { throw "bridge debug binary not found: $exe (run cargo build first)" }
 

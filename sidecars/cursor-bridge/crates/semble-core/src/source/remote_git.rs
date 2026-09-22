@@ -18,7 +18,11 @@ pub struct RemoteRepository {
 impl RemoteRepository {
     pub fn acquire(url: &str, cache_root: &Path) -> Result<Self> {
         let parsed = Url::parse(url).map_err(|_| Error::UnsupportedUrl(url.to_owned()))?;
-        if !matches!(parsed.scheme(), "https" | "http") || parsed.host_str().is_none() {
+        // HTTPS only. The clone result becomes the source text the search index
+        // is built from, and `http://` lets anyone on the network path decide
+        // what that text says — a plaintext URL is an instruction to trust an
+        // unauthenticated third party with the contents of the index.
+        if parsed.scheme() != "https" || parsed.host_str().is_none() {
             return Err(Error::UnsupportedUrl(url.to_owned()));
         }
         let key = hex::encode(Sha256::digest(url.as_bytes()));
@@ -73,7 +77,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn remote_sources_reject_non_http_urls_before_git_runs() {
+    fn remote_sources_reject_non_https_urls_before_git_runs() {
         let directory = tempfile::tempdir().unwrap();
         assert!(matches!(
             RemoteRepository::acquire("file:///tmp/repository", directory.path()),
@@ -81,6 +85,12 @@ mod tests {
         ));
         assert!(matches!(
             RemoteRepository::acquire("git@github.com:owner/repo.git", directory.path()),
+            Err(Error::UnsupportedUrl(_))
+        ));
+        // Plaintext HTTP is rejected even though it has a host: the clone output
+        // is index content, and an unauthenticated network path could choose it.
+        assert!(matches!(
+            RemoteRepository::acquire("http://example.invalid/repo.git", directory.path()),
             Err(Error::UnsupportedUrl(_))
         ));
     }

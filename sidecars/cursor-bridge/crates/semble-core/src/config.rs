@@ -23,13 +23,14 @@ impl SembleConfig {
     }
 }
 
-impl Default for SembleConfig {
-    fn default() -> Self {
-        let root = std::env::var_os("SEMBLE_CACHE_LOCATION")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .or_else(|| dirs::home_dir().map(|home| home.join(".coderelay-cursor-bridge/cache/semble")))
-            .unwrap_or_else(|| PathBuf::from(".coderelay-cursor-bridge/cache/semble"));
-        Self::new(root)
-    }
-}
+// There is deliberately no `Default` impl.
+//
+// There used to be one that fell back to `~/.coderelay-cursor-bridge/cache/semble`
+// (overridable via `SEMBLE_CACHE_LOCATION`). That fallback contradicted the
+// contract the host application relies on — "the bridge keeps its state under
+// `CODERELAY_CURSOR_DATA_DIR`" — and it did so on a path that is reachable
+// without any user action: a single tool call from a model would create a cache
+// in the user's home directory, download tens of megabytes of model assets from
+// huggingface.co, and `git clone` whatever URL the model supplied. The cache
+// root is now a required argument so the caller has to say where it goes, and
+// the host passes its managed data directory.

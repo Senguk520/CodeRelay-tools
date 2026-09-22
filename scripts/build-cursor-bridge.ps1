@@ -15,7 +15,13 @@ if ($targetTriple -match 'windows') {
 # pins the Tauri build to F:/target, and that setting is directory-scoped, so it
 # does not apply here. Sharing one target directory between the two builds would
 # make each one evict the other's artifacts.
-$targetDir = 'F:/target-cursor-bridge'
+#
+# The location is resolved by scripts/cursor-bridge-target-dir.ps1 so the build
+# and every verify script that looks for its output agree on it: an explicit
+# CODERELAY_CURSOR_TARGET_DIR wins, F:/target-cursor-bridge is the default, and a
+# machine without an F: drive falls back to the checkout-local
+# sidecars/cursor-bridge/target (git-ignored).
+$targetDir = & (Join-Path $PSScriptRoot 'cursor-bridge-target-dir.ps1')
 
 Push-Location $bridge
 try {

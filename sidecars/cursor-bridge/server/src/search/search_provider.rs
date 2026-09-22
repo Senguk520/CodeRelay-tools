@@ -98,9 +98,16 @@ async fn engine(store: Option<Store>) -> Result<Arc<SearchEngine>> {
                 Some(store) => crate::network::blocking_client_builder(&store).await?,
                 None => reqwest::blocking::Client::builder().use_native_tls(),
             };
+            // The cache root is passed explicitly rather than left to a default:
+            // it has to live under the bridge's managed data directory, next to
+            // the database, so that "bridge state is under
+            // `CODERELAY_CURSOR_DATA_DIR`" stays true. A home-directory fallback
+            // would put tens of megabytes of downloaded model assets somewhere
+            // nothing cleans up and the user never agreed to.
+            let config = SembleConfig::new(crate::config::managed_data_dir()?.join("cache/semble"));
             tokio::task::spawn_blocking(move || {
                 let client = builder.build()?;
-                SearchEngine::load_default_with_client(SembleConfig::default(), &client)
+                SearchEngine::load_default_with_client(config, &client)
                     .map(Arc::new)
                     .map_err(|error| Error::Config(format!("load Semble search engine: {error}")))
             })

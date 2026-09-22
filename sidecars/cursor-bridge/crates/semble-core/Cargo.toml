@@ -7,7 +7,6 @@ publish = false
 
 [dependencies]
 bincode = { version = "2", features = ["serde"] }
-dirs = "6"
 half = "2"
 hex = "0.4"
 ignore = "0.4"

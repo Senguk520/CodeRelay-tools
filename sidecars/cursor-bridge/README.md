@@ -29,9 +29,15 @@ Or directly:
 powershell -ExecutionPolicy Bypass -File scripts/build-cursor-bridge.ps1
 ```
 
-The build uses its own Cargo target directory (`F:/target-cursor-bridge` by default)
-so it never contends with the Tauri build's target directory. Override it with the
-`CODERELAY_CURSOR_BRIDGE_TARGET_DIR` environment variable if needed.
+The build uses its own Cargo target directory so it never contends with the Tauri
+build's target directory. `scripts/cursor-bridge-target-dir.ps1` resolves it, and
+the build script and every `scripts/verify-*.ps1` script share that one helper, so
+the binary that is built and the binary that is verified are always the same file:
+
+1. `CODERELAY_CURSOR_TARGET_DIR`, when set — an explicit choice always wins.
+2. `F:/target-cursor-bridge`, when an F: drive exists (the default here).
+3. `sidecars/cursor-bridge/target` (git-ignored) on a machine with no F: drive,
+   where the hardcoded path could not be built at all.
 
 The output lands in `bin/cursor-bridge-<target-triple>.exe`.
 
