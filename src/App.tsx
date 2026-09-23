@@ -710,21 +710,25 @@ function LogsPage({ state, onClear, notify }: { state: AppState; onClear: () => 
   </>;
 }
 
-// 账号池长按拖拽：长按等待、抖动容差、边缘自动滚动、落位弹簧与动量投影参数。
-const ACCOUNT_DRAG_HOLD_MS = 300;
-const ACCOUNT_DRAG_TOLERANCE = 8;
-const ACCOUNT_DRAG_SCROLL_EDGE = 56;
-const ACCOUNT_DRAG_SCROLL_SPEED = 12;
-const ACCOUNT_DRAG_RESPONSE = 0.4;
-const ACCOUNT_DRAG_PROJECTION = 99;
+// 长按拖拽排序：长按等待、抖动容差、边缘自动滚动、落位弹簧与动量投影参数。
+//
+// 这组取值是「账号池」与「Cursor 服务」页模型绑定列表共用的交互契约 —— 两个列表
+// 各自持有一份拖拽状态机（见 AccountsPage / CursorPage），但参数值只在这里定义一次，
+// 保证两边手感逐项一致（参数改名是纯机械重命名，不改变账号池行为）。
+const DRAG_HOLD_MS = 300;
+const DRAG_TOLERANCE = 8;
+const DRAG_SCROLL_EDGE = 56;
+const DRAG_SCROLL_SPEED = 12;
+const DRAG_RESPONSE = 0.4;
+const DRAG_PROJECTION = 99;
 
 // 顺序落库：停手后合并提交一次，避免连续多次拖拽各触发一次 sidecar 重建；
 // 保存落地后若后端顺序仍不一致（失败/被覆盖），再给一小段宽限才交还本地顺序。
-const ACCOUNT_ORDER_SAVE_DEBOUNCE = 1000;
-const ACCOUNT_ORDER_RELEASE_GRACE = 1500;
+const ORDER_SAVE_DEBOUNCE = 1000;
+const ORDER_RELEASE_GRACE = 1500;
 
 // 一次拖拽的可变状态：位置采样用于计算松手速度，host 用于拖到边缘时自动滚动。
-type AccountDragState = {
+type RowDragState = {
   id: string;
   pointerId: number;
   startY: number;
@@ -805,7 +809,7 @@ function AccountsPage({ state, blocked, onAdd, onImport, onSave, onRefresh, onRe
   const [dragView, setDragView] = useState<{ dy: number; fromIndex: number; toIndex: number; step: number } | null>(null);
   // 落位后的本地顺序：先按新顺序渲染，后端状态回来后自动交还。
   const [orderOverride, setOrderOverride] = useState<string[] | null>(null);
-  const dragRef = useRef<AccountDragState | null>(null);
+  const dragRef = useRef<RowDragState | null>(null);
   const landingRafRef = useRef<number | null>(null);
   // 结束拖拽的回调交给 DOM 事件调用，避免事件监听随渲染重建。
   const finishDragRef = useRef<(commit: boolean) => void>(() => undefined);
@@ -859,7 +863,7 @@ function AccountsPage({ state, blocked, onAdd, onImport, onSave, onRefresh, onRe
     if (pending?.timer != null) window.clearTimeout(pending.timer);
     pendingOrderRef.current = { ids, timer: null };
     if (blockedRef.current) return;
-    pendingOrderRef.current.timer = window.setTimeout(() => flushOrderSaveRef.current(), ACCOUNT_ORDER_SAVE_DEBOUNCE);
+    pendingOrderRef.current.timer = window.setTimeout(() => flushOrderSaveRef.current(), ORDER_SAVE_DEBOUNCE);
   };
 
   const cancelOrderSave = (): string[] | null => {
@@ -874,7 +878,7 @@ function AccountsPage({ state, blocked, onAdd, onImport, onSave, onRefresh, onRe
     if (blocked) return;
     const pending = pendingOrderRef.current;
     if (!pending || pending.timer != null) return;
-    pending.timer = window.setTimeout(() => flushOrderSaveRef.current(), ACCOUNT_ORDER_SAVE_DEBOUNCE);
+    pending.timer = window.setTimeout(() => flushOrderSaveRef.current(), ORDER_SAVE_DEBOUNCE);
     return () => { if (pending.timer != null) window.clearTimeout(pending.timer); };
   }, [blocked]);
 
@@ -884,7 +888,7 @@ function AccountsPage({ state, blocked, onAdd, onImport, onSave, onRefresh, onRe
     if (incoming.length === orderOverride.length && incoming.every((id, index) => id === orderOverride[index])) { setOrderOverride(null); return; }
     // 顺序还在排队/提交中就不交还，否则会在 sidecar 重启完成前闪回旧顺序。
     if (pendingOrderRef.current || blockedRef.current) return;
-    const timer = window.setTimeout(() => setOrderOverride(null), ACCOUNT_ORDER_RELEASE_GRACE);
+    const timer = window.setTimeout(() => setOrderOverride(null), ORDER_RELEASE_GRACE);
     return () => window.clearTimeout(timer);
   }, [orderOverride, state.accounts, blocked]);
 
@@ -901,7 +905,7 @@ function AccountsPage({ state, blocked, onAdd, onImport, onSave, onRefresh, onRe
   }, []);
 
   // 把当前指针位置换算成偏移与目标槽位；超出首/末行时收紧在边界（表格面板会裁切，不做回弹）。
-  const syncDragView = (drag: AccountDragState) => {
+  const syncDragView = (drag: RowDragState) => {
     const minDy = -drag.fromIndex * drag.step;
     const maxDy = (drag.maxIndex - drag.fromIndex) * drag.step;
     const dy = Math.max(minDy, Math.min(maxDy, drag.pointerY - drag.startY));
@@ -911,8 +915,8 @@ function AccountsPage({ state, blocked, onAdd, onImport, onSave, onRefresh, onRe
   };
 
   // 落位：从「松手偏移 + 松手速度」续接的临界阻尼弹簧，无过冲、不跳位（apple-design §4/§5）。
-  const landToSlot = (drag: AccountDragState, residual: number, velocity: number) => {
-    const omega = (2 * Math.PI) / ACCOUNT_DRAG_RESPONSE;
+  const landToSlot = (drag: RowDragState, residual: number, velocity: number) => {
+    const omega = (2 * Math.PI) / DRAG_RESPONSE;
     let offset = residual;
     let speed = velocity;
     let previous = performance.now();
@@ -945,7 +949,7 @@ function AccountsPage({ state, blocked, onAdd, onImport, onSave, onRefresh, onRe
     const visibleIds = display.map((account) => account.id);
     // 动量投影（apple-design §6）：按松手速度估算落点，向上/下快甩可多跨几个槽位。
     const velocity = releaseVelocity(drag.samples);
-    const projection = Math.max(-2 * drag.step, Math.min(2 * drag.step, (velocity / 1000) * ACCOUNT_DRAG_PROJECTION));
+    const projection = Math.max(-2 * drag.step, Math.min(2 * drag.step, (velocity / 1000) * DRAG_PROJECTION));
     drag.toIndex = Math.max(0, Math.min(drag.maxIndex, drag.fromIndex + Math.round((drag.dy + projection) / drag.step)));
     if (drag.fromIndex === drag.toIndex) { setDraggingId(null); setDragView(null); return; }
     const nextIds = [...visibleIds];
@@ -963,7 +967,7 @@ function AccountsPage({ state, blocked, onAdd, onImport, onSave, onRefresh, onRe
 
   useEffect(() => {
     if (!draggingId) return;
-    const track = (drag: AccountDragState, y: number) => {
+    const track = (drag: RowDragState, y: number) => {
       drag.samples.push({ y, t: performance.now() });
       if (drag.samples.length > 6) drag.samples.shift();
     };
@@ -992,9 +996,9 @@ function AccountsPage({ state, blocked, onAdd, onImport, onSave, onRefresh, onRe
       const host = drag.host;
       if (host) {
         const rect = host.getBoundingClientRect();
-        const above = (rect.top + ACCOUNT_DRAG_SCROLL_EDGE - drag.pointerY) / ACCOUNT_DRAG_SCROLL_EDGE;
-        const below = (drag.pointerY - (rect.bottom - ACCOUNT_DRAG_SCROLL_EDGE)) / ACCOUNT_DRAG_SCROLL_EDGE;
-        const delta = above > 0 ? -ACCOUNT_DRAG_SCROLL_SPEED * Math.min(1, above) : below > 0 ? ACCOUNT_DRAG_SCROLL_SPEED * Math.min(1, below) : 0;
+        const above = (rect.top + DRAG_SCROLL_EDGE - drag.pointerY) / DRAG_SCROLL_EDGE;
+        const below = (drag.pointerY - (rect.bottom - DRAG_SCROLL_EDGE)) / DRAG_SCROLL_EDGE;
+        const delta = above > 0 ? -DRAG_SCROLL_SPEED * Math.min(1, above) : below > 0 ? DRAG_SCROLL_SPEED * Math.min(1, below) : 0;
         if (delta) {
           const before = host.scrollTop;
           host.scrollTop = before + delta;
@@ -1044,7 +1048,7 @@ function AccountsPage({ state, blocked, onAdd, onImport, onSave, onRefresh, onRe
         setPressingId(null);
         setDraggingId(account.id);
         setDragView({ dy: 0, fromIndex: index, toIndex: index, step });
-      }, ACCOUNT_DRAG_HOLD_MS),
+      }, DRAG_HOLD_MS),
     };
   };
 
@@ -1059,7 +1063,7 @@ function AccountsPage({ state, blocked, onAdd, onImport, onSave, onRefresh, onRe
   const handlePressMove = (event: ReactPointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
     if (!drag || drag.active || drag.pointerId !== event.pointerId) return;
-    if (Math.abs(event.clientY - drag.startY) > ACCOUNT_DRAG_TOLERANCE) cancelPress();
+    if (Math.abs(event.clientY - drag.startY) > DRAG_TOLERANCE) cancelPress();
   };
 
   // 清洗文件名中的非法字符与空白，避免保存失败。
@@ -1345,7 +1349,283 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
   const removeBinding = (binding: CursorBinding) => {
     const label = binding.displayName || binding.modelId;
     if (!window.confirm(`确认删除「${label}」？删除后该模型会从 Cursor 的模型选择器中移除。`)) return;
-    void persist(status.bindings.filter((item) => item.id !== binding.id), '绑定已删除');
+    // 挂起的顺序与删除合并成一次提交，避免顺序先提交又被旧列表覆盖（与账号池同一处理）。
+    const pending = cancelOrderSave();
+    void persist(orderedBindings(pending ?? orderOverride).filter((item) => item.id !== binding.id), '绑定已删除');
+  };
+
+  // —— 长按拖拽排序（与「账号池」同一套自定义指针拖拽，非 HTML5 draggable）——
+  //
+  // 按下即刻反馈 → 长按 DRAG_HOLD_MS 才浮起（避免与点击冲突）→ 上下移动换位 →
+  // 松手带动量落位；拖到列表上/下边缘时自动滚动。
+  //
+  // 这里刻意「复制适配」账号池的那套实现，而不是抽成跨页面共享的 hook：交互一致是
+  // 需求，代码复用不是。账号池是用户正在使用的既有功能，抽约会打开它的回归面；
+  // 按项目规范「不要拿可用的产品去换未完成的复杂度」，重复这一份是更稳妥的取舍。
+  const [pressingId, setPressingId] = useState<string | null>(null);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dragView, setDragView] = useState<{ dy: number; fromIndex: number; toIndex: number; step: number } | null>(null);
+  // 落位后的本地顺序：先按新顺序渲染，后端状态回来后自动交还。
+  const [orderOverride, setOrderOverride] = useState<string[] | null>(null);
+  const dragRef = useRef<RowDragState | null>(null);
+  const landingRafRef = useRef<number | null>(null);
+  // 结束拖拽的回调交给 DOM 事件调用，避免事件监听随渲染重建。
+  const finishDragRef = useRef<(commit: boolean) => void>(() => undefined);
+  // 拖拽回调需要读取最新数据，但不希望因此重建 window 事件监听。
+  const latestRef = useRef({ display: status.bindings, all: status.bindings, save: (next: CursorBinding[]) => { void persist(next, '绑定顺序已更新'); } });
+
+  // 绑定列表没有搜索/筛选，因此不存在账号池那种「可见子集」——重排直接作用于全量列表。
+  const displayBindings = useMemo(() => {
+    if (!orderOverride) return status.bindings;
+    const byId = new Map(status.bindings.map((binding) => [binding.id, binding]));
+    const ordered = orderOverride.map((id) => byId.get(id)).filter((binding): binding is CursorBinding => Boolean(binding));
+    // 覆盖期间新出现的绑定（不在覆盖列表内）保持原相对位置，避免整段顺序被回退。
+    const rest = status.bindings.filter((binding) => !orderOverride.includes(binding.id));
+    return rest.length ? [...ordered, ...rest] : ordered;
+  }, [status.bindings, orderOverride]);
+  // 提交重排必须按「当前渲染顺序」计算，否则本地顺序覆盖期间会与显示错位。
+  latestRef.current = { display: displayBindings, all: status.bindings, save: (next) => { void persist(next, '绑定顺序已更新'); } };
+
+  /** 把本地顺序铺回后端最新绑定列表：已删除的忽略，新出现的保持原位。 */
+  const orderedBindings = (ids: string[] | null): CursorBinding[] => {
+    const all = latestRef.current.all;
+    if (!ids || !ids.length) return all;
+    const byId = new Map(all.map((binding) => [binding.id, binding]));
+    const desired = ids.filter((id) => byId.has(id));
+    if (!desired.length) return all;
+    // 与账号池的 reorderVisibleAccounts 同义：desired 中的条目按新次序依次填入其所在槽位。
+    const wanted = new Set(desired);
+    let cursor = 0;
+    return all.map((binding) => (wanted.has(binding.id) ? byId.get(desired[cursor++]) ?? binding : binding));
+  };
+
+  // —— 顺序持久化：停手后合并提交一次，未落地前一直持有本地顺序 ——
+  // 保存动作在途时先挂起、等它结束再补交（persist 会 setBusy，期间重复提交会互相覆盖）。
+  const pendingOrderRef = useRef<{ ids: string[]; timer: number | null } | null>(null);
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
+  const flushOrderSaveRef = useRef<(force?: boolean) => void>(() => undefined);
+
+  const flushOrderSave = (force = false) => {
+    const pending = pendingOrderRef.current;
+    if (!pending) return;
+    if (!force && busyRef.current) return; // 保留挂起，等动作结束后补交
+    if (pending.timer != null) window.clearTimeout(pending.timer);
+    pendingOrderRef.current = null;
+    const current = latestRef.current.all;
+    const next = orderedBindings(pending.ids);
+    // 顺序与后端一致时不提交，省掉一次无谓的桥接 reconcile。
+    if (next.every((binding, index) => binding.id === current[index]?.id)) return;
+    latestRef.current.save(next);
+  };
+  flushOrderSaveRef.current = flushOrderSave;
+
+  const queueOrderSave = (ids: string[]) => {
+    const pending = pendingOrderRef.current;
+    if (pending?.timer != null) window.clearTimeout(pending.timer);
+    pendingOrderRef.current = { ids, timer: null };
+    if (busyRef.current) return;
+    pendingOrderRef.current.timer = window.setTimeout(() => flushOrderSaveRef.current(), ORDER_SAVE_DEBOUNCE);
+  };
+
+  const cancelOrderSave = (): string[] | null => {
+    const pending = pendingOrderRef.current;
+    if (pending?.timer != null) window.clearTimeout(pending.timer);
+    pendingOrderRef.current = null;
+    return pending?.ids ?? null;
+  };
+
+  // 在途动作结束后补交挂起的顺序（连续拖拽期间正好撞上保存时）。
+  useEffect(() => {
+    if (busy) return;
+    const pending = pendingOrderRef.current;
+    if (!pending || pending.timer != null) return;
+    pending.timer = window.setTimeout(() => flushOrderSaveRef.current(), ORDER_SAVE_DEBOUNCE);
+    return () => { if (pending.timer != null) window.clearTimeout(pending.timer); };
+  }, [busy]);
+
+  // 后端顺序与本地一致后交还本地覆盖；顺序还在排队/提交中就先持有，避免闪回旧顺序。
+  useEffect(() => {
+    if (!orderOverride) return;
+    const incoming = status.bindings.filter((binding) => orderOverride.includes(binding.id)).map((binding) => binding.id);
+    if (incoming.length === orderOverride.length && incoming.every((id, index) => id === orderOverride[index])) { setOrderOverride(null); return; }
+    if (pendingOrderRef.current || busy) return;
+    const timer = window.setTimeout(() => setOrderOverride(null), ORDER_RELEASE_GRACE);
+    return () => window.clearTimeout(timer);
+  }, [orderOverride, status.bindings, busy]);
+
+  // 离开页面或关闭窗口时兜底提交，避免最后一次拖拽只停在本地。
+  useEffect(() => () => flushOrderSaveRef.current(true), []);
+  useEffect(() => {
+    const flush = () => flushOrderSaveRef.current(true);
+    window.addEventListener('pagehide', flush);
+    window.addEventListener('beforeunload', flush);
+    return () => {
+      window.removeEventListener('pagehide', flush);
+      window.removeEventListener('beforeunload', flush);
+    };
+  }, []);
+
+  // 把当前指针位置换算成偏移与目标槽位；超出首/末行时收紧在边界（表格面板会裁切，不做回弹）。
+  const syncDragView = (drag: RowDragState) => {
+    const minDy = -drag.fromIndex * drag.step;
+    const maxDy = (drag.maxIndex - drag.fromIndex) * drag.step;
+    const dy = Math.max(minDy, Math.min(maxDy, drag.pointerY - drag.startY));
+    drag.dy = dy;
+    drag.toIndex = Math.max(0, Math.min(drag.maxIndex, drag.fromIndex + Math.round(dy / drag.step)));
+    setDragView({ dy, fromIndex: drag.fromIndex, toIndex: drag.toIndex, step: drag.step });
+  };
+
+  // 落位：从「松手偏移 + 松手速度」续接的临界阻尼弹簧，无过冲、不跳位（apple-design §4/§5）。
+  const landToSlot = (drag: RowDragState, residual: number, velocity: number) => {
+    const omega = (2 * Math.PI) / DRAG_RESPONSE;
+    let offset = residual;
+    let speed = velocity;
+    let previous = performance.now();
+    const frame = (now: number) => {
+      const delta = Math.min(0.032, Math.max(0.001, (now - previous) / 1000));
+      previous = now;
+      speed += (-omega * omega * offset - 2 * omega * speed) * delta;
+      offset += speed * delta;
+      if (Math.abs(offset) < 0.5 && Math.abs(speed) < 20) {
+        landingRafRef.current = null;
+        setDraggingId(null);
+        setDragView(null);
+        return;
+      }
+      setDragView({ dy: offset, fromIndex: drag.toIndex, toIndex: drag.toIndex, step: drag.step });
+      landingRafRef.current = window.requestAnimationFrame(frame);
+    };
+    if (landingRafRef.current !== null) window.cancelAnimationFrame(landingRafRef.current);
+    landingRafRef.current = window.requestAnimationFrame(frame);
+  };
+
+  const finishDrag = (commit: boolean) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    if (drag.timer !== null) window.clearTimeout(drag.timer);
+    dragRef.current = null;
+    setPressingId(null);
+    if (!commit || !drag.active) { setDraggingId(null); setDragView(null); return; }
+    const visibleIds = latestRef.current.display.map((binding) => binding.id);
+    // 动量投影（apple-design §6）：按松手速度估算落点，向上/下快甩可多跨几个槽位。
+    const velocity = releaseVelocity(drag.samples);
+    const projection = Math.max(-2 * drag.step, Math.min(2 * drag.step, (velocity / 1000) * DRAG_PROJECTION));
+    drag.toIndex = Math.max(0, Math.min(drag.maxIndex, drag.fromIndex + Math.round((drag.dy + projection) / drag.step)));
+    if (drag.fromIndex === drag.toIndex) { setDraggingId(null); setDragView(null); return; }
+    const nextIds = [...visibleIds];
+    const [moved] = nextIds.splice(drag.fromIndex, 1);
+    nextIds.splice(drag.toIndex, 0, moved);
+    // 换序后该行的自然位置已移动 (toIndex - fromIndex) 行，用残余偏移衔接落位。
+    const residual = drag.dy - (drag.toIndex - drag.fromIndex) * drag.step;
+    setOrderOverride(nextIds);
+    setDragView({ dy: residual, fromIndex: drag.toIndex, toIndex: drag.toIndex, step: drag.step });
+    landToSlot(drag, residual, velocity);
+    // 松手先只更新本地顺序，停手 1s 后合并提交一次（连续拖拽只触发一次桥接 reconcile）。
+    queueOrderSave(nextIds);
+  };
+  finishDragRef.current = finishDrag;
+
+  useEffect(() => {
+    if (!draggingId) return;
+    const track = (drag: RowDragState, y: number) => {
+      drag.samples.push({ y, t: performance.now() });
+      if (drag.samples.length > 6) drag.samples.shift();
+    };
+    const onMove = (event: PointerEvent) => {
+      const drag = dragRef.current;
+      if (!drag || !drag.active || event.pointerId !== drag.pointerId) return;
+      drag.pointerY = event.clientY;
+      track(drag, event.clientY);
+      syncDragView(drag);
+    };
+    const onEnd = (event: PointerEvent) => {
+      const drag = dragRef.current;
+      if (!drag || !drag.active || event.pointerId !== drag.pointerId) return;
+      finishDragRef.current(true);
+    };
+    // 指针被系统收回时按取消处理，避免停在半路。
+    const onCancel = (event: PointerEvent) => {
+      const drag = dragRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      finishDragRef.current(false);
+    };
+    // 拖到列表上/下边缘时自动滚动，并把滚动量补偿进 startY 保持 1:1 跟手。
+    const tick = () => {
+      const drag = dragRef.current;
+      if (!drag || !drag.active) return;
+      const host = drag.host;
+      if (host) {
+        const rect = host.getBoundingClientRect();
+        const above = (rect.top + DRAG_SCROLL_EDGE - drag.pointerY) / DRAG_SCROLL_EDGE;
+        const below = (drag.pointerY - (rect.bottom - DRAG_SCROLL_EDGE)) / DRAG_SCROLL_EDGE;
+        const delta = above > 0 ? -DRAG_SCROLL_SPEED * Math.min(1, above) : below > 0 ? DRAG_SCROLL_SPEED * Math.min(1, below) : 0;
+        if (delta) {
+          const before = host.scrollTop;
+          host.scrollTop = before + delta;
+          const moved = host.scrollTop - before;
+          if (moved) { drag.startY -= moved; syncDragView(drag); }
+        }
+      }
+      drag.raf = window.requestAnimationFrame(tick);
+    };
+    window.addEventListener('pointermove', onMove, { passive: true });
+    window.addEventListener('pointerup', onEnd);
+    window.addEventListener('pointercancel', onCancel);
+    const current = dragRef.current;
+    if (current) current.raf = window.requestAnimationFrame(tick);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onEnd);
+      window.removeEventListener('pointercancel', onCancel);
+      if (current?.raf != null) window.cancelAnimationFrame(current.raf);
+    };
+  }, [draggingId]);
+
+  useEffect(() => () => { if (landingRafRef.current !== null) window.cancelAnimationFrame(landingRafRef.current); }, []);
+
+  const handlePressStart = (event: ReactPointerEvent<HTMLDivElement>, binding: CursorBinding, index: number) => {
+    if (event.button !== 0 || draggingId) return;
+    // 行内的编辑/删除是 <button>：按下它们时不进入拖拽，交互按钮不受影响 —— 与账号池同一判据。
+    if ((event.target as HTMLElement).closest('input,button,a,select,textarea,label,[data-no-drag]')) return;
+    const row = event.currentTarget;
+    const rect = row.getBoundingClientRect();
+    // 相邻行的实际行距即一次换位的位移量（行高已含 1px 分隔线）。
+    const nextRow = row.nextElementSibling as HTMLElement | null;
+    const step = nextRow ? Math.abs(nextRow.getBoundingClientRect().top - rect.top) : rect.height;
+    // 按下即刻反馈，长按满 DRAG_HOLD_MS 才真正浮起。
+    setPressingId(binding.id);
+    dragRef.current = {
+      id: binding.id, pointerId: event.pointerId, startY: event.clientY, pointerY: event.clientY, dy: 0, step,
+      maxIndex: Math.max(0, displayBindings.length - 1), fromIndex: index, toIndex: index, active: false, raf: null,
+      host: findScrollHost(row), samples: [{ y: event.clientY, t: performance.now() }],
+      timer: window.setTimeout(() => {
+        const current = dragRef.current;
+        if (!current || current.pointerId !== event.pointerId) return;
+        current.active = true;
+        current.timer = null;
+        // 速度采样从浮起那一刻重算，避免把长按期间的静止计入速度。
+        current.samples = [{ y: current.pointerY, t: performance.now() }];
+        try { row.setPointerCapture(event.pointerId); } catch { /* 指针已释放，忽略 */ }
+        setPressingId(null);
+        setDraggingId(binding.id);
+        setDragView({ dy: 0, fromIndex: index, toIndex: index, step });
+      }, DRAG_HOLD_MS),
+    };
+  };
+
+  const cancelPress = () => {
+    const drag = dragRef.current;
+    if (!drag || drag.active) return;
+    if (drag.timer !== null) window.clearTimeout(drag.timer);
+    dragRef.current = null;
+    setPressingId(null);
+  };
+
+  const handlePressMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.active || drag.pointerId !== event.pointerId) return;
+    if (Math.abs(event.clientY - drag.startY) > DRAG_TOLERANCE) cancelPress();
   };
 
   const injected = status.integration === 'enabled';
@@ -1413,9 +1693,19 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
           </button>
         </div>
       </div>
-      {loading ? <EmptyState icon={Cable} title="正在读取桥接状态" description="请稍候。" /> : status.bindings.length ? <div className="data-table key-table">
+      {loading ? <EmptyState icon={Cable} title="正在读取桥接状态" description="请稍候。" /> : status.bindings.length ? <div className={`data-table key-table bindings-table${draggingId ? ' is-dragging' : ''}`}>
         <div className="table-head"><span>显示名称</span><span>模型</span><span>绑定 Key</span><span>推理强度</span><span>备注</span><span /></div>
-        {status.bindings.map((binding) => <div className="table-row" key={binding.id}>
+        {displayBindings.map((binding, index) => {
+          const isDragging = draggingId === binding.id;
+          const isPressing = pressingId === binding.id && !isDragging;
+          const shift = dragView && !isDragging
+            ? dragView.fromIndex < index && index <= dragView.toIndex ? -dragView.step
+              : dragView.toIndex <= index && index < dragView.fromIndex ? dragView.step : 0
+            : 0;
+          const rowStyle: CSSProperties = isDragging
+            ? { transform: `translateY(${dragView?.dy ?? 0}px) scale(1.02)` }
+            : shift ? { transform: `translateY(${shift}px)` } : {};
+          return <div className={`table-row${isPressing ? ' drag-pressing' : ''}${isDragging ? ' drag-active' : ''}${shift ? ' drag-shift' : ''}`} style={rowStyle} key={binding.id} title="长按可拖动排序" onPointerDown={(event) => handlePressStart(event, binding, index)} onPointerMove={handlePressMove} onPointerUp={() => finishDragRef.current(true)} onPointerCancel={() => finishDragRef.current(false)} onPointerLeave={cancelPress}>
           <div className="key-name"><span className="model-glyph"><Sparkles size={14} /></span><div><strong>{binding.displayName || binding.modelId}</strong><small>{binding.displayName ? binding.modelId : '未设置显示名称'}</small></div></div>
           <div className="model-name"><code>{binding.modelId}</code></div>
           <span className="muted-text">{keyName(binding.keyId)}</span>
@@ -1425,7 +1715,7 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
             <IconButton label="编辑绑定" onClick={() => { setEditingBinding(binding); setShowBindingModal(true); }} disabled={busy}><Pencil size={15} /></IconButton>
             <IconButton label="删除绑定" danger onClick={() => removeBinding(binding)} disabled={busy}><Trash2 size={15} /></IconButton>
           </div>
-        </div>)}
+        </div>; })}
       </div> : <EmptyState
         icon={Sparkles}
         title="还没有可供 Cursor 使用的模型"
@@ -1697,6 +1987,9 @@ function CursorSettingsSection({ notify }: { notify: NoticeHandler }) {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [showPromptModal, setShowPromptModal] = useState(false);
+  // 「查看内置默认提示词」的展开状态：随弹窗关闭一起复位，避免下次打开还停在上次的展开态。
+  const [showDefaultPrompt, setShowDefaultPrompt] = useState(false);
+  const closePromptModal = () => { setShowPromptModal(false); setShowDefaultPrompt(false); };
 
   const load = useCallback(async () => {
     if (!hasTauri()) { setLoading(false); return; }
@@ -1800,17 +2093,26 @@ function CursorSettingsSection({ notify }: { notify: NoticeHandler }) {
       <button className="button primary compact" disabled={busy} onClick={() => { void save(); }}><Check size={14} />{busy ? '保存中…' : '保存 Cursor 设置'}</button>
     </div>
 
-    {showPromptModal && <Modal title="Commit 提示词" onClose={() => setShowPromptModal(false)} wide>
-      <Field label="提示词" wide hint="留空即使用内置默认提示词。">
-        <textarea rows={12} value={draft.commitPrompt} onChange={(e) => update({ commitPrompt: e.target.value })} placeholder={status.commitDefaultPrompt ?? '（内置默认提示词）'} />
-      </Field>
-      {status.commitDefaultPrompt && <details>
-        <summary className="settings-note">查看内置默认提示词</summary>
-        <pre className="code-block">{status.commitDefaultPrompt}</pre>
-      </details>}
+    {showPromptModal && <Modal title="Commit 提示词" onClose={closePromptModal} wide>
+      <div className="modal-form">
+        <Field label="提示词" wide hint="留空即使用内置默认提示词。">
+          {/* 行数按内容量取：内置提示词约 66 行，12 行可视区过小，改到 18 行。 */}
+          <textarea rows={18} value={draft.commitPrompt} onChange={(e) => update({ commitPrompt: e.target.value })} placeholder={status.commitDefaultPrompt ?? '（内置默认提示词）'} />
+        </Field>
+        {status.commitDefaultPrompt && <>
+          {/* 「查看」是一个次要动作，与设置页的「编辑提示词 / 恢复默认」同为 ghost compact 按钮，
+              不再用被压扁的整行 settings-note 条目。 */}
+          <div className="form-actions" style={{ justifyContent: 'flex-start' }}>
+            <button className="button ghost compact" onClick={() => setShowDefaultPrompt((value) => !value)}>
+              <Eye size={14} />{showDefaultPrompt ? '收起内置默认提示词' : '查看内置默认提示词'}
+            </button>
+          </div>
+          {showDefaultPrompt && <pre className="code-block" style={{ marginTop: 12 }}>{status.commitDefaultPrompt}</pre>}
+        </>}
+      </div>
       <div className="modal-footer">
-        <button className="button ghost" onClick={() => setShowPromptModal(false)}>取消</button>
-        <button className="button primary" onClick={() => setShowPromptModal(false)}><Check size={15} />完成</button>
+        <button className="button ghost" onClick={closePromptModal}>取消</button>
+        <button className="button primary" onClick={closePromptModal}><Check size={15} />完成</button>
       </div>
     </Modal>}
   </>;
