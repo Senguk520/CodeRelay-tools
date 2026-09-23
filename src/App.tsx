@@ -9,10 +9,6 @@ import {
   ShieldCheck, SlidersHorizontal, Sparkles, Square, Terminal, Trash2, Unplug, Upload,
   Users, X, Zap,
 } from 'lucide-react';
-// Cursor 标记位图。项目此前没有应用内图片资源（「CR」是纯 CSS 文字、应用图标只在
-// src-tauri/icons 供打包用），故采用 Vite 的默认约定：放 `src/assets/` 并由 ESM
-// 导入，交给构建做内容哈希。理由见文档 §23。
-import cursorMark from './assets/cursor-mark.png';
 import type { Account, ApiKey, AppState, CheckinResponse, CheckinStatusResponse, CursorBinding, CursorBridgePreferences, CursorBridgeStatus, DayStats, ModelInfo, OAuthCompleteResponse, PageId, RequestLog, ServiceConfig, ThemeMode, UpdateCheckResult } from './types';
 import { defaultCursorBridgePreferences, defaultCursorBridgeStatus, defaultState, emptyDayStats } from './types';
 import { applyTheme } from './theme';
@@ -28,7 +24,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 // 保持前端展示与打包版本一致，避免多处手动维护。
 const APP_VERSION = __APP_VERSION__;
 
-/** 图标入参：lucide 组件，或 `'cursor-mark'` 这个特殊标记（走 `CursorMark` 位图）。 */
+/** 图标入参：lucide 组件，或 `'cursor-mark'` 这个特殊标记（走内联的 `CursorMark`）。 */
 type IconInput = LucideIcon | 'cursor-mark';
 type NavItem = { id: PageId; label: string; icon: IconInput };
 type NavGroup = { id: string; label: string; icon: IconInput; items: NavItem[] };
@@ -36,22 +32,30 @@ type NavGroup = { id: string; label: string; icon: IconInput; items: NavItem[] }
 type NoticeHandler = (message: string) => void;
 
 /**
- * Cursor 标记位图（`src/assets/cursor-mark.png`）。
+ * Cursor 服务标记：内联 SVG，描边版等距立方体。
  *
- * 素材是黑白灰的等距立体方块，原图同时含接近纯白与接近纯黑的面：直接用在浅色
- * 主题下白面会融进背景，深色主题下黑面会融进背景。故按浅色主题把灰度整体压到
- * 22–120，深色主题交给样式里的 `invert(1)` 翻到 135–233，两种主题下轮廓才都成立。
+ * 用户否定了上一轮的实心方块位图（「太丑了不符合项目风格」），改用其提供的描边素材。
+ * 素材是「六边形外轮廓 + 内部 Y 形棱 + 一条斜线」的等距立方体，纯线框、无面填充，
+ * 因此重绘为矢量：`stroke="currentColor"` 让它与同栏 lucide 图标共享颜色，选中/悬停态
+ * 与深浅主题都不再需要 `filter: invert(1)` 之类的补偿，体积也从 6202 B 降到几百字节。
  *
- * 以位图而非 SVG：原始 SVG 是这张位图的自动描摹（31482 条 path、4.8 MB），
- * 用 svgo 最强档也只压到 1.5 MB，且坐标是死色值、无法跟随 `currentColor`。
+ * 几何按用户素材实测重绘（方法与对照见文档 §24）：24 视口内中心线跨 19.5 单位，与素材
+ * 自身的取景比例一致；线宽沿用 `Glyph` 传入的 `strokeWidth`（导航 1.8、菜单与设置页走
+ * lucide 默认 2），所以视觉重量与相邻的 lucide 图标完全一致。
  */
-function CursorMark({ size = 19 }: { size?: number }) {
-  return <img className="cursor-mark" src={cursorMark} width={size} height={size} alt="" aria-hidden="true" />;
+function CursorMark({ size = 19, strokeWidth = 2 }: { size?: number; strokeWidth?: number }) {
+  return (
+    <svg className="cursor-mark" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M12 2.25L20.44 7.12L20.44 16.88L12 21.75L3.56 16.88L3.56 7.12Z" />
+      <path d="M3.56 7.12L12 12L20.44 7.12M12 12V21.75" />
+      <path d="M20.44 7.12L12 21.75" />
+    </svg>
+  );
 }
 
-/** 图标渲染：`'cursor-mark'` 走位图，其余按原样渲染 lucide 组件。 */
+/** 图标渲染：`'cursor-mark'` 走内联矢量标记，其余按原样渲染 lucide 组件。 */
 function Glyph({ icon, size, strokeWidth }: { icon: IconInput; size: number; strokeWidth?: number }) {
-  if (icon === 'cursor-mark') return <CursorMark size={size} />;
+  if (icon === 'cursor-mark') return <CursorMark size={size} strokeWidth={strokeWidth} />;
   const Icon = icon;
   return <Icon size={size} strokeWidth={strokeWidth} />;
 }
