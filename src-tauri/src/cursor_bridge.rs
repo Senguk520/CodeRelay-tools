@@ -1875,4 +1875,22 @@ mod tests {
             Some(vec!["hash-a".to_string()])
         );
     }
+
+    /// The zero-binding case is not drift. With no bindings the payload is empty,
+    /// `reconcile_models` deletes every stored row, and both sides then describe
+    /// "no models" — so the order trivially agrees and nothing is pushed. Removing
+    /// the last binding lands here.
+    #[test]
+    fn no_bindings_means_the_order_agrees_and_nothing_is_pushed() {
+        assert_eq!(desired_model_order(&[], &[]), Some(vec![]));
+        assert_eq!(current_model_order(&[]), Some(vec![]));
+        assert_eq!(model_order_to_push(&[], &[]), None);
+        // Rows the payload cannot match one-to-one are refused by the length
+        // check, so no order is ever proposed for a set `reorder_models` would
+        // reject. Reached transiently when the last binding is deleted while the
+        // bridge still lists rows.
+        let stale = vec![stored("hash-a", "Alpha", "m1", "sk-1", 0)];
+        assert_eq!(desired_model_order(&stale, &[]), None);
+        assert_eq!(model_order_to_push(&stale, &[]), None);
+    }
 }
