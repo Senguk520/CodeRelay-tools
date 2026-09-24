@@ -210,6 +210,24 @@ export interface CursorBridgeModel {
   displayName: string;
 }
 
+/** `cursor_bridge_test_binding` 的返回：一次绑定连通性探测的结果。 */
+export interface CursorBindingTest {
+  ok: boolean;
+  /** 首个输出增量到达的耗时（毫秒）；失败时为 0。 */
+  latencyMs: number;
+  /** 上游 `usage.completion_tokens`；relay 未回 usage 时为 null。 */
+  completionTokens: number | null;
+  /** 首个到最后一个输出增量之间的生成窗口（毫秒）。 */
+  generationMs: number | null;
+  /**
+   * 输出速率（tokens/s）。缺少 token 计数或生成窗口为零时为 null——
+   * 界面必须显示「—」而不是 0，否则会把「测不出」误读成「模型很慢」。
+   */
+  tokensPerSecond: number | null;
+  /** 可读的失败原因；成功时为 null。 */
+  error: string | null;
+}
+
 /** `cursor_bridge_status` 的返回。 */
 export interface CursorBridgeStatus {
   running: boolean;

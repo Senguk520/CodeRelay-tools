@@ -5,16 +5,16 @@ import {
   Activity, AlertTriangle, Ban, Cable, CalendarCheck, CalendarDays, Check, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, Clipboard, Cloud,
   Copy, Database, Download, Eye, EyeOff, FileJson, Flame, FolderOpen, Gauge, Gift, Globe2, KeyRound,
   Layers3, LayoutDashboard, ListFilter, LockKeyhole, LogOut, Menu, Minus, MoreHorizontal,
-  Network, Pause, Pencil, Play, Plus, RefreshCw, Search, Server, Settings2,
+  Network, Pause, Pencil, Play, PlugZap, Plus, RefreshCw, Search, Server, Settings2,
   ShieldCheck, SlidersHorizontal, Sparkles, Square, Terminal, Trash2, Unplug, Upload,
   Users, X, Zap,
 } from 'lucide-react';
-import type { Account, ApiKey, AppState, CheckinResponse, CheckinStatusResponse, CursorBinding, CursorBridgePreferences, CursorBridgeStatus, DayStats, ModelInfo, OAuthCompleteResponse, PageId, RequestLog, ServiceConfig, ThemeMode, UpdateCheckResult } from './types';
+import type { Account, ApiKey, AppState, CheckinResponse, CheckinStatusResponse, CursorBinding, CursorBindingTest, CursorBridgePreferences, CursorBridgeStatus, DayStats, ModelInfo, OAuthCompleteResponse, PageId, RequestLog, ServiceConfig, ThemeMode, UpdateCheckResult } from './types';
 import { defaultCursorBridgePreferences, defaultCursorBridgeStatus, defaultState, emptyDayStats } from './types';
 import { applyTheme } from './theme';
 import {
   cancelOAuth, checkForUpdate, checkinAccount, clearLogs, completeOAuth, exportAccounts, getCheckinStatus, getCursorBridgeInstallCommand, getCursorBridgeStatus, getState, initCursorBridgeCa, listModels, openExternal,
-  refreshAccountQuota, refreshAllQuotas, resetLocalState, saveAccounts, saveCursorBridgeBindings, saveCursorBridgePreferences, saveConfig, saveKeys, setCursorBridgeEnabled, startCursorBridge, startOAuth, startService, stopCursorBridge, stopService, syncModels, validateToken,
+  refreshAccountQuota, refreshAllQuotas, resetLocalState, saveAccounts, saveCursorBridgeBindings, saveCursorBridgePreferences, saveConfig, saveKeys, setCursorBridgeEnabled, startCursorBridge, startOAuth, startService, stopCursorBridge, stopService, syncModels, testCursorBridgeBinding, validateToken,
 } from './services';
 
 import { listen } from '@tauri-apps/api/event';
@@ -1281,6 +1281,27 @@ const CURSOR_INTEGRATION_LABELS: Record<string, string> = {
  * 页面驱动 cursor-bridge sidecar：启动/停止进程、开关注入、维护模型绑定列表。
  * 所有 bridge 通讯都经 Tauri 命令（见 services.ts 的说明），前端不需要知道端口。
  */
+/**
+ * 行内结论：尽量短，完整说明放在 `title` 里。
+ *
+ * 速率缺失时**只显示延迟**，不补一个 `0 tok/s`——那会把「上游没回 token 计数」
+ * 读成「模型不出字」。
+ */
+function summarizeBindingTest(result: CursorBindingTest): string {
+  if (!result.ok) return result.error ?? '测试失败';
+  const latency = `${result.latencyMs} ms`;
+  return result.tokensPerSecond === null ? latency : `${latency} · ${result.tokensPerSecond.toFixed(1)} tok/s`;
+}
+
+/** `title` 里的完整说明，含「速率为什么不可用」。 */
+function describeBindingTest(result: CursorBindingTest): string {
+  if (!result.ok) return result.error ?? '测试失败';
+  if (result.tokensPerSecond === null || result.completionTokens === null) {
+    return `首字节延迟 ${result.latencyMs} ms；本次响应没有可计算的生成窗口（或上游未返回 token 计数），因此不显示输出速率。`;
+  }
+  return `首字节延迟 ${result.latencyMs} ms；输出速率 ${result.tokensPerSecond.toFixed(1)} tok/s（${result.completionTokens} tokens / 生成窗口 ${result.generationMs} ms）。`;
+}
+
 function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler }) {
   const [status, setStatus] = useState<CursorBridgeStatus>(defaultCursorBridgeStatus);
   const [models, setModels] = useState<ModelInfo[]>([]);
@@ -1288,6 +1309,11 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
   const [busy, setBusy] = useState(false);
   const [showBindingModal, setShowBindingModal] = useState(false);
   const [editingBinding, setEditingBinding] = useState<CursorBinding | null>(null);
+  // 每条绑定各自的测试状态：`bindingTests` 存结论，`testingBindings` 是进行中集合。
+  // 两者都按 bindingId 索引，因此测 A 行不会影响 B 行的按钮或结果，也不需要
+  // 一个「全局是否在测」的布尔。
+  const [bindingTests, setBindingTests] = useState<Record<string, CursorBindingTest>>({});
+  const [testingBindings, setTestingBindings] = useState<Record<string, true>>({});
 
   const enabledKeys = state.keys.filter((key) => key.enabled);
   const keyName = (keyId: string) => state.keys.find((key) => key.id === keyId)?.name ?? '（Key 已删除）';
@@ -1352,6 +1378,35 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
     // 挂起的顺序与删除合并成一次提交，避免顺序先提交又被旧列表覆盖（与账号池同一处理）。
     const pending = cancelOrderSave();
     void persist(orderedBindings(pending ?? orderOverride).filter((item) => item.id !== binding.id), '绑定已删除');
+  };
+
+  /**
+   * 测一条绑定的连通性。结果**留在行内**（`bindingTests[bindingId]`），因为用户
+   * 点的是这一行，答案也应该落回这一行；失败原因较长时 `title` 承载全文，行内只
+   * 留短结论，避免撑高固定行高的表格行。
+   *
+   * 该绑定测试期间，`testingBindings[bindingId]` 为真：按钮转圈并禁用，重复点击
+   * 不会叠加请求。另一条绑定的按钮不受影响。
+   */
+  const testBinding = async (binding: CursorBinding) => {
+    setTestingBindings((current) => ({ ...current, [binding.id]: true }));
+    try {
+      const result = await testCursorBridgeBinding(binding.id);
+      setBindingTests((current) => ({ ...current, [binding.id]: result }));
+    } catch (reason) {
+      // 命令本身报错（绑定已被删除、客户端构造失败）也是一条结论，和探测失败
+      // 一视同仁地渲染在同一行，避免用户以为「点了没反应」。
+      setBindingTests((current) => ({
+        ...current,
+        [binding.id]: { ok: false, latencyMs: 0, completionTokens: null, generationMs: null, tokensPerSecond: null, error: reason instanceof Error ? reason.message : String(reason) },
+      }));
+    } finally {
+      setTestingBindings((current) => {
+        const next = { ...current };
+        delete next[binding.id];
+        return next;
+      });
+    }
   };
 
   // —— 长按拖拽排序（与「账号池」同一套自定义指针拖拽，非 HTML5 draggable）——
@@ -1694,10 +1749,11 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
         </div>
       </div>
       {loading ? <EmptyState icon={Cable} title="正在读取桥接状态" description="请稍候。" /> : status.bindings.length ? <div className={`data-table key-table bindings-table${draggingId ? ' is-dragging' : ''}`}>
-        <div className="table-head"><span>显示名称</span><span>模型</span><span>绑定 Key</span><span>推理强度</span><span>备注</span><span /></div>
+        <div className="table-head"><span>显示名称</span><span>模型</span><span>绑定 Key</span><span>推理强度</span><span>备注</span><span>连通性</span><span /></div>
         {displayBindings.map((binding, index) => {
           const isDragging = draggingId === binding.id;
           const isPressing = pressingId === binding.id && !isDragging;
+          const testing = Boolean(testingBindings[binding.id]);
           const shift = dragView && !isDragging
             ? dragView.fromIndex < index && index <= dragView.toIndex ? -dragView.step
               : dragView.toIndex <= index && index < dragView.fromIndex ? dragView.step : 0
@@ -1711,7 +1767,13 @@ function CursorPage({ state, notify }: { state: AppState; notify: NoticeHandler 
           <span className="muted-text">{keyName(binding.keyId)}</span>
           <span className="muted-text">{CURSOR_EFFORT_OPTIONS.find((option) => option.value === binding.reasoningEffort)?.label ?? (binding.reasoningEffort || '不设置')}</span>
           <span className="muted-text">{binding.remark || '—'}</span>
+          {testing
+            ? <span className="muted-text">测试中…</span>
+            : bindingTests[binding.id]
+              ? <span className={`muted-text binding-test ${bindingTests[binding.id].ok ? 'ok' : 'failed'}`} title={describeBindingTest(bindingTests[binding.id])}>{summarizeBindingTest(bindingTests[binding.id])}</span>
+              : <span className="muted-text">未测试</span>}
           <div className="row-actions">
+            <IconButton label={testing ? '正在测试连通性' : '测试连通性'} onClick={() => { void testBinding(binding); }} disabled={busy || testing}>{testing ? <RefreshCw size={15} className="spin" /> : <PlugZap size={15} />}</IconButton>
             <IconButton label="编辑绑定" onClick={() => { setEditingBinding(binding); setShowBindingModal(true); }} disabled={busy}><Pencil size={15} /></IconButton>
             <IconButton label="删除绑定" danger onClick={() => removeBinding(binding)} disabled={busy}><Trash2 size={15} /></IconButton>
           </div>

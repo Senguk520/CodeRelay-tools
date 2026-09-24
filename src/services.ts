@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import type { Account, ApiKey, AppState, CheckinResponse, CheckinStatusResponse, CursorBinding, CursorBridgePreferences, CursorBridgeStatus, ModelInfo, OAuthCompleteResponse, OAuthStartResponse, ServiceConfig, UpdateCheckResult } from './types';
+import type { Account, ApiKey, AppState, CheckinResponse, CheckinStatusResponse, CursorBinding, CursorBindingTest, CursorBridgePreferences, CursorBridgeStatus, ModelInfo, OAuthCompleteResponse, OAuthStartResponse, ServiceConfig, UpdateCheckResult } from './types';
 import { defaultState } from './types';
 
 const STORAGE_KEY = 'coderelay-app-state';
@@ -235,6 +235,22 @@ export async function setCursorBridgeEnabled(enabled: boolean): Promise<CursorBr
 export async function saveCursorBridgeBindings(bindings: CursorBinding[]): Promise<CursorBridgeStatus> {
   requireTauri('Cursor 绑定');
   return invoke<CursorBridgeStatus>('cursor_bridge_save_bindings', { bindings });
+}
+
+/**
+ * 测试一条已保存的绑定能否真正走到模型。
+ *
+ * 走 Tauri 命令而不是前端 `fetch` 到 relay：webview 的 CSP 只管得住 webview
+ * 自己发出的请求，前端直连 `http://127.0.0.1:<port>` 一旦被 CSP 收紧就会变成
+ * `TypeError: Failed to fetch`（见文档 §32，e554c70 修过同一个坑）。Rust 侧的
+ * 请求不受 CSP 约束。
+ *
+ * 传 `bindingId` 而不是绑定字段：按钮长在已保存的行上，测试的对象必须就是
+ * 当前生效的那条绑定，而不是调用方临时拼出来的东西。
+ */
+export async function testCursorBridgeBinding(bindingId: string): Promise<CursorBindingTest> {
+  requireTauri('绑定连通性测试');
+  return invoke<CursorBindingTest>('cursor_bridge_test_binding', { bindingId });
 }
 
 export async function saveCursorBridgePreferences(preferences: CursorBridgePreferences): Promise<CursorBridgeStatus> {

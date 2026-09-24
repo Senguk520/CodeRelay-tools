@@ -29,7 +29,7 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
 const CONFIG_FILE: &str = "cursor-bridge.json";
 /// Subdirectory of the app data dir handed to the bridge. It keeps the bridge's
@@ -60,6 +60,21 @@ const SLOW_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 /// as "the bridge failed to start" when the truth is only "the migrations were
 /// still running", which sends the user looking in the wrong place.
 const BRIDGE_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Hard ceiling for one binding connectivity probe.
+///
+/// Deliberately short: a user is waiting on a button press, and a probe that
+/// outlives the timeout tells them nothing the timeout does not already say.
+/// Measured end-to-end time against the local relay is ~1.5-2s, so this is a
+/// generous margin rather than a working budget.
+const BINDING_TEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Output budget for one binding connectivity probe.
+///
+/// The rate needs a real generation window to divide by, and `max_tokens: 1`
+/// would make tokens/s meaningless (one token, zero-length window). 64 is the
+/// trade-off: long enough to measure, small enough that a probe costs almost
+/// nothing in credit.
+const BINDING_TEST_MAX_TOKENS: u64 = 64;
 
 /// Port the bridge is listening on, or 0 when it is not running.
 ///
@@ -1165,6 +1180,240 @@ async fn reconcile_if_drifted(
 }
 
 // ---------------------------------------------------------------------------
+// Binding connectivity test
+// ---------------------------------------------------------------------------
+
+/// Outcome of one binding connectivity probe, shaped for the row that started it.
+///
+/// A *failed* probe is a normal answer, not a command error — the UI renders the
+/// reason in the row. `Err` stays reserved for "the probe could not even be
+/// attempted" (the binding is gone, the client could not be built), which is a
+/// refresh problem rather than a verdict on the binding.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorBindingTest {
+    pub ok: bool,
+    /// 首个输出增量到达的耗时（毫秒）——用户感知的「延迟」。
+    ///
+    /// 连接建立快但上游迟迟不吐字，就体现在这里；因此它比「收到响应头」的耗时
+    /// 更贴近体感。请求未成功时保持 0，界面对失败不该显示这个数字。
+    pub latency_ms: u64,
+    /// 上游 `usage.completion_tokens`。relay 未回 usage 时为 `None`。
+    pub completion_tokens: Option<u64>,
+    /// 首个到最后一个输出增量之间的生成窗口（毫秒）。
+    pub generation_ms: Option<u64>,
+    /// 输出速率（tokens/s）= `completion_tokens ÷ 生成窗口`。
+    ///
+    /// 只在**流式**响应下成立：非流式只有一个总耗时，算不出生成速率。缺少
+    /// token 计数、或生成窗口为零（只收到一个增量）时为 `None`——界面必须显示
+    /// 「—」而不是 `0`，否则用户会以为模型真的慢。
+    pub tokens_per_second: Option<f64>,
+    /// 可读的失败原因；成功时为 `None`。
+    pub error: Option<String>,
+}
+
+impl CursorBindingTest {
+    /// A failed verdict carrying a user-facing reason.
+    fn failed(error: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            latency_ms: 0,
+            completion_tokens: None,
+            generation_ms: None,
+            tokens_per_second: None,
+            error: Some(error.into()),
+        }
+    }
+}
+
+/// Probes one persisted binding end to end through the relay.
+///
+/// The binding is resolved from the persisted config by the caller rather than
+/// accepting its fields over IPC: the button sits on a saved row, and letting the
+/// caller supply the key and model would let the test verify something other than
+/// what is actually in effect. Draft bindings are therefore out of scope, which
+/// matches the button's placement.
+async fn probe_binding(binding: &CursorBinding, state: &AppState) -> Result<CursorBindingTest, String> {
+    // Pre-flight. The relay drops disabled keys from its lookup map entirely
+    // (`manifest_policy.go`: `if key == "" || !m.APIKeys[i].Enabled { continue }`),
+    // so a binding on a disabled key would surface only as a bare
+    // `401 invalid_api_key`. Checking here turns that into a message naming the
+    // real problem, which is the whole reason this guard exists.
+    if binding.model_id.trim().is_empty() {
+        return Ok(CursorBindingTest::failed("绑定未选择模型。"));
+    }
+    let Some(key) = state.keys.iter().find(|key| key.id == binding.key_id) else {
+        return Ok(CursorBindingTest::failed("绑定的 API Key 已删除，请到「API Key」页检查。"));
+    };
+    if !key.enabled {
+        return Ok(CursorBindingTest::failed("绑定的 API Key 已停用，在「API Key」页启用后才能测试。"));
+    }
+
+    let client = http_client(BINDING_TEST_TIMEOUT)?;
+    let url = format!("{}/chat/completions", relay_base_url(state));
+    let mut body = json!({
+        "model": binding.model_id.trim(),
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_tokens": BINDING_TEST_MAX_TOKENS,
+        // 流式是速率指标的前提：非流式拿不到生成窗口，也就分不出「慢在连接」
+        // 和「慢在生成」。
+        "stream": true,
+        // 让 relay 在最后一个 chunk 回 `usage`，token 计数只能从这里拿。
+        "stream_options": { "include_usage": true },
+    });
+    // 绑定自己的推理强度是「这个绑定是否可用」的一部分，按同步路径同一套映射发送。
+    if let Some(effort) = normalize_effort(&binding.reasoning_effort) {
+        body["reasoning_effort"] = json!(effort);
+    }
+
+    // `http_client` 的默认头带 bridge 控制令牌，但 reqwest 的默认头**不会覆盖**
+    // 请求上已设置的头（`client.rs`: `if let Entry::Vacant(entry) = headers.entry(key)`），
+    // 所以这里显式设置的 Authorization 会生效，不必另造客户端。
+    let started = Instant::now();
+    let mut response = match client
+        .post(&url)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", key.key.trim()))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return Ok(CursorBindingTest::failed(describe_request_error(&error))),
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        return Ok(CursorBindingTest::failed(describe_http_failure(status, &detail)));
+    }
+
+    let mut buffer = String::new();
+    let mut first_token_ms: Option<u64> = None;
+    let mut last_token_ms: Option<u64> = None;
+    let mut completion_tokens: Option<u64> = None;
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("读取 relay 流式响应失败：{error}"))?
+    {
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        // SSE 按行切分；最后一段可能是半行，留在 buffer 里等下一个 chunk。
+        while let Some(index) = buffer.find('\n') {
+            let line = buffer[..index].trim_end_matches('\r').to_string();
+            buffer.drain(..=index);
+            let Some(payload) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let payload = payload.trim();
+            if payload.is_empty() || payload == "[DONE]" {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(payload) else {
+                continue;
+            };
+            if let Some(tokens) = value
+                .get("usage")
+                .and_then(|usage| usage.get("completion_tokens"))
+                .and_then(Value::as_u64)
+            {
+                completion_tokens = Some(tokens);
+            }
+            if !delta_has_output(&value) {
+                continue;
+            }
+            let elapsed = started.elapsed().as_millis() as u64;
+            first_token_ms.get_or_insert(elapsed);
+            last_token_ms = Some(elapsed);
+        }
+    }
+
+    // 生成窗口取「首个到最后一个增量」。单增量响应窗口为零，此时没有可除的数，
+    // 如实留空而不是拿含连接耗时的总时长冒充。
+    let generation_ms = match (first_token_ms, last_token_ms) {
+        (Some(first), Some(last)) if last > first => Some(last - first),
+        _ => None,
+    };
+    let tokens_per_second = match (completion_tokens, generation_ms) {
+        (Some(tokens), Some(window)) if tokens > 0 && window > 0 => {
+            Some(tokens as f64 / (window as f64 / 1000.0))
+        }
+        _ => None,
+    };
+
+    Ok(CursorBindingTest {
+        ok: true,
+        latency_ms: first_token_ms.unwrap_or_else(|| started.elapsed().as_millis() as u64),
+        completion_tokens,
+        generation_ms,
+        tokens_per_second,
+        error: None,
+    })
+}
+
+/// True when the chunk carries a non-empty output delta.
+///
+/// `reasoning_content` counts alongside `content`: a reasoning model under
+/// `reasoning_effort` spends its whole budget there, and ignoring it would report
+/// "no output" for a healthy binding.
+fn delta_has_output(value: &Value) -> bool {
+    let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+        return false;
+    };
+    choices.iter().any(|choice| {
+        let Some(delta) = choice.get("delta") else {
+            return false;
+        };
+        ["content", "reasoning_content"].iter().any(|field| {
+            delta
+                .get(*field)
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+        })
+    })
+}
+
+/// Turns a transport failure into something the user can act on.
+fn describe_request_error(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        return format!(
+            "请求超时（超过 {} 秒），上游可能拥堵或该模型不可用。",
+            BINDING_TEST_TIMEOUT.as_secs()
+        );
+    }
+    if error.is_connect() {
+        return "无法连接 relay：反代服务可能未启动，请先启动服务。".to_string();
+    }
+    format!("请求失败：{error}")
+}
+
+/// Turns a non-2xx relay response into a readable cause.
+///
+/// The relay answers with OpenAI's `{"error":{"message":...}}` envelope, so the
+/// upstream's own wording is preferred over a bare status code — except for 401,
+/// where the relay's message is generic and the useful hint is about the Key.
+fn describe_http_failure(status: reqwest::StatusCode, body: &str) -> String {
+    let detail = match api_error_message(body) {
+        Some(detail) => format!("：{detail}"),
+        None => String::new(),
+    };
+    match status.as_u16() {
+        401 => format!("鉴权失败（HTTP 401）{detail}。绑定引用的 Key 已启用却仍被拒绝，请在「API Key」页核对该 Key 的值。"),
+        404 => format!("模型不可用（HTTP 404）{detail}"),
+        429 => format!("请求被限流（HTTP 429）{detail}"),
+        code if code >= 500 => format!("relay 上游错误（HTTP {code}）{detail}"),
+        code => format!("请求被拒绝（HTTP {code}）{detail}"),
+    }
+}
+
+/// Extracts the relay's OpenAI-style error message, if the body carries one.
+fn api_error_message(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body.trim()).ok()?;
+    let message = value.get("error")?.get("message")?.as_str()?.trim();
+    (!message.is_empty()).then(|| message.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Status assembly
 // ---------------------------------------------------------------------------
 
@@ -1669,6 +1918,43 @@ async fn apply_preferences(
     Ok(())
 }
 
+/// Tests whether one saved binding can actually reach a model through the relay.
+///
+/// Takes a `binding_id` rather than the binding's fields: the button sits on a
+/// saved row, and letting the caller supply the key and model would let the test
+/// verify something other than what is in effect. It also keeps the relay secret
+/// on this side of the IPC boundary.
+///
+/// Returns `Ok` for a failed probe too — the reason belongs in the row, and only
+/// "there is no such binding" or a client-construction failure is an `Err`.
+#[tauri::command]
+pub async fn cursor_bridge_test_binding(
+    app: AppHandle,
+    runtime: State<'_, CursorBridgeState>,
+    binding_id: String,
+) -> Result<CursorBindingTest, String> {
+    let inner = runtime.inner.clone();
+    drop(runtime);
+    // Clone the binding out before awaiting: the relay probe takes seconds, and
+    // holding the config lock across it would stall every other command.
+    let binding = locked(&inner.config, "Cursor 桥接配置")?
+        .bindings
+        .iter()
+        .find(|binding| binding.id == binding_id)
+        .cloned()
+        .ok_or_else(|| "该绑定已不存在，请刷新页面后重试。".to_string())?;
+
+    let state = app_state_snapshot(&app)?;
+    // The relay must be up first, or the probe just reports a connection error
+    // for what is really "the proxy is stopped".
+    if !state.running {
+        return Ok(CursorBindingTest::failed(
+            "反代服务未启动，请先在「反代服务」页启动服务。",
+        ));
+    }
+    probe_binding(&binding, &state).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1879,5 +2165,59 @@ mod tests {
         let stale = vec![stored("hash-a", "Alpha", "m1", "sk-1", 0)];
         assert_eq!(desired_model_order(&stale, &[]), None);
         assert_eq!(model_order_to_push(&stale, &[]), None);
+    }
+
+    // ---- 连通性测试的纯函数 ----
+
+    /// 推理模型的输出全在 `reasoning_content` 里。只认 `content` 会把一个健康
+    /// 的绑定判成「没有输出」，而这正是 `reasoningEffort` 绑定的常态。
+    #[test]
+    fn delta_has_output_counts_reasoning_content() {
+        let content = json!({"choices": [{"delta": {"content": "hi"}}]});
+        let reasoning = json!({"choices": [{"delta": {"reasoning_content": "think"}}]});
+        assert!(delta_has_output(&content));
+        assert!(delta_has_output(&reasoning));
+
+        // 空串是「角色占位」chunk，不是输出；拿它当首字会让延迟偏小。
+        let role_only = json!({"choices": [{"delta": {"role": "assistant", "content": ""}}]});
+        assert!(!delta_has_output(&role_only));
+        let usage_only = json!({"choices": [], "usage": {"completion_tokens": 3}});
+        assert!(!delta_has_output(&usage_only));
+    }
+
+    /// relay 的错误体是 OpenAI 信封，其中的 `message` 才是可读原因。
+    #[test]
+    fn api_error_message_reads_the_openai_envelope() {
+        assert_eq!(
+            api_error_message(r#"{"error":{"code":"invalid_api_key","message":"missing or invalid API key"}}"#),
+            Some("missing or invalid API key".to_string())
+        );
+        assert_eq!(api_error_message("not json"), None);
+        assert_eq!(api_error_message(r#"{"error":{"message":"  "}}"#), None);
+        assert_eq!(api_error_message(""), None);
+    }
+
+    /// 失败原因必须带上游原文，同时 401 要额外提示「Key 是否启用」——relay 对
+    /// 禁用 Key 只会回一句笼统的 invalid_api_key，单看那句话排查不出原因。
+    #[test]
+    fn http_failures_keep_the_upstream_reason() {
+        let unauthorized = describe_http_failure(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":{"message":"missing or invalid API key"}}"#,
+        );
+        assert!(unauthorized.contains("401"), "{unauthorized}");
+        assert!(unauthorized.contains("missing or invalid API key"), "{unauthorized}");
+        assert!(unauthorized.contains("启用"), "{unauthorized}");
+
+        let missing_model = describe_http_failure(
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"error":{"code":"model_not_available","message":"模型 x 不在当前 API Key 的可用模型范围内"}}"#,
+        );
+        assert!(missing_model.contains("404"), "{missing_model}");
+        assert!(missing_model.contains("模型 x 不在当前"), "{missing_model}");
+
+        // 没有可解析错误体时，仍然给出状态码而不是空串。
+        let bare = describe_http_failure(reqwest::StatusCode::BAD_GATEWAY, "oops");
+        assert!(bare.contains("502"), "{bare}");
     }
 }

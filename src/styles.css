@@ -176,6 +176,13 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .accounts-table .table-row.drag-shift, .bindings-table .table-row.drag-shift { transition: transform 220ms cubic-bezier(.32, .72, 0, 1); }
 html[data-theme='dark'] .accounts-table .table-row.drag-pressing, html[data-theme='dark'] .bindings-table .table-row.drag-pressing { background: var(--surface-hover); }
 html[data-theme='dark'] .accounts-table .table-row.drag-active, html[data-theme='dark'] .bindings-table .table-row.drag-active { background: var(--surface-solid); box-shadow: 0 18px 36px rgba(0, 0, 0, .52), 0 3px 8px rgba(0, 0, 0, .34); }
+/* 绑定表比 .key-table 多一列「连通性」，另一列末列要放下三个图标按钮（3×27px + 2×2px 间隙），
+   因此必须整体覆盖列定义；60px 是 .key-table 给两个按钮的宽度，不够三个。 */
+.bindings-table .table-head, .bindings-table .table-row { grid-template-columns: 1.15fr 1.4fr .95fr .9fr 1fr 96px 88px; }
+.bindings-table .binding-test.ok { color: var(--green); }
+.bindings-table .binding-test.failed { color: var(--red); }
+html[data-theme='dark'] .bindings-table .binding-test.ok { color: var(--green); }
+html[data-theme='dark'] .bindings-table .binding-test.failed { color: var(--red); }
 /* models */
 .sync-time { display: inline-flex; align-items: center; gap: 5px; color: var(--subtle); font-size: 10px; }.model-notice { display: flex; align-items: center; gap: 10px; margin-bottom: 13px; padding: 13px 15px; border: 1px solid #e2e6f1; border-radius: 9px; color: #526da0; background: #f5f7fc; }.model-notice > svg { flex: 0 0 auto; }.model-notice div { display: flex; flex: 1; flex-direction: column; gap: 3px; }.model-notice strong { color: #5d6f96; font-size: 11px; }.model-notice span { color: #8c9abc; font-size: 10px; }.models-table .table-head, .models-table .table-row { grid-template-columns: 1.45fr 1.15fr .8fr 1fr 1fr 27px; }.model-name code { color: #a0a19a; font-size: 9px; }.capability-list { display: flex; flex-wrap: wrap; gap: 4px; }.capability-list span { padding: 4px 6px; border-radius: 4px; color: #777971; background: var(--surface-hover); font-size: 9px; }.capability-list span.vision { color: #667f9d; background: #edf3fb; }.alias-button { display: flex; align-items: center; justify-content: space-between; gap: 7px; width: 100px; padding: 6px 7px; border: 1px solid var(--line); border-radius: 5px; color: var(--subtle); background: var(--surface-soft); font-size: 10px; }.alias-button:hover { color: #5e605a; border-color: var(--line-strong); }.model-footnote { justify-content: flex-start; }
 /* settings */
