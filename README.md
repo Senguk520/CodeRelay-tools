@@ -159,7 +159,7 @@ go test ./...
 
 本项目参考了 [cockpit-tools](https://github.com/jlcodes99/cockpit-tools) 的技术选型，并基于众多优秀的开源项目构建。完整的上游致谢与第三方依赖归属清单见 [ACKNOWLEDGMENTS.md](./ACKNOWLEDGMENTS.md)。
 
-「Cursor 服务」所使用的本地桥接 sidecar，是 [cursor_byok](https://github.com/leookun/cursor-byok)（MIT License，Copyright (c) 2026 leookun）服务端的修改副本，固定在上游 commit `2068ab20513288e6a0289d33febe872a30608610`。上游版权与许可声明已逐字保留，改动清单与详细来源记录见 [sidecars/cursor-bridge/UPSTREAM.md](./sidecars/cursor-bridge/UPSTREAM.md)。
+「Cursor 服务」所使用的本地桥接 sidecar，是 [cursor_byok](https://github.com/leookun/cursor-byok)（MIT License，Copyright (c) 2026 leookun）服务端的修改副本，固定在上游 commit `2068ab20513288e6a0289d33febe872a30608610`。感谢作者 leookun 与 cursor_byok 项目：没有这份上游实现，「Cursor 服务」无从做起。上游版权与许可声明已逐字保留，改动清单见 [sidecars/cursor-bridge/README.md](./sidecars/cursor-bridge/README.md)，详细来源记录见 [sidecars/cursor-bridge/UPSTREAM.md](./sidecars/cursor-bridge/UPSTREAM.md)。
 
 > **排障提示**：该桥接通过 Cursor 的私有 protobuf 协议工作，Cursor 更新后可能失效。升级 Cursor 后请**完全退出并重新启动** Cursor，再重新开启注入。
 >
@@ -178,7 +178,7 @@ go test ./...
 
 ## 许可证
 
-本项目自身代码采用 [MIT License with Commons Clause](./LICENSE) 开源：在 MIT License 基础上附加 **Commons Clause License Condition v1.0**，即允许自由使用、复制、修改、合并、发布与分发，但**禁止将本软件以收费或其他对价形式提供给第三方**（禁止 Sell）。第三方组件 CLIProxyAPI 仍保持其原始 MIT License 不变。
+本项目自身代码采用 [MIT License with Commons Clause](./LICENSE) 开源：在 MIT License 基础上附加 **Commons Clause License Condition v1.0**，即允许自由使用、复制、修改、合并、发布与分发，但**禁止将本软件以收费或其他对价形式提供给第三方**（禁止 Sell）。第三方组件 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 与 [cursor_byok](https://github.com/leookun/cursor-byok) 仍保持各自的原始 MIT License 不变，不受上述 Commons Clause 附加条款约束；该附加条款只适用于本项目自身代码。
 
 ---
 
