@@ -2443,6 +2443,28 @@ mod tests {
         assert_eq!(config.bind_host, "0.0.0.0");
     }
 
+    /// 回归护栏：webview 的 `connect-src` 必须放行回环地址，否则「模型管理」页的
+    /// 「立即同步」与「Cursor 服务」页的绑定弹窗都读不到 relay 的模型目录。
+    ///
+    /// 这一条编译器与其它单测都发现不了：CSP 只在 webview 内生效，构建与测试全绿，
+    /// 故障要等用户点击时才暴露（2026-09-24 实际发生过，见接入记录 §32）。
+    /// relay 端口由 `--port` 动态决定（现实测为 11430，源码默认 11435），故必须按端口通配放行。
+    #[test]
+    fn webview_csp_allows_loopback_relay_fetch() {
+        let raw = include_str!("../tauri.conf.json");
+        let config: serde_json::Value =
+            serde_json::from_str(raw).expect("tauri.conf.json 必须是合法 JSON");
+        for block in ["csp", "devCsp"] {
+            let connect_src = config["app"]["security"][block]["connect-src"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{block}.connect-src 必须是字符串"));
+            assert!(
+                connect_src.contains("http://127.0.0.1:*"),
+                "{block}.connect-src 必须放行 http://127.0.0.1:*，实际为：{connect_src}"
+            );
+        }
+    }
+
     #[test]
     fn runtime_cleanup_keeps_only_model_cache() {
         // 模型清单缓存必须跨「停止服务 / 退出程序」保留，否则下次启动只剩一次性的
