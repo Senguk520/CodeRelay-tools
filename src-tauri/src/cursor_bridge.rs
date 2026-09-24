@@ -22,7 +22,7 @@ use crate::gateway::{
 use crate::models::AppState;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -819,16 +819,27 @@ fn build_sync_payload(config: &CursorBridgeConfig, state: &AppState) -> SyncPayl
     }
 }
 
-async fn push_models(port: u16, models: &[Value]) -> Result<Value, String> {
+/// Reconciles the bridge's model rows onto `models` and returns what it holds
+/// afterwards.
+///
+/// The response is the post-write row set, and the order push needs it:
+/// `model_hash` is the bridge's primary key and CodeRelay cannot recompute it
+/// (see [`ModelFingerprint`]), so the hashes have to come back from the bridge
+/// either way.
+async fn push_models(port: u16, models: &[Value]) -> Result<Vec<Value>, String> {
     let client = http_client(HTTP_TIMEOUT)?;
     let url = format!("{}/models/reconcile", bridge_base(port));
-    send_json(
+    let response = send_json(
         &client,
         reqwest::Method::PUT,
         &url,
         &json!({ "models": models }),
     )
-    .await
+    .await?;
+    match response {
+        Value::Array(rows) => Ok(rows),
+        _ => Err("Cursor 桥接返回的模型同步结果不是数组。".to_string()),
+    }
 }
 
 async fn fetch_models(port: u16) -> Result<Vec<Value>, String> {
@@ -838,6 +849,146 @@ async fn fetch_models(port: u16) -> Result<Vec<Value>, String> {
         Value::Array(items) => Ok(items),
         _ => Ok(Vec::new()),
     }
+}
+
+/// A row's identity, as the matching in [`desired_model_order`] uses it.
+///
+/// The three fields the bridge's `model_hash` is built from that a payload and a
+/// stored row can both express: `display_name` and `model_id` verbatim, and the
+/// credential as a digest (the row carries `api_key_fingerprint`; the payload
+/// carries the key, which [`api_key_fingerprint`] digests identically). Matching
+/// on fewer fields is not enough: `reconcile_models` matches on `display_name`
+/// alone, so two bindings may legitimately share a name while pointing at
+/// different models or keys, and a matcher that confused them would emit an order
+/// naming the wrong rows.
+///
+/// Text is trimmed because the bridge normalizes every stored value
+/// (`normalize_model_input` trims), while the payload carries the binding as
+/// typed. Comparing untrimmed text would silently refuse to push the order of any
+/// binding whose name has a stray space.
+fn row_identity(value: &Value) -> Option<(String, String, Option<String>)> {
+    let display_name = value.get("display_name")?.as_str()?.trim().to_string();
+    let model_id = value
+        .get("model_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    // The stored side already holds the digest; the desired side holds the key.
+    // A `null` digest and an empty key both mean "no credential", which compares
+    // equal rather than refusing to match: the bridge rejects an empty key at
+    // reconcile time, so the two sides cannot diverge on this.
+    let key_fingerprint = match value.get("api_key_fingerprint").and_then(Value::as_str) {
+        Some(digest) => Some(digest.to_string()),
+        None => value
+            .get("api_key")
+            .and_then(Value::as_str)
+            .and_then(api_key_fingerprint),
+    };
+    Some((display_name, model_id, key_fingerprint))
+}
+
+/// The `model_hash` values, in binding order, that the bridge should hold.
+///
+/// `model_hash` is the bridge's own primary key and CodeRelay cannot recompute it
+/// (see [`ModelFingerprint`]), so the hashes are taken from the bridge's rows by
+/// matching each desired payload onto a row with [`row_identity`]. The match is
+/// positional only in the sense that duplicates resolve in row order, the same way
+/// `reconcile_models` resolves them.
+///
+/// `None` means the rows cannot be matched onto the payload one-to-one — a
+/// binding was skipped for a missing key, say. That is not an error to report:
+/// `reorder_models` rejects a set that does not match its stored rows exactly, so
+/// an order derived from an incomplete match could only fail.
+fn desired_model_order(rows: &[Value], models: &[Value]) -> Option<Vec<String>> {
+    if rows.len() != models.len() {
+        return None;
+    }
+    let mut remaining: Vec<&Value> = rows.iter().collect();
+    let mut order = Vec::with_capacity(models.len());
+    for model in models {
+        let identity = row_identity(model)?;
+        let position = remaining
+            .iter()
+            .position(|row| row_identity(row).as_ref() == Some(&identity))?;
+        let row = remaining.remove(position);
+        order.push(row.get("model_hash")?.as_str()?.to_string());
+    }
+    Some(order)
+}
+
+/// The order the bridge currently presents, or `None` when it has none that
+/// CodeRelay could have chosen.
+///
+/// Every reader orders with `ORDER BY sort_order, display_name`, so that is what
+/// is reconstructed here. Rows sharing a `sort_order` yield `None`, because the
+/// tie then breaks on `display_name` — an order CodeRelay never chose. A tie is
+/// reachable: `reconcile_models` ranks new rows by payload index but leaves the
+/// stored rank on rows it short-circuits, so a newly added binding can collide
+/// with a short-circuited one. Callers treat `None` as "differs", which is what
+/// pushes the order back to something dense and deterministic.
+fn current_model_order(rows: &[Value]) -> Option<Vec<String>> {
+    let mut ranked: Vec<(i64, &str)> = Vec::with_capacity(rows.len());
+    let mut seen = HashSet::with_capacity(rows.len());
+    for row in rows {
+        let rank = row.get("sort_order")?.as_i64()?;
+        let hash = row.get("model_hash")?.as_str()?;
+        if !seen.insert(rank) {
+            return None;
+        }
+        ranked.push((rank, hash));
+    }
+    ranked.sort_by_key(|(rank, _)| *rank);
+    Some(
+        ranked
+            .into_iter()
+            .map(|(_, hash)| hash.to_string())
+            .collect(),
+    )
+}
+
+/// The `model_hash` sequence to push, or `None` when the bridge already agrees.
+///
+/// This is the whole reason the order needs a separate push: `sort_order` is not
+/// part of `ModelFingerprint` (it cannot be, see there), so a reorder-only edit
+/// looks perfectly converged to both the drift check and the bridge's own
+/// `reconcile_models`, which short-circuits on an unchanged `model_hash`.
+fn model_order_to_push(rows: &[Value], models: &[Value]) -> Option<Vec<String>> {
+    let desired = desired_model_order(rows, models)?;
+    if current_model_order(rows).as_deref() == Some(desired.as_slice()) {
+        return None;
+    }
+    Some(desired)
+}
+
+/// Pushes the binding order when, and only when, the bridge disagrees with it.
+///
+/// One list read answers both "is the order right" and "what are the hashes", so
+/// the healthy path costs no request at all.
+async fn sync_model_order(port: u16, rows: &[Value], models: &[Value]) -> Result<(), String> {
+    match model_order_to_push(rows, models) {
+        Some(order) => push_model_order(port, &order).await,
+        None => Ok(()),
+    }
+}
+
+/// Rewrites the bridge's stored `sort_order` to match `hashes`.
+///
+/// The bridge writes `sort_order = index + 1` here, while `reconcile` writes
+/// 0-based values. The difference does not matter: every reader orders with
+/// `ORDER BY sort_order, display_name` and nothing reads the absolute value, so
+/// both are just relative ranks.
+async fn push_model_order(port: u16, hashes: &[String]) -> Result<(), String> {
+    let client = http_client(HTTP_TIMEOUT)?;
+    let url = format!("{}/models/order", bridge_base(port));
+    send_json(
+        &client,
+        reqwest::Method::PUT,
+        &url,
+        &json!({ "model_hashes": hashes }),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Projects the bridge's model rows onto what the UI needs.
@@ -958,22 +1109,34 @@ fn fingerprints_match(stored: &[Value], desired: &[Value]) -> bool {
 /// Converges the bridge onto the persisted binding list.
 ///
 /// Called on start and whenever drift is detected, so a relay port change heals
-/// itself instead of leaving a second copy of every model behind.
+/// itself instead of leaving a second copy of every model behind. The binding
+/// *order* is converged here too, and that is not redundant: `reconcile_models`
+/// short-circuits a binding whose `model_hash` is unchanged, and `sort_order` is
+/// not part of that hash, so a reorder-only save would otherwise leave the stored
+/// order untouched.
+///
+/// A failed order push does not fail this call. `sort_order` only affects the
+/// order Cursor lists models in, so losing it must not fail a binding save; the
+/// failure is logged here and retried by the next status read (see
+/// [`reconcile_if_drifted`], which reports it through `last_error`).
 async fn reconcile(port: u16, app: &AppHandle, inner: &Arc<CursorBridgeInner>) -> Result<usize, String> {
     let state = app_state_snapshot(app)?;
     let payload = {
         let config = locked(&inner.config, "Cursor 桥接配置")?.clone();
         build_sync_payload(&config, &state)
     };
-    push_models(port, &payload.models).await?;
+    let rows = push_models(port, &payload.models).await?;
+    if let Err(error) = sync_model_order(port, &rows, &payload.models).await {
+        eprintln!("cursor-bridge: pushing the model order failed: {error}");
+    }
     Ok(payload.models.len())
 }
 
 /// Reconciles only when the bridge's rows disagree with what CodeRelay wants.
 ///
-/// `Ok(None)` means already converged. This is the routine called on every
-/// status read, so it must stay cheap: one list request, and a write only on
-/// real drift.
+/// `Ok(None)` means nothing was written; `Ok(Some(n))` means a write covering `n`
+/// models happened. This is the routine called on every status read, so it must
+/// stay cheap: one list request, and a write only on real drift.
 async fn reconcile_if_drifted(
     port: u16,
     app: &AppHandle,
@@ -985,10 +1148,20 @@ async fn reconcile_if_drifted(
         build_sync_payload(&config, &state)
     };
     let stored = fetch_models(port).await?;
-    if fingerprints_match(&stored, &payload.models) {
-        return Ok(None);
+    if !fingerprints_match(&stored, &payload.models) {
+        return reconcile(port, app, inner).await.map(Some);
     }
-    reconcile(port, app, inner).await.map(Some)
+    // The rows are identical, but that verdict is deliberately blind to order:
+    // `sort_order` is not part of [`ModelFingerprint`]. A reorder-only edit lands
+    // here, so the order is checked before returning "converged" — otherwise this
+    // early return would be the one path that skips the push.
+    match model_order_to_push(&stored, &payload.models) {
+        Some(order) => {
+            push_model_order(port, &order).await?;
+            Ok(Some(payload.models.len()))
+        }
+        None => Ok(None),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1507,4 +1680,199 @@ async fn apply_preferences(
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One desired payload, shaped the way `model_payload` shapes it.
+    fn desired(name: &str, model_id: &str, api_key: &str) -> Value {
+        json!({
+            "display_name": name,
+            "model_id": model_id,
+            "api_key": api_key,
+            "base_url": "http://127.0.0.1:11435/v1",
+        })
+    }
+
+    /// One stored row, shaped the way the bridge's control API returns it: the
+    /// credential is a digest, never the key.
+    fn stored(hash: &str, name: &str, model_id: &str, api_key: &str, sort_order: i64) -> Value {
+        json!({
+            "model_hash": hash,
+            "display_name": name,
+            "model_id": model_id,
+            "api_key_fingerprint": api_key_fingerprint(api_key),
+            "base_url": "http://127.0.0.1:11435/v1",
+            "sort_order": sort_order,
+        })
+    }
+
+    /// The §25.7 experiment in miniature: identical identities, reversed order.
+    fn reordered_fixture() -> (Vec<Value>, Vec<Value>) {
+        let rows = vec![
+            stored("hash-a", "Alpha", "m1", "sk-1", 0),
+            stored("hash-b", "Beta", "m2", "sk-2", 1),
+            stored("hash-c", "Gamma", "m3", "sk-3", 2),
+        ];
+        let models = vec![
+            desired("Gamma", "m3", "sk-3"),
+            desired("Alpha", "m1", "sk-1"),
+            desired("Beta", "m2", "sk-2"),
+        ];
+        (rows, models)
+    }
+
+    #[test]
+    fn desired_order_follows_the_binding_array_not_the_stored_ranks() {
+        let (rows, models) = reordered_fixture();
+        // Rows arrive in stored order; the desired list is the authority.
+        assert_eq!(
+            desired_model_order(&rows, &models),
+            Some(vec![
+                "hash-c".to_string(),
+                "hash-a".to_string(),
+                "hash-b".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn current_order_reconstructs_the_selector_order() {
+        let (rows, _) = reordered_fixture();
+        // Deliberately scrambled on the wire; `ORDER BY sort_order` decides.
+        let shuffled = vec![rows[2].clone(), rows[0].clone(), rows[1].clone()];
+        assert_eq!(
+            current_model_order(&shuffled),
+            Some(vec![
+                "hash-a".to_string(),
+                "hash-b".to_string(),
+                "hash-c".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn duplicate_ranks_are_reported_as_unknown_rather_than_guessed() {
+        // Reachable in practice: a binding whose key changed goes through
+        // `update_model` and takes its payload index, while its neighbours are
+        // short-circuited and keep their stored ranks.
+        let rows = vec![
+            stored("hash-a", "Alpha", "m1", "sk-1", 0),
+            stored("hash-b", "Beta", "m2", "sk-2", 0),
+        ];
+        assert_eq!(current_model_order(&rows), None);
+        // Anything other than the desired order — `None` included — must push, or
+        // the tie would be settled by `display_name` forever.
+        let models = vec![
+            desired("Beta", "m2", "sk-2"),
+            desired("Alpha", "m1", "sk-1"),
+        ];
+        assert_eq!(
+            model_order_to_push(&rows, &models),
+            Some(vec!["hash-b".to_string(), "hash-a".to_string()])
+        );
+    }
+
+    /// The regression this whole change exists for.
+    ///
+    /// With identities untouched, the fingerprint check — which is what gates
+    /// `reconcile` — reports "converged", and the bridge's own `reconcile_models`
+    /// short-circuits each binding because `model_hash` is unchanged. If the order
+    /// push were placed after that check, this state would persist forever.
+    #[test]
+    fn reorder_only_still_produces_a_push_even_though_fingerprints_match() {
+        let (rows, models) = reordered_fixture();
+        assert!(
+            fingerprints_match(&rows, &models),
+            "the fixture must be indistinguishable to the drift check"
+        );
+        assert_eq!(
+            model_order_to_push(&rows, &models),
+            Some(vec![
+                "hash-c".to_string(),
+                "hash-a".to_string(),
+                "hash-b".to_string()
+            ]),
+            "a single request must be able to settle this state"
+        );
+    }
+
+    #[test]
+    fn matching_order_pushes_nothing() {
+        let (rows, _) = reordered_fixture();
+        let already_ordered = vec![
+            desired("Alpha", "m1", "sk-1"),
+            desired("Beta", "m2", "sk-2"),
+            desired("Gamma", "m3", "sk-3"),
+        ];
+        assert_eq!(model_order_to_push(&rows, &already_ordered), None);
+    }
+
+    #[test]
+    fn an_unmatchable_payload_yields_no_order_instead_of_a_wrong_one() {
+        let (rows, _) = reordered_fixture();
+        // A binding whose key is missing never reaches the payload, so the two
+        // sides no longer describe the same set. `reorder_models` would reject
+        // this, so nothing is proposed.
+        let short = vec![
+            desired("Gamma", "m3", "sk-3"),
+            desired("Alpha", "m1", "sk-1"),
+        ];
+        assert_eq!(desired_model_order(&rows, &short), None);
+        assert_eq!(model_order_to_push(&rows, &short), None);
+    }
+
+    #[test]
+    fn identical_display_names_are_told_apart_by_model_id_and_key() {
+        let rows = vec![
+            stored("hash-1", "Shared", "m1", "sk-1", 0),
+            stored("hash-2", "Shared", "m2", "sk-2", 1),
+            stored("hash-3", "Shared", "m1", "sk-2", 2),
+        ];
+        let models = vec![
+            desired("Shared", "m1", "sk-2"),
+            desired("Shared", "m2", "sk-2"),
+            desired("Shared", "m1", "sk-1"),
+        ];
+        assert_eq!(
+            desired_model_order(&rows, &models),
+            Some(vec![
+                "hash-3".to_string(),
+                "hash-2".to_string(),
+                "hash-1".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn whitespace_in_a_binding_name_does_not_block_the_order() {
+        // The bridge trims on write; the payload carries the binding as typed.
+        let rows = vec![stored("hash-a", "Alpha", "m1", "sk-1", 0)];
+        let models = vec![desired(" Alpha ", " m1 ", "sk-1")];
+        assert_eq!(
+            desired_model_order(&rows, &models),
+            Some(vec!["hash-a".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_blank_credential_matches_the_null_digest_the_bridge_reports() {
+        // `api_key_fingerprint` is `null` for an absent key, and `None` rather
+        // than a refusal is what keeps a keyless row matchable. The bridge rejects
+        // an empty key at reconcile time, so this cannot diverge in practice.
+        let mut row = stored("hash-a", "Alpha", "m1", "sk-1", 0);
+        row["api_key_fingerprint"] = Value::Null;
+        let model = json!({
+            "display_name": "Alpha",
+            "model_id": "m1",
+            "api_key": "",
+            "base_url": "http://127.0.0.1:11435/v1",
+        });
+        assert_eq!(
+            desired_model_order(&[row], &[model]),
+            Some(vec!["hash-a".to_string()])
+        );
+    }
 }
