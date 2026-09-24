@@ -1520,26 +1520,13 @@ pub async fn cursor_bridge_set_enabled(
     build_status(&app, &inner).await
 }
 
-#[tauri::command]
-pub async fn cursor_bridge_sync_models(
-    app: AppHandle,
-    runtime: State<'_, CursorBridgeState>,
-) -> Result<CursorBridgeStatus, String> {
-    let inner = runtime.inner.clone();
-    drop(runtime);
-    if let Some(port) = current_port() {
-        reconcile(port, &app, &inner).await?;
-    }
-    build_status(&app, &inner).await
-}
-
 /// Persists the binding list.
 ///
 /// Not in the plan's command list, but the plan's flow is unimplementable
 /// without it: the frontend has to hand the edited list to the process that
-/// owns `cursor-bridge.json` before `cursor_bridge_sync_models` can push it to
-/// the bridge. Kept as a separate command so reading status stays side-effect
-/// free apart from the drift check.
+/// owns `cursor-bridge.json` and reconciles it into the bridge. Kept as a
+/// separate command so reading status stays side-effect free apart from the
+/// drift check.
 #[tauri::command]
 pub async fn cursor_bridge_save_bindings(
     app: AppHandle,

@@ -106,7 +106,6 @@ pub fn run() {
             cursor_bridge::cursor_bridge_init_ca,
             cursor_bridge::cursor_bridge_install_command,
             cursor_bridge::cursor_bridge_set_enabled,
-            cursor_bridge::cursor_bridge_sync_models,
             cursor_bridge::cursor_bridge_save_bindings,
             cursor_bridge::cursor_bridge_save_preferences,
             update::check_for_update,
