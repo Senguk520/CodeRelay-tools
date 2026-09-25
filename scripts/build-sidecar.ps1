@@ -19,4 +19,17 @@ try {
 } finally {
   Pop-Location
 }
+
+# The Go linker replaces a running binary by renaming it aside to a single fixed
+# `<name>~`, so at most one such leftover exists per binary. It reuses that name
+# on the next conflicting build but leaves a stale one alone when the target is
+# free, so sweep it here best-effort: a leftover whose old process is still
+# running cannot be deleted at all, and that must never fail the build. The
+# pattern cannot match the canonical binary, which is never a candidate.
+$binDir = Split-Path $bin
+$binName = Split-Path $bin -Leaf
+Get-ChildItem -LiteralPath $binDir -File -Force -ErrorAction SilentlyContinue |
+  Where-Object { $_.Name -like "$binName~" } |
+  Remove-Item -Force -ErrorAction SilentlyContinue
+
 Write-Host "Built $bin"

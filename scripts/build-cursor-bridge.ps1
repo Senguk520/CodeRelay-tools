@@ -37,5 +37,40 @@ if (-not (Test-Path $built)) {
 
 $bin = Join-Path $bridge "bin\cursor-bridge-$targetTriple$extension"
 New-Item -ItemType Directory -Force (Split-Path $bin) | Out-Null
-Copy-Item -Force $built $bin
+
+# `Copy-Item -Force` cannot be used here: Windows lets a running process keep its
+# mapped image while the file is renamed, but it refuses to overwrite that image
+# in place, so the copy fails with a sharing violation whenever the bridge is
+# already running -- which is the normal case during `tauri:build`. Stage the new
+# binary beside the target instead, then rename it into place; only when the
+# target name is truly in use is that name moved aside first.
+#
+# The staging file has to sit in the target directory: F: -> H: is a different
+# volume, and a cross-volume rename is a copy, which the running process blocks.
+$staged = "$bin.new"
+Remove-Item -Force -LiteralPath $staged -ErrorAction SilentlyContinue
+Copy-Item -Force $built $staged
+try {
+  Move-Item -Force -LiteralPath $staged -Destination $bin -ErrorAction Stop
+} catch {
+  if (-not (Test-Path -LiteralPath $staged)) { throw }
+  # The aside name carries a timestamp on purpose: a fixed name such as `~` is
+  # taken by the running process's image, so from the second conflict onwards the
+  # move-aside has nowhere to put the name and fails.
+  $aside = "$bin.old-$(Get-Date -Format yyyyMMddHHmmss)"
+  Move-Item -Force -LiteralPath $bin -Destination $aside -ErrorAction Stop
+  Move-Item -Force -LiteralPath $staged -Destination $bin -ErrorAction Stop
+}
+
+# Each conflicting replacement above leaves one `<name>.old-<timestamp>` behind
+# (an interrupted run can leave `<name>.new`, and older hand-rolled workflows
+# left `<name>~`). Sweep them up best-effort: debris that an old process still
+# maps cannot be deleted at all, and that must never fail the build. None of the
+# patterns match the canonical binary, so it is never a candidate.
+$binDir = Split-Path $bin
+$binName = Split-Path $bin -Leaf
+Get-ChildItem -LiteralPath $binDir -File -Force -ErrorAction SilentlyContinue |
+  Where-Object { $_.Name -like "$binName.old-*" -or $_.Name -like "$binName.new" -or $_.Name -like "$binName~" } |
+  Remove-Item -Force -ErrorAction SilentlyContinue
+
 Write-Host "Built $bin"
