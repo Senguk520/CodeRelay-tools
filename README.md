@@ -185,3 +185,9 @@ go test ./...
 ## 免责声明
 
 CodeRelay 是独立的第三方工具，与腾讯、CodeBuddy 官方无关。请遵守 CodeBuddy 及相关上游服务的使用条款，仅将其用于合法、合规的学习与个人用途。账号凭据、Token 与 API Key 均只保存在本地，本项目不收集、不上传任何凭据。
+
+---
+
+## 交流群
+<img width="563" height="703" alt="image" src="https://github.com/user-attachments/assets/e7576847-2f6c-4dd0-a60b-68d2b4f9f3a6" />
+
