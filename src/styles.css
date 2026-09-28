@@ -503,3 +503,15 @@ html[data-theme='dark'] .nav-badge { box-shadow: 0 0 0 2px var(--app-bg); }
 .compact-toggle .toggle-copy small { font-size: 9px; }
 .compact-toggle:has(input:disabled) { opacity: .5; }
 html[data-theme='dark'] .inline-warning { color: var(--yellow); background: var(--yellow-soft); border-color: rgba(195, 153, 78, .28); }
+/* —— 账号编辑弹窗（账号池行内铅笔按钮）——
+   复用 .modal / .modal-form / .field / .modal-footer / .inline-error；
+   这里只补两处结构性样式：头像预览与输入框同排、只读字段的元信息栅格。
+   刻意不用 .form-grid：.modal-form 的字段间距只作用于直接子级
+   （.modal-form > .field + .field），再套一层 grid 会把间距叠歪。 */
+.account-edit-name { display: flex; align-items: center; gap: 9px; }
+.account-edit-name input { width: auto; flex: 1; min-width: 0; }
+.account-edit-meta { display: grid; grid-template-columns: repeat(2, 1fr); gap: 9px; margin-top: 17px; }
+.account-edit-meta > div { display: flex; flex-direction: column; gap: 3px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); }
+.account-edit-meta span { color: var(--subtle); font-size: 10px; }
+.account-edit-meta strong { overflow-wrap: anywhere; color: var(--ink-strong); font-family: 'DM Mono', monospace; font-size: 11px; font-weight: 500; }
+.account-edit-alert { margin: 17px 0 0; }

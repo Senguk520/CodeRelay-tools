@@ -452,7 +452,7 @@ export function App() {
         {page === 'service' && <ServicePage state={state} onApply={async (config) => { updateState(await saveConfig(config)); }} notify={notify} />}
         {page === 'keys' && <KeysPage state={state} onAdd={() => { setEditingKey(null); setShowKeyModal(true); }} onEdit={(key) => { setEditingKey(key); setShowKeyModal(true); }} onSave={(keys) => void runAction(() => saveKeys(keys), 'API Key 已更新', 'save')} notify={notify} />}
         {page === 'logs' && <LogsPage state={state} onClear={() => void runAction(clearLogs, '请求日志已清理', 'save')} notify={notify} />}
-        {page === 'accounts' && <AccountsPage state={state} blocked={busy !== null} onAdd={() => { setAccountModalMode('browser'); setShowAccountModal(true); }} onImport={() => { setAccountModalMode('file'); setShowAccountModal(true); }} onSave={(accounts) => void runAction(() => saveAccounts(accounts), '账号列表已更新', 'save')} onRefresh={handleRefreshAccount} onRefreshAll={handleRefreshAll} onCheckin={() => setShowCheckinModal(true)} notify={notify} />}
+        {page === 'accounts' && <AccountsPage state={state} blocked={busy !== null} onAdd={() => { setAccountModalMode('browser'); setShowAccountModal(true); }} onImport={() => { setAccountModalMode('file'); setShowAccountModal(true); }} onSave={(accounts, message) => void runAction(() => saveAccounts(accounts), message ?? '账号列表已更新', 'save')} onRefresh={handleRefreshAccount} onRefreshAll={handleRefreshAll} onCheckin={() => setShowCheckinModal(true)} notify={notify} />}
         {page === 'models' && <ModelsPage state={state} notify={notify} />}
         {page === 'cursor' && <CursorPage state={state} notify={notify} />}
         {page === 'settings' && <SettingsPage onReset={resetLocalState} notify={notify} updateInfo={updateInfo} updateError={updateError} checkingUpdate={checkingUpdate} onCheckUpdate={() => { void handleCheckUpdate(); }} onShowUpdate={() => setShowUpdateModal(true)} />}
@@ -773,7 +773,7 @@ function reorderVisibleAccounts(all: Account[], visibleIds: Set<string>, newVisi
   return all.map((account) => (visibleIds.has(account.id) ? byId.get(newVisibleOrder[cursor++]) ?? account : account));
 }
 
-function AccountsPage({ state, blocked, onAdd, onImport, onSave, onRefresh, onRefreshAll, onCheckin, notify }: { state: AppState; blocked: boolean; onAdd: () => void; onImport: () => void; onSave: (accounts: Account[]) => void; onRefresh: (account: Account) => Promise<void>; onRefreshAll: () => Promise<void>; onCheckin: () => void; notify: NoticeHandler }) {
+function AccountsPage({ state, blocked, onAdd, onImport, onSave, onRefresh, onRefreshAll, onCheckin, notify }: { state: AppState; blocked: boolean; onAdd: () => void; onImport: () => void; onSave: (accounts: Account[], message?: string) => void; onRefresh: (account: Account) => Promise<void>; onRefreshAll: () => Promise<void>; onCheckin: () => void; notify: NoticeHandler }) {
   const [query, setQuery] = useState('');
   const [region, setRegion] = useState<'all' | 'cn'>('all');
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
@@ -800,6 +800,15 @@ function AccountsPage({ state, blocked, onAdd, onImport, onSave, onRefresh, onRe
     }
   };
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  // 编辑弹窗只持有账号 ID，账号对象每次从最新 state 派生：刷新额度后弹窗里的只读信息不会停在旧值。
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const editingAccount = editingId ? state.accounts.find((item) => item.id === editingId) ?? null : null;
+  /** 保存账号名与备注：与删除同一路径——先把挂起的拖拽顺序合并提交，避免顺序被这份旧列表覆盖。 */
+  const saveAccountEdit = (id: string, patch: { email: string; tags: string[] }) => {
+    const pending = cancelOrderSave();
+    const next = orderedAccounts(pending ?? orderOverride).map((item) => (item.id === id ? { ...item, email: patch.email, tags: patch.tags } : item));
+    onSave(next, `已更新账号 ${patch.email}`);
+  };
   const allVisibleSelected = accounts.length > 0 && accounts.every((account) => selected.has(account.id));
   const toggleSelect = (id: string) => setSelected((prev) => { const next = new Set(prev); next.has(id) ? next.delete(id) : next.add(id); return next; });
   const toggleSelectAll = () => setSelected(allVisibleSelected ? new Set() : new Set(accounts.map((account) => account.id)));
@@ -1095,7 +1104,7 @@ function AccountsPage({ state, blocked, onAdd, onImport, onSave, onRefresh, onRe
             const rowStyle: CSSProperties = isDragging
               ? { transform: `translateY(${dragView?.dy ?? 0}px) scale(1.02)` }
               : shift ? { transform: `translateY(${shift}px)` } : {};
-            return <div className={`table-row${isPressing ? ' drag-pressing' : ''}${isDragging ? ' drag-active' : ''}${shift ? ' drag-shift' : ''}`} style={rowStyle} key={account.id} title="长按可拖动排序" onPointerDown={(event) => handlePressStart(event, account, index)} onPointerMove={handlePressMove} onPointerUp={() => finishDragRef.current(true)} onPointerCancel={() => finishDragRef.current(false)} onPointerLeave={cancelPress}><div className="row-check"><input type="checkbox" className="check-box" checked={selected.has(account.id)} onChange={() => toggleSelect(account.id)} aria-label={`选择账号 ${account.email}`} /></div><div className="account-name"><span className="account-avatar">{account.email.slice(0, 1).toUpperCase()}</span><div><strong>{account.email}</strong><small>CodeBuddy 中国站</small></div></div><span className={`plan-badge plan-${account.plan.toLowerCase()}`}>{account.plan || '未知'}</span><StatusPill tone={statusClass[account.status]}>{statusLabels[account.status]}</StatusPill><div className="quota-cell"><div className="quota-line"><span>{formatNumber(account.quota)}</span><small>/ {formatNumber(account.quotaTotal)}</small></div><div className="quota-bar"><span style={{ width: `${Math.min(100, account.quota / Math.max(1, account.quotaTotal) * 100)}%` }} /></div></div><span className="muted-text">{formatDate(account.lastUsed)}</span><div className="tag-list">{account.tags.map((tag) => <span key={tag}>{tag}</span>)}</div><div className="row-actions"><IconButton label="导出账号" onClick={() => exportOne(account)}><Download size={15} /></IconButton><IconButton label={refreshingId === account.id ? '正在刷新额度' : '刷新额度'} onClick={() => { void runRefresh(account); }} disabled={refreshBusy}><RefreshCw size={15} className={refreshingId === account.id ? 'spin' : ''} /></IconButton><IconButton label="删除账号" danger onClick={() => remove(account)}><Trash2 size={15} /></IconButton></div></div>; })}</div> : <EmptyState icon={Users} title="还没有 CodeBuddy 账号" description="添加账号后，CodeRelay 才能为请求选择上游凭据。" action={<button className="button primary" onClick={onAdd}><Plus size={15} />添加第一个账号</button>} />}</div><div className="account-footnote"><span><ShieldCheck size={15} />Token 仅在桌面端凭据文件中保存，页面不回显完整凭据。</span></div></>;
+            return <div className={`table-row${isPressing ? ' drag-pressing' : ''}${isDragging ? ' drag-active' : ''}${shift ? ' drag-shift' : ''}`} style={rowStyle} key={account.id} title="长按可拖动排序" onPointerDown={(event) => handlePressStart(event, account, index)} onPointerMove={handlePressMove} onPointerUp={() => finishDragRef.current(true)} onPointerCancel={() => finishDragRef.current(false)} onPointerLeave={cancelPress}><div className="row-check"><input type="checkbox" className="check-box" checked={selected.has(account.id)} onChange={() => toggleSelect(account.id)} aria-label={`选择账号 ${account.email}`} /></div><div className="account-name"><span className="account-avatar">{account.email.slice(0, 1).toUpperCase()}</span><div><strong>{account.email}</strong><small>CodeBuddy 中国站</small></div></div><span className={`plan-badge plan-${account.plan.toLowerCase()}`}>{account.plan || '未知'}</span><StatusPill tone={statusClass[account.status]}>{statusLabels[account.status]}</StatusPill><div className="quota-cell"><div className="quota-line"><span>{formatNumber(account.quota)}</span><small>/ {formatNumber(account.quotaTotal)}</small></div><div className="quota-bar"><span style={{ width: `${Math.min(100, account.quota / Math.max(1, account.quotaTotal) * 100)}%` }} /></div></div><span className="muted-text">{formatDate(account.lastUsed)}</span><div className="tag-list">{account.tags.map((tag) => <span key={tag}>{tag}</span>)}</div><div className="row-actions"><IconButton label="编辑账号" onClick={() => setEditingId(account.id)}><Pencil size={15} /></IconButton><IconButton label="导出账号" onClick={() => exportOne(account)}><Download size={15} /></IconButton><IconButton label={refreshingId === account.id ? '正在刷新额度' : '刷新额度'} onClick={() => { void runRefresh(account); }} disabled={refreshBusy}><RefreshCw size={15} className={refreshingId === account.id ? 'spin' : ''} /></IconButton><IconButton label="删除账号" danger onClick={() => remove(account)}><Trash2 size={15} /></IconButton></div></div>; })}</div> : <EmptyState icon={Users} title="还没有 CodeBuddy 账号" description="添加账号后，CodeRelay 才能为请求选择上游凭据。" action={<button className="button primary" onClick={onAdd}><Plus size={15} />添加第一个账号</button>} />}</div><div className="account-footnote"><span><ShieldCheck size={15} />Token 仅在桌面端凭据文件中保存，页面不回显完整凭据。</span></div>{editingAccount && <AccountEditModal account={editingAccount} siblings={state.accounts.filter((item) => item.id !== editingAccount.id).map((item) => item.email)} onClose={() => setEditingId(null)} onSave={(id, patch) => { setEditingId(null); saveAccountEdit(id, patch); }} />}</>;
 }
 
 type CheckinUiState = 'loading' | 'available' | 'claimed' | 'inactive' | 'error';
@@ -2367,6 +2376,66 @@ function AccountModal({ existingAccounts, initialMode = 'browser', onClose, onSa
   const primaryDisabled = (mode === 'browser' && (phase === 'starting' || phase === 'waiting')) || (mode === 'file' && !selectedImportCount) || (mode === 'token' && !tokenLooksValid);
 
   return <Modal title="添加 CodeBuddy 账号" onClose={closeModal} wide><div className="modal-split"><div className="modal-methods"><button className={mode === 'browser' ? 'active' : ''} onClick={() => setMode('browser')}><Globe2 size={16} /><span>浏览器认证</span><small>OAuth / 网页登录</small></button><button className={mode === 'token' ? 'active' : ''} onClick={() => setMode('token')}><KeyRound size={16} /><span>手动粘贴 Token</span></button><button className={mode === 'file' ? 'active' : ''} onClick={() => setMode('file')}><FolderOpen size={16} /><span>导入配置文件</span></button></div><div className="modal-method-content">{mode === 'browser' && <div className="method-content"><span className="large-method-icon"><Globe2 size={24} /></span><h3>通过 CodeBuddy CN 完成浏览器认证</h3><p>选择下面任一方式，CodeRelay 会在系统浏览器中打开 CodeBuddy CN 官方授权页。完成登录后凭据自动回收并保存，不需要手动复制 Token。</p>{phase === 'idle' && <div className="oauth-actions"><button className="button primary" onClick={() => { void beginAuth(); }}><KeyRound size={15} />OAuth 授权</button><button className="button ghost" onClick={() => { void beginAuth(); }}><Globe2 size={15} />网页登录</button></div>}{phase === 'starting' && <div className="oauth-status"><span className="pulse-dot" /><span>正在向 CodeBuddy CN 发起认证…</span></div>}{phase === 'waiting' && <div className="oauth-status"><span className="pulse-dot" /><span>已在系统浏览器打开授权页，等待完成登录（10 分钟内有效）…</span><button className="button ghost" onClick={() => { void cancelAuth(); }}>取消认证</button></div>}{phase === 'success' && oauthResult && <div className="import-preview"><strong>认证成功，请确认账号信息</strong><span><Check size={13} />账号：{oauthResult.email || '未命名账号'}</span>{oauthResult.uid && <span><Check size={13} />UID：{oauthResult.uid}</span>}{oauthResult.enterpriseId && <span><Check size={13} />企业：{oauthResult.enterpriseId}</span>}</div>}{phase === 'error' && <div className="inline-error"><AlertTriangle size={15} /><span>{oauthError ?? '认证失败，请重试'}</span><button className="button ghost" onClick={() => { void beginAuth(); }}>重试</button></div>}</div>}{mode === 'token' && <div className="method-content"><span className="large-method-icon"><KeyRound size={24} /></span><h3>粘贴 CodeBuddy Token</h3><p>Token 只写入桌面端凭据文件。建议先点击“验证 Token”读取账号信息，再保存。</p><label className="field"><span>Token</span><div className="input-with-action"><textarea value={token} onChange={(e) => { setToken(e.target.value.trimStart()); setTokenValidation({ state: 'idle' }); }} placeholder="粘贴 Token" rows={4} style={{ WebkitTextSecurity: showToken ? 'none' : 'disc' } as CSSProperties} /><IconButton label={showToken ? '隐藏 Token' : '显示 Token'} onClick={() => setShowToken((value) => !value)}>{showToken ? <EyeOff size={15} /> : <Eye size={15} />}</IconButton></div><small>{tokenLooksValid ? '已完成基本格式检查，可执行验证。' : '请粘贴完整 Token。'}</small></label><div className="oauth-actions"><button className="button ghost" disabled={!tokenLooksValid || tokenValidation.state === 'checking'} onClick={() => { void runValidate(); }}><ShieldCheck size={15} />{tokenValidation.state === 'checking' ? '验证中…' : '验证 Token'}</button></div>{tokenValidation.state === 'ok' && <div className="import-preview"><strong>验证成功</strong><span><Check size={13} />账号：{tokenValidation.result.email || '未命名账号'}</span>{tokenValidation.result.uid && <span><Check size={13} />UID：{tokenValidation.result.uid}</span>}{tokenValidation.result.enterpriseId && <span><Check size={13} />企业：{tokenValidation.result.enterpriseId}</span>}</div>}{tokenValidation.state === 'error' && <div className="inline-error"><AlertTriangle size={15} /><span>{tokenValidation.message}</span></div>}<label className="field"><span>账号邮箱（可选）</span><input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="未验证 Token 时用于列表展示" /></label></div>}{mode === 'file' && <div className="method-content"><span className="large-method-icon"><FileJson size={24} /></span><h3>导入已有账号配置</h3><p>支持包含 accounts 数组或单个账号对象的 JSON。与现有账号重复的条目会自动标记并默认跳过。</p><label className="drop-zone"><Upload size={22} /><strong>{fileName || '选择 JSON 文件'}</strong><span>不会在选择文件时自动写入</span><input type="file" accept=".json,application/json" onChange={(e) => { void handleFile(e.target.files?.[0]); }} /></label>{imported.length > 0 && <div className="import-preview"><strong>导入预览：共 {imported.length} 项，将导入 {selectedImportCount} 项{duplicateImportCount ? `，${duplicateImportCount} 项重复已跳过` : ''}</strong>{imported.map((entry, index) => <label key={entry.account.id}><input type="checkbox" disabled={entry.duplicate} checked={entry.selected && !entry.duplicate} onChange={(e) => setImported((items) => items.map((item, itemIndex) => itemIndex === index ? { ...item, selected: e.target.checked } : item))} /><span>{entry.duplicate ? `重复 · ${entry.source}` : entry.source}</span></label>)}</div>}</div>}</div></div><div className="modal-footer"><button className="button ghost" onClick={closeModal}>取消</button><button className="button primary" disabled={primaryDisabled} onClick={submit}>{primaryLabel}</button></div></Modal>;
+}
+
+/**
+ * 账号编辑弹窗：只暴露真正由用户拥有的字段。
+ *
+ * 可编辑的是 `email`（列表里的账号名）与 `tags`（备注）；其余字段都不是用户资产：
+ * - `plan` / `quota` / `quotaTotal` / `domain`：额度刷新时被上游返回值整体覆盖
+ *   （`gateway.rs` 的 `refresh_account_inner`）；
+ * - `status` / `failures`：由刷新结果、sidecar 运行事件与签到推导；
+ * - `lastUsed` / `lastCheckin` / `checkinStreak`：运行时统计。
+ * 手改它们要么下一次刷新被覆盖，要么会误导调度，因此这里只读展示。
+ *
+ * 后端 `save_accounts` 只接受 `models.rs` 中 `Account` 已声明的字段（serde 默认忽略
+ * 未知字段），所以本次不新增字段：改的就是既有的 `email` 与 `tags`，无需改动 Rust。
+ */
+function AccountEditModal({ account, siblings, onClose, onSave }: { account: Account; siblings: string[]; onClose: () => void; onSave: (id: string, patch: { email: string; tags: string[] }) => void }) {
+  const [name, setName] = useState(account.email);
+  const [note, setNote] = useState(account.tags.join('，'));
+  const [error, setError] = useState<string | null>(null);
+
+  const trimmed = name.trim();
+  // 同名账号不会被拦截（`2c08d33` 明确放开了 email 去重），但两行长得一样时用户会以为丢了一个账号，所以提示一下。
+  const duplicate = trimmed.length > 0 && siblings.some((other) => other.trim().toLowerCase() === trimmed.toLowerCase());
+
+  const submit = () => {
+    if (!trimmed) { setError('显示名称不能为空：列表里的账号名与圆形头像都取它。'); return; }
+    if (trimmed.length > 40) { setError(`显示名称有 ${trimmed.length} 个字符，请控制在 40 个字符以内。`); return; }
+    // 备注按逗号 / 顿号 / 换行切分，去空白、去重：标签列表用文本做 key，重复项会产生重复 key。
+    const tags = [...new Set(note.split(/[,，、\n]/).map((tag) => tag.trim()).filter(Boolean))];
+    if (tags.length > 6) { setError(`备注最多 6 条，当前 ${tags.length} 条，请合并或删减。`); return; }
+    const oversized = tags.find((tag) => tag.length > 12);
+    if (oversized) { setError(`备注「${oversized}」有 ${oversized.length} 个字符，单条请控制在 12 个字符以内（它以标签形式显示在「标签」列）。`); return; }
+    onSave(account.id, { email: trimmed, tags });
+  };
+
+  return <Modal title="编辑账号" onClose={onClose}>
+    <div className="modal-form">
+      <p className="modal-lead">这里只修改 CodeRelay 本地保存的账号名与备注。套餐、额度、健康状态由上游刷新与运行事件写回，手改不会保留，因此只读展示。</p>
+      <Field label="显示名称" hint={duplicate ? `另有账号使用相同名称，保存后两行会显示成一样。账号身份由内部 ID 决定，两行仍是两个独立账号。` : '即账号的 email 字段，刷新额度不会覆盖它；圆形头像取它的第一个字符，导出文件名也用它。'}>
+        <div className="account-edit-name">
+          <span className="account-avatar">{(trimmed || '?').slice(0, 1).toUpperCase()}</span>
+          <input autoFocus value={name} onChange={(e) => { setName(e.target.value); setError(null); }} placeholder="例如：飞狐 / 主号 / 13534608225" />
+        </div>
+      </Field>
+      <Field label="备注" hint="用逗号分隔，最多 6 条、每条 12 个字符以内，显示在列表的「标签」列；重复项会自动合并。">
+        <input value={note} onChange={(e) => { setNote(e.target.value); setError(null); }} placeholder="例如：主号，已充值" />
+      </Field>
+      {error && <div className="inline-error account-edit-alert"><AlertTriangle size={15} /><span>{error}</span></div>}
+      <div className="account-edit-meta">
+        <div><span>套餐</span><strong>{account.plan || '未知'}</strong></div>
+        <div><span>健康状态</span><strong>{statusLabels[account.status]}</strong></div>
+        <div><span>额度</span><strong>{formatNumber(account.quota)} / {formatNumber(account.quotaTotal)}</strong></div>
+        <div><span>最近使用</span><strong>{formatDate(account.lastUsed)}</strong></div>
+      </div>
+    </div>
+    <div className="modal-footer">
+      <button className="button ghost" onClick={onClose}>取消</button>
+      <button className="button primary" onClick={submit}><Check size={15} />保存修改</button>
+    </div>
+  </Modal>;
 }
 
 function KeyModal({ accounts, existingKey, onClose, onSave }: { accounts: Account[]; existingKey?: ApiKey | null; onClose: () => void; onSave: (key: ApiKey) => void }) {
