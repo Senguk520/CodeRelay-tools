@@ -461,7 +461,7 @@ export function App() {
     </main>
     {notice && <div className="toast success-toast"><Check size={16} />{notice}</div>}
     {error && <div className="toast error-toast"><AlertTriangle size={16} />{error}</div>}
-    {showAccountModal && <AccountModal existingAccounts={state.accounts} initialMode={accountModalMode} onClose={() => setShowAccountModal(false)} onSave={(accounts, summary) => { setShowAccountModal(false); void runAction(() => { const ids = new Set(accounts.map((account) => account.id)); const emails = new Set(accounts.map((account) => account.email.trim().toLowerCase()).filter(Boolean)); const kept = state.accounts.filter((account) => !ids.has(account.id) && !emails.has(account.email.trim().toLowerCase())); return saveAccounts([...kept, ...accounts]); }, summary ?? `已添加 ${accounts.length} 个账号`, 'save'); }} notify={notify} />}
+    {showAccountModal && <AccountModal existingAccounts={state.accounts} initialMode={accountModalMode} onClose={() => setShowAccountModal(false)} onSave={(accounts, summary) => { setShowAccountModal(false); void runAction(() => { const ids = new Set(accounts.map((account) => account.id)); const kept = state.accounts.filter((account) => !ids.has(account.id)); return saveAccounts([...kept, ...accounts]); }, summary ?? `已添加 ${accounts.length} 个账号`, 'save'); }} notify={notify} />}
     {showKeyModal && <KeyModal accounts={state.accounts} existingKey={editingKey} onClose={() => { setShowKeyModal(false); setEditingKey(null); }} onSave={(key) => { setShowKeyModal(false); setEditingKey(null); if (editingKey) { void runAction(() => saveKeys(state.keys.map((item) => item.id === key.id ? key : item)), 'API Key 已更新', 'save'); } else { void runAction(() => saveKeys([...state.keys, key]), 'API Key 已创建', 'save'); } }} />}
     {showCheckinModal && <CheckinModal accounts={state.accounts} onClose={() => setShowCheckinModal(false)} />}
     {showUpdateModal && updateInfo && <UpdateModal info={updateInfo} onClose={() => setShowUpdateModal(false)} />}
@@ -2292,11 +2292,7 @@ function AccountModal({ existingAccounts, initialMode = 'browser', onClose, onSa
     try {
       const parsed = normalizeImportedAccounts(JSON.parse(await file.text()));
       const existingIds = new Set(existingAccounts.map((account) => account.id));
-      const existingEmails = new Set(existingAccounts.map((account) => account.email.trim().toLowerCase()).filter(Boolean));
-      setImported(parsed.map((entry) => {
-        const duplicate = existingIds.has(entry.account.id) || (entry.account.email.trim().length > 0 && existingEmails.has(entry.account.email.trim().toLowerCase()));
-        return { ...entry, duplicate, selected: !duplicate };
-      }));
+      setImported(parsed.map((entry) => ({ ...entry, duplicate: existingIds.has(entry.account.id), selected: !existingIds.has(entry.account.id) })));
       if (!parsed.length) notify('文件中没有识别到包含 access_token 的账号');
     } catch {
       setImported([]);
