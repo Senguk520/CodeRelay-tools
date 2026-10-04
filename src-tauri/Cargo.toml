@@ -1,6 +1,6 @@
 [package]
 name = "coderelay"
-version = "0.4.1"
+version = "0.4.2"
 description = "CodeRelay desktop manager for CodeBuddy local proxy"
 authors = ["CodeRelay contributors"]
 edition = "2021"
