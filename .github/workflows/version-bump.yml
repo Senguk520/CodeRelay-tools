@@ -6,9 +6,23 @@ name: Bump version
 # package-lock.json 两处、tauri.conf.json、Cargo.toml、Cargo.lock）外加两个 README
 # 徽章，靠人肉同步已经漂过好几次（见历史提交 "chore(release): 刷新 Cargo.lock…"）。
 # 交给 CI 之后，本地提交不再碰版本号文件，rebase 也就不会在这几行上冲突。
+#
+# 推送身份：main 上挂着必需检查规则集，GITHUB_TOKEN 既不在 bypass 名单里、也无法被
+# 加进去（GitHub Actions 应用不是 ruleset bypass 的可选 actor）。直接推会被拒 GH006。
+# 所以改用机器人账号的 PAT（仓库 secret 名 BUMP_TOKEN）推送：该账号已在 bypass 名单中。
+# 代价是 PAT 推送会触发后续 workflow，防循环靠下面的两道判断兜住。
 on:
   push:
     branches: [main]
+    # 纯文档改动不涨版本：这些文件不进安装包，没必要每次 +1 patch。
+    # 语义是「这次 push 里改动的文件全部被忽略才跳过」，不是「有一个被忽略就跳过」，
+    # 所以文档 PR 与代码提交混在一起时照常发版。
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - LICENSE
+      - NOTICE.md
+      - ACKNOWLEDGMENTS.md
   # 手动触发：用于首次验证本工作流，或某次 push 的 bump 失败后补一次。
   # 手动触发时 github.event.head_commit 为空，因此只会撞到下面 actor 那道判断。
   workflow_dispatch:
@@ -37,11 +51,26 @@ jobs:
     #     head_commit 为 null，缺少兜底会让表达式求值报错。
     if: github.actor != 'github-actions[bot]' && !startsWith(github.event.head_commit.message || '', 'chore(release):')
     steps:
+      # 先确认 PAT 存在。缺 secret 时 checkout 会拿到空 token，一路跑到推送才失败，
+      # 报错是规则集返回的 GH006，完全指不到真正的原因。提前显式检查，报错才有指向性。
+      - name: 校验 BUMP_TOKEN 已配置
+        env:
+          TOKEN: ${{ secrets.BUMP_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::仓库 secret BUMP_TOKEN 未配置，无法把版本提交推回 main" >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@v5
         with:
           ref: main
           # 需要完整历史：下面推送被拒时要 rebase 到最新 main，浅克隆做不了。
           fetch-depth: 0
+          # 用 PAT 而不是默认的 GITHUB_TOKEN（原因见文件头「推送身份」一节）。
+          # checkout 会把这个 token 写进 git remote，默认 persist-credentials 下后续的
+          # git push 直接复用它。
+          token: ${{ secrets.BUMP_TOKEN }}
 
       - uses: actions/setup-node@v7
         with:

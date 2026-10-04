@@ -1,0 +1,240 @@
+name: PR 自动并入闸门
+
+# 设计目标：fail-closed —— 默认转人工，只有明确安全才自动并入。
+# 任何异常（API 调用失败、脚本报错、字段缺失）都会落到「打 needs-human + 评论」，
+# 绝不会落到「合并」。宁可漏放，不可错并。
+#
+# 为什么用 pull_request_target 而不是 pull_request：
+#   fork PR 在 pull_request 事件下拿到的是只读 GITHUB_TOKEN，既不能开 auto-merge，
+#   也不能打标签/评论。pull_request_target 在「基分支上下文」运行 —— 跑的是 main 上的
+#   这份文件（PR 作者改不到它），并且带写权限。
+# 三条纪律，缺一不可：
+#   1. 绝不 checkout / build / 运行 PR 里的任何代码；信息全部用 gh api / gh pr view 读。
+#   2. 绝不把 PR 标题、正文、分支名插进 run:（那是攻击者可控的字符串，会导致命令注入）。
+#      只有 PR 号这类 GitHub 自己算出的字段可以进 env，其余一律在脚本里用 jq 取。
+#   3. 不要往这个文件里加 actions/checkout 或任何第三方 action；加了就等于开洞。
+#
+# 人工介入的两个开关：
+#   * 打上 do-not-merge  → 闸门撤销 auto-merge 并转人工（一票否决）。
+#   * 被转人工后修好问题 → 摘掉 needs-human 标签，闸门会重跑一次（恢复通道）。
+#
+# 注意：main 上的 workflow 以写权限和 secrets 运行，所以「自动并入一个改了
+# .github/workflows/ 的 PR」等价于把仓库交给作者。下面 BLOCK 正则把 .github/ 列为
+# 一票否决，就是冲着这件事来的。这份文件本身也只能由人工 PR 更新。
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+    branches: [main]
+
+permissions:
+  contents: write        # 开 auto-merge / 直接合并
+  pull-requests: write   # 读取 PR 信息
+  issues: write          # 打标签、发评论（PR 的标签与评论走 issues 接口）
+
+concurrency:
+  group: pr-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    # 下面的兜底路径最长轮询 20 分钟；给足余量，但不要让异常情况挂满默认的 6 小时。
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # 闸门要用到的三个标签可能还不存在。REST 的加标签接口在标签缺失时会直接失败，
+      # 而下面所有打标签都带容错 —— 失败会静默，PR 会既没有 automerge 也没有
+      # needs-human，失去可观测性。所以先幂等建一次（--force 会更新已有同名标签）。
+      - name: 确保三个标签存在
+        run: |
+          gh label create automerge    --color 0E8A16 --description "闸门已放行：检查全绿后自动并入" --force || true
+          gh label create needs-human  --color FBCA04 --description "等待人工判断" --force || true
+          gh label create do-not-merge --color B60205 --description "人工否决：打上即撤销 auto-merge" --force || true
+
+      - name: 判定并执行
+        shell: bash
+        env:
+          # 只有 PR 号是 GitHub 自己算出来的数字，可以安全地进 env。
+          # 作者、描述、标签、分支名等全部在脚本里用 API + jq 读，绝不插进 shell。
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # 标签与评论统一走 REST（issues 接口）。比 gh pr edit 少一层依赖，对 fork PR 更稳。
+          # 用 --input - 传 JSON 而不是 -f 表单：数组字段（labels）与含中文的评论正文都更可靠。
+          add_label() { printf '{"labels":["%s"]}' "$1" | gh api -X POST "repos/$GH_REPO/issues/$PR/labels" --input - >/dev/null 2>&1 || true; }
+          del_label() { gh api -X DELETE "repos/$GH_REPO/issues/$PR/labels/$1" >/dev/null 2>&1 || true; }
+          say()       { jq -n --arg b "$1" '{body:$b}' | gh api -X POST "repos/$GH_REPO/issues/$PR/comments" --input - >/dev/null 2>&1 || true; }
+
+          # 唯一的「转人工」出口。定义在 trap 之前，保证任何异常都有地方可去。
+          to_human() {
+            echo "::notice::转人工：$1"
+            add_label needs-human
+            del_label automerge
+            say "🤖 未自动并入，等你人工判断。原因：$1"
+            gh pr merge "$PR" --disable-auto >/dev/null 2>&1 || true
+            exit 0
+          }
+          # 任何未预期的失败都落到「转人工」，绝不落到「自动合并」
+          trap 'to_human "闸门脚本异常退出（第 $LINENO 行）"' ERR
+
+          # 闸门自己打的标签会再次触发 labeled 事件。只处理人触发的。
+          if [ "${GITHUB_ACTOR}" = 'github-actions[bot]' ]; then
+            echo "bot 触发的标签变更，跳过"
+            exit 0
+          fi
+
+          # 一次 REST 调用把判定所需的字段全部读出来
+          META=$(gh api "repos/$GH_REPO/pulls/$PR")
+          get() { printf '%s' "$META" | jq -r "$1"; }
+          AUTHOR=$(get '.user.login // ""')
+          ASSOC=$(get '.author_association // ""')
+          DRAFT=$(get '.draft // false | tostring')
+          BODY=$(get '.body // ""')
+          LABELS=$(get '[.labels[]?.name]|join(" ")')
+          STATE=$(get '.state // ""')
+          HEAD_SHA=$(get '.head.sha // ""')
+          MS=$(get '.mergeable_state // ""' | tr '[:lower:]' '[:upper:]')
+
+          # 已合并 / 已关闭的 PR 不再处理，否则会往死 PR 上贴标签
+          case "$STATE" in
+            open) ;;
+            *) echo "PR 状态为 $STATE，跳过"; exit 0 ;;
+          esac
+
+          # mergeable_state 在刚开 PR 时可能算不出来（unknown），重试几次再判
+          for _ in 1 2 3 4 5; do
+            if [ -n "$MS" ] && [ "$MS" != "UNKNOWN" ]; then break; fi
+            sleep 3
+            MS=$(gh api "repos/$GH_REPO/pulls/$PR" | jq -r '.mergeable_state // ""' | tr '[:lower:]' '[:upper:]')
+          done
+
+          # 1) 作者可信度：在维护者名单内，或与仓库有 OWNER/MEMBER/COLLABORATOR 关系
+          ok=0
+          for u in Senguk520 hmbbjack; do
+            if [ "$u" = "$AUTHOR" ]; then ok=1; fi
+          done
+          case "$ASSOC" in OWNER|MEMBER|COLLABORATOR) ok=1 ;; esac
+          if [ "$ok" != 1 ]; then
+            to_human "作者 $AUTHOR 不在维护者名单（author_association=$ASSOC）"
+          fi
+
+          # 2) 状态、标签、描述
+          if [ "$DRAFT" != "false" ]; then to_human "这是 draft PR"; fi
+          for bad in do-not-merge needs-human; do
+            case " $LABELS " in
+              *" $bad "*) to_human "带有 $bad 标签" ;;
+            esac
+          done
+          if [ -z "$(printf '%s' "$BODY" | tr -d '[:space:]')" ]; then
+            to_human "PR 描述为空"
+          fi
+
+          # 3) 路径白名单（全部改动都必须落在白名单内）+ 规模上限
+          #    白名单只收「不影响可执行产物」的 Markdown：仓库根目录与 docs/ 下。
+          #    LICENSE 故意不在白名单里 —— 改许可证是法律行为，必须人工过目。
+          FILES_JSON=$(gh api "repos/$GH_REPO/pulls/$PR/files?per_page=100")
+          N=$(printf '%s' "$FILES_JSON" | jq -r 'length')
+          if [ "$N" -eq 0 ]; then to_human "读不到改动文件"; fi
+          if [ "$N" -gt 10 ]; then to_human "改动文件数 $N > 10"; fi
+          DELTA=$(printf '%s' "$FILES_JSON" | jq -r '[.[]|(.additions+.deletions)]|add // 0')
+          if [ "$DELTA" -gt 300 ]; then to_human "改动行数 $DELTA > 300"; fi
+          # patch 为 null 说明是二进制文件或超大 diff
+          BIN=$(printf '%s' "$FILES_JSON" | jq -r '[.[]|select(.patch==null)|.filename]|join(",")')
+          if [ -n "$BIN" ]; then to_human "含二进制或超大文件：$BIN"; fi
+
+          ALLOW='^([^/]+\.md|docs/.+\.md)$'
+          BLOCK='^(\.github/|scripts/|src/|src-tauri/|sidecars/|package(-lock)?\.json|index\.html|vite\.config\.ts|tsconfig.*\.json|LICENSE$)'
+          FILES_LIST=$(mktemp)
+          printf '%s' "$FILES_JSON" | jq -r '.[].filename' > "$FILES_LIST"
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if printf '%s' "$f" | grep -Eq "$BLOCK"; then
+              to_human "命中敏感路径：$f"
+            fi
+            if ! printf '%s' "$f" | grep -Eq "$ALLOW"; then
+              to_human "不在白名单：$f"
+            fi
+          done < "$FILES_LIST"
+
+          # 4) 冲突与检查状态
+          #    允许 BLOCKED：那正是「必需检查还没跑完」的正常状态，auto-merge 就是为它准备的。
+          #    不允许 DIRTY（有冲突）与 UNKNOWN（重试后仍算不出来）。
+          case "$MS" in
+            CLEAN|BLOCKED|BEHIND|UNSTABLE|HAS_HOOKS) ;;
+            *) to_human "mergeable_state=$MS" ;;
+          esac
+          BADCHK=$(gh pr view "$PR" --json statusCheckRollup \
+            -q '[.statusCheckRollup[]?|select(.conclusion=="FAILURE" or .conclusion=="CANCELLED" or .conclusion=="TIMED_OUT" or .conclusion=="ACTION_REQUIRED" or .conclusion=="STARTUP_FAILURE")]|length')
+          if [ "$BADCHK" != "0" ]; then to_human "存在失败的检查（$BADCHK 条）"; fi
+
+          # 仍在运行 / 排队中的检查条数。注意 checks 与 statuses 的字段名不同：
+          # CheckRun 用 status，StatusContext 用 state。两者都算上，避免漏判成「已完成」。
+          PENDING=$(gh pr view "$PR" --json statusCheckRollup \
+            -q '[.statusCheckRollup[]?|select(.status=="IN_PROGRESS" or .status=="QUEUED" or .status=="PENDING" or .status=="REQUESTED" or .status=="WAITING" or .state=="PENDING" or .state=="EXPECTED")]|length')
+
+          # 5a) 条件已全部满足：直接合并。
+          #     --match-head-commit 锁住我们判定过的那个提交，避免「判定」与「合并」之间被塞入新提交。
+          #     必须 PENDING=0 才走这条路：CLEAN/BEHIND 状态下若仍有必需检查在跑，
+          #     说明是刚跑完一轮又被 push 触发了新一轮，直接合并会绕过检查。
+          if { [ "$MS" = "CLEAN" ] || [ "$MS" = "BEHIND" ]; } && [ "$PENDING" = "0" ]; then
+            if gh pr merge "$PR" --merge --match-head-commit "$HEAD_SHA" >/dev/null 2>&1; then
+              add_label automerge
+              say "✅ 闸门通过：已按 head commit 直接并入。"
+              exit 0
+            fi
+            to_human "已满足条件但合并被拒（检查仓库是否允许 merge commit、规则集 bypass 名单）"
+          fi
+
+          # 5b) 检查还在跑：优先开原生 auto-merge，让 GitHub 在检查全绿后自行并入。
+          if gh pr merge "$PR" --merge --auto >/dev/null 2>&1; then
+            add_label automerge
+            say "✅ 闸门通过：已开启 auto-merge（merge commit），必需检查全绿后自动并入。"
+            exit 0
+          fi
+          # 重复触发时 auto-merge 本来就已经开着，幂等处理
+          if [ "$(get 'if .auto_merge then "yes" else "no" end')" = "yes" ]; then
+            add_label automerge
+            echo "auto-merge 之前已开启，保持不变"
+            exit 0
+          fi
+
+          # 5c) 兜底：开不了 auto-merge（部分仓库在检查未完成时拒绝开启，返回 422）。
+          #     在闸门里轮询到检查就绪，再按 head SHA 直接合并。
+          #     代价是占一个 runner 约 9 分钟（Analyze (rust) 的典型耗时）；最长等 20 分钟。
+          DEADLINE=$(( $(date +%s) + 1200 ))
+          TICK=0
+          while :; do
+            TICK=$((TICK + 1))
+            MS=$(gh api "repos/$GH_REPO/pulls/$PR" | jq -r '.mergeable_state // ""' | tr '[:lower:]' '[:upper:]')
+            case "$MS" in
+              CLEAN) break ;;
+              DIRTY) to_human "PR 与 main 存在冲突" ;;
+              DRAFT) to_human "这是 draft PR" ;;
+            esac
+            # 每 2 分钟查一次是否有检查失败，给出比超时更快的反馈
+            if [ $((TICK % 4)) -eq 0 ]; then
+              BADCHK=$(gh pr view "$PR" --json statusCheckRollup \
+                -q '[.statusCheckRollup[]?|select(.conclusion=="FAILURE" or .conclusion=="CANCELLED" or .conclusion=="TIMED_OUT" or .conclusion=="ACTION_REQUIRED" or .conclusion=="STARTUP_FAILURE")]|length')
+              if [ "$BADCHK" != "0" ]; then to_human "存在失败的检查（$BADCHK 条）"; fi
+            fi
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              to_human "等待必需检查超过 20 分钟仍未就绪（mergeable_state=$MS）"
+            fi
+            sleep 30
+          done
+
+          # 就绪后再确认一次没有失败/取消的检查，避免漏网
+          BADCHK=$(gh pr view "$PR" --json statusCheckRollup \
+            -q '[.statusCheckRollup[]?|select(.conclusion=="FAILURE" or .conclusion=="CANCELLED" or .conclusion=="TIMED_OUT" or .conclusion=="ACTION_REQUIRED" or .conclusion=="STARTUP_FAILURE")]|length')
+          if [ "$BADCHK" != "0" ]; then to_human "存在失败的检查（$BADCHK 条）"; fi
+
+          if gh pr merge "$PR" --merge --match-head-commit "$HEAD_SHA" >/dev/null 2>&1; then
+            add_label automerge
+            say "✅ 闸门通过：已按 head commit 直接并入。"
+            exit 0
+          fi
+          to_human "已满足条件但合并被拒（检查仓库是否允许 merge commit、规则集 bypass 名单）"
