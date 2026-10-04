@@ -10,8 +10,8 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "build:sidecar": "powershell -ExecutionPolicy Bypass -File scripts/build-sidecar.ps1",
-    "build:cursor-bridge": "powershell -ExecutionPolicy Bypass -File scripts/build-cursor-bridge.ps1",
+    "build:sidecar": "node scripts/build-sidecar.mjs",
+    "build:cursor-bridge": "node scripts/build-cursor-bridge.mjs",
     "sync-version": "node scripts/sync-version.mjs"
   },
   "dependencies": {

@@ -6,16 +6,16 @@
 # artifacts from a shared target directory.
 
 [build]
-# Default artifact location. `F:/` is where this checkout builds, but a machine
-# without an F: drive cannot use it.
+# Default artifact location. Using the checkout-local `target/` keeps the build
+# working on every machine: the previous `F:/target` default was specific to one
+# machine and made `cargo check` fail outright on macOS/Linux with
+# "path segment contains separator `:`". Machines that want a dedicated cache
+# drive can override it per-invocation without touching this file:
 #
-# Cargo does not expand environment variables inside this file, so the override
-# does not live here — it is `CARGO_TARGET_DIR`, which takes precedence over this
-# setting (verified: with both set, artifacts land in `CARGO_TARGET_DIR`). For a
-# one-off build, `--target-dir <path>` on the cargo command works too.
+#   CARGO_TARGET_DIR=D:/target npm run tauri:build
 #
-#   $env:CARGO_TARGET_DIR = 'D:/target'; npm run tauri:build
-#
-# Removing this section entirely also works: the build then uses the local
-# `src-tauri/target/`, which `.gitignore` already covers.
-target-dir = "F:/target"
+# Directory-scoped: applies only to cargo commands run inside `src-tauri/`, and
+# never to the cursor-bridge workspace under `sidecars/cursor-bridge/`. The two
+# builds have separate, heavy dependency graphs and must not evict each other's
+# artifacts from a shared target directory.
+target-dir = "target"
