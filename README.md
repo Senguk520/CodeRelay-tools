@@ -126,6 +126,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | `src-tauri/src/models.rs` | 请求日志/统计结构与应用状态模型 |
 | `sidecars/coderelay-proxy/` | Go sidecar 主程序（relay 服务器、模型同步、账号池调度） |
 | `scripts/` | `build-sidecar.ps1`、`sync-version.mjs` |
+| `.github/workflows/` | `codeql.yml` 静态扫描；`version-bump.yml` 每次 push 到 main 自动递增 patch 版本号 |
 
 ### 常用命令
 
@@ -133,7 +134,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 npm run typecheck          # 前端 TS 类型检查
 npm run build              # 前端生产构建
 npm run build:sidecar      # 按 Rust target triple 编译 Go sidecar
-npm run sync-version       # 把 package.json 版本同步到 tauri.conf.json/Cargo.toml
+npm run sync-version       # 把 package.json 版本同步到其余 5 个副本与两个 README 徽章
 cargo check --manifest-path src-tauri/Cargo.toml
 go build ./...             # 在 sidecars/coderelay-proxy 下
 go test ./...
@@ -141,7 +142,22 @@ go test ./...
 
 ### 版本号约定
 
-**单一版本源 = `package.json` 的 `version`**。升级版本只改这一个文件，再运行 `npm run sync-version`（或直接 `tauri:build`，其 beforeBuild 已包含）。前端通过 `APP_VERSION`（由 Vite 注入）展示版本号，不要硬编码。Rust 侧通过 `env!("CARGO_PKG_VERSION")` 读取同一版本参与更新比对，无需另行维护。
+**单一版本源 = `package.json` 的 `version`**。它在仓库里共有 6 个副本加 2 个 README 徽章，全部由一处命令补齐，不要手改其余任何一份：
+
+| 副本 | 由谁写入 |
+|---|---|
+| `package.json`、`package-lock.json`（两处） | `npm version patch --no-git-tag-version` |
+| `src-tauri/tauri.conf.json` | `scripts/sync-version.mjs` |
+| `src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`（`coderelay` 条目） | `scripts/sync-version.mjs` |
+| `README.md`、`README.en.md` 的 version 徽章 | `scripts/sync-version.mjs` |
+
+**main 分支上的版本号由 CI 独占**：每次有提交落到 main，`.github/workflows/version-bump.yml` 会把 patch 位 +1 后提交回 main（提交信息为 `chore(release): 版本号自动递增至 x.y.z`）。由此带来三条约定：
+
+- **本地提交不要手改版本号文件**，把写入权留给 CI，这样 rebase 永远不会撞在这几行上。
+- 每次推送后 main 会比本地多一个 bump 提交，**再次推送前先 `git pull --rebase`**。
+- 提交信息以 `chore(release):` 开头时 CI 不再加一，留给手工发版使用；手动触发该 workflow 可补一次漏掉的递增。
+
+前端通过 `APP_VERSION`（由 Vite 注入）展示版本号，不要硬编码。Rust 侧通过 `env!("CARGO_PKG_VERSION")` 读取同一版本参与更新比对，无需另行维护。
 
 ### 发布约定
 

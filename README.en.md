@@ -128,6 +128,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | `src-tauri/src/models.rs` | Request log / statistics structures and app state model |
 | `sidecars/coderelay-proxy/` | Go sidecar main program (relay server, model sync, account pool scheduling) |
 | `scripts/` | `build-sidecar.ps1`, `sync-version.mjs` |
+| `.github/workflows/` | `codeql.yml` static analysis; `version-bump.yml` auto-increments the patch version on every push to main |
 
 ### Common Commands
 
@@ -135,7 +136,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 npm run typecheck          # Frontend TS type check
 npm run build              # Frontend production build
 npm run build:sidecar      # Build Go sidecar for Rust target triple
-npm run sync-version       # Sync package.json version to tauri.conf.json/Cargo.toml
+npm run sync-version       # Sync package.json version to the other 5 copies and both README badges
 cargo check --manifest-path src-tauri/Cargo.toml
 go build ./...             # under sidecars/coderelay-proxy
 go test ./...
@@ -143,7 +144,22 @@ go test ./...
 
 ### Version Convention
 
-**Single version source = `package.json` `version`**. To bump the version, modify only this file, then run `npm run sync-version` (or just `tauri:build`, which includes it in beforeBuild). The frontend displays the version via `APP_VERSION` (injected by Vite) — do not hardcode it. The Rust side reads the same version through `env!("CARGO_PKG_VERSION")` for update comparison, so nothing else needs maintaining.
+**Single version source = `package.json` `version`**. It has 6 copies plus 2 README badges in this repository; one command writes all of them — never edit any of the other copies by hand:
+
+| Copy | Written by |
+|---|---|
+| `package.json`, `package-lock.json` (two places) | `npm version patch --no-git-tag-version` |
+| `src-tauri/tauri.conf.json` | `scripts/sync-version.mjs` |
+| `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock` (the `coderelay` entry) | `scripts/sync-version.mjs` |
+| the version badges in `README.md`, `README.en.md` | `scripts/sync-version.mjs` |
+
+**On `main`, CI owns the version number**: every time a commit lands on `main`, `.github/workflows/version-bump.yml` bumps the patch digit and commits the result back to `main` (commit message `chore(release): 版本号自动递增至 x.y.z`). Three conventions follow from that:
+
+- **Do not hand-edit version files in local commits** — leave the write to CI, so a rebase never conflicts on those lines.
+- After each push, `main` has one extra bump commit, so **run `git pull --rebase` before pushing again**.
+- A push whose commit message starts with `chore(release):` is not bumped again, leaving room for manual releases; dispatching the workflow manually adds a missing increment.
+
+The frontend displays the version via `APP_VERSION` (injected by Vite) — do not hardcode it. The Rust side reads the same version through `env!("CARGO_PKG_VERSION")` for update comparison, so nothing else needs maintaining.
 
 ### Release Convention
 

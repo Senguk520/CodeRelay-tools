@@ -1,0 +1,91 @@
+name: Bump version
+
+# 每次有提交落到 main，就把 patch 位 +1 并提交回 main。
+#
+# 为什么要由 CI 独占这件事：版本号在仓库里有 6 个副本（package.json、
+# package-lock.json 两处、tauri.conf.json、Cargo.toml、Cargo.lock）外加两个 README
+# 徽章，靠人肉同步已经漂过好几次（见历史提交 "chore(release): 刷新 Cargo.lock…"）。
+# 交给 CI 之后，本地提交不再碰版本号文件，rebase 也就不会在这几行上冲突。
+on:
+  push:
+    branches: [main]
+  # 手动触发：用于首次验证本工作流，或某次 push 的 bump 失败后补一次。
+  # 手动触发时 github.event.head_commit 为空，因此只会撞到下面 actor 那道判断。
+  workflow_dispatch:
+
+# 串行化：同一时刻只允许一个 bump 在跑。
+#
+# 两个 run 并发读到同一个旧版本号会各自算出同一个新版本，后推的那个必定被拒。
+# cancel-in-progress: false 让后来者排队——排队期间它尚未 checkout，因此拿到的是
+# 前一个 run 推完后的 main，会接着算出下一个版本，正好一 push 一跳。
+concurrency:
+  group: version-bump
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    name: Bump patch version
+    runs-on: ubuntu-latest
+    # 两道防循环判断，缺一不可：
+    #   - actor：GITHUB_TOKEN 推出的提交本来就不会再触发 workflow，但万一将来改用
+    #     了 PAT（例如想让 tag 触发打包），这道判断就是唯一的闸门。
+    #   - 提交信息前缀：与仓库既有的 chore(release): 约定一致，同时也让"手工发版
+    #     的那次 push"不会被再自动加一。`|| ''` 是必需的——workflow_dispatch 触发时
+    #     head_commit 为 null，缺少兜底会让表达式求值报错。
+    if: github.actor != 'github-actions[bot]' && !startsWith(github.event.head_commit.message || '', 'chore(release):')
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          # 需要完整历史：下面推送被拒时要 rebase 到最新 main，浅克隆做不了。
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Bump, sync every copy, and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # package.json 与 package-lock.json 由 npm 改；其余副本由 sync-version.mjs 改。
+          npm version patch --no-git-tag-version
+          node scripts/sync-version.mjs
+
+          version=$(node -p "require('./package.json').version")
+          echo "新版本号：${version}"
+
+          git add package.json package-lock.json \
+            src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock \
+            README.md README.en.md
+
+          # 没有任何副本发生变化说明同步脚本失配，此时提交等于写入一个自相矛盾的
+          # 版本号；宁可让 run 失败暴露出来。
+          if git diff --cached --quiet; then
+            echo "版本号未被改动，请检查 scripts/sync-version.mjs 的目标路径" >&2
+            exit 1
+          fi
+
+          git commit -m "chore(release): 版本号自动递增至 ${version}"
+
+          # concurrency 只串行化本工作流的 run，挡不住同时间的人手 push。
+          # 被拒就 rebase 到最新 main 再试，最多三次。
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "已推送 v${version} 到 main"
+              exit 0
+            fi
+            echo "推送被拒（第 ${attempt} 次），尝试 rebase 到最新 main"
+            if [[ "${attempt}" = "3" ]]; then
+              echo "三次推送均失败，main 上存在持续竞争" >&2
+              exit 1
+            fi
+            git fetch origin main
+            git rebase origin/main
+          done
