@@ -510,6 +510,9 @@ fn select_primary_lan_ipv4(mut candidates: Vec<LanIpv4Candidate>) -> Option<Ipv4
 /// - **地址行**：含 ASCII 子串 `IPv4`（中文输出为「IPv4 地址 …」，仍含该子串），
 ///   取最后一个 `:` 之后的内容解析；
 /// - 非私有地址（回环、169.254 链路本地、公网）直接丢弃。
+// 仅 Windows 的 resolve_primary_lan_ipv4 调用；非 Windows 平台保留编译，
+// 供 tests 模块的解析测试使用（cfg_attr 而非 cfg 门，测试在 Mac 也可跑）。
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn parse_ipconfig_candidates(output: &str) -> Vec<LanIpv4Candidate> {
     let mut candidates = Vec::new();
     let mut current_interface = String::new();
@@ -544,6 +547,44 @@ fn parse_ipconfig_candidates(output: &str) -> Vec<LanIpv4Candidate> {
     candidates
 }
 
+/// 解析 `ifconfig` 输出，抽出所有私有 IPv4 候选（macOS / *BSD 同构输出）。
+///
+/// 规则（与 ipconfig 版同一套候选/打分/选择管线）：
+/// - **网卡头行**：不缩进、形如 `en0: flags=...`，冒号前是网卡名；
+/// - **地址行**：缩进的 `inet <addr> ...`（`inet6` 不是这个关键字，天然排除）；
+/// - 非私有地址（回环、169.254 链路本地、公网）由 is_lan_ipv4 丢弃。
+fn parse_ifconfig_candidates(output: &str) -> Vec<LanIpv4Candidate> {
+    let mut candidates = Vec::new();
+    let mut current_interface = String::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let is_indented = line
+            .chars()
+            .next()
+            .map(|character| character.is_whitespace())
+            .unwrap_or(false);
+        if !is_indented {
+            current_interface = trimmed.trim_end_matches(':').trim().to_string();
+            continue;
+        }
+        let mut fields = trimmed.split_whitespace();
+        if fields.next() != Some("inet") {
+            continue;
+        }
+        let Some(addr) = fields.next().and_then(|raw| raw.parse::<Ipv4Addr>().ok()) else {
+            continue;
+        };
+        if !is_lan_ipv4(addr) {
+            continue;
+        }
+        candidates.push(LanIpv4Candidate {
+            interface_name: current_interface.clone(),
+            addr,
+        });
+    }
+    candidates
+}
+
 /// 执行 `ipconfig` 并选出首要局域网 IPv4。命令失败 / 无候选时返回 None（静默降级）。
 #[cfg(target_os = "windows")]
 fn resolve_primary_lan_ipv4() -> Option<Ipv4Addr> {
@@ -564,8 +605,21 @@ fn resolve_primary_lan_ipv4() -> Option<Ipv4Addr> {
     )))
 }
 
-/// 非 Windows 平台不提供局域网地址解析（本项目仅面向 Windows）。
-#[cfg(not(target_os = "windows"))]
+/// macOS：执行 `ifconfig` 并选出首要局域网 IPv4（en* 物理网卡优先，
+/// utun/awdl/bridge 等虚拟接口按上游打分表垫底）。命令失败 / 无候选时返回
+/// None，由调用方静默降级，与 Windows 行为一致。
+#[cfg(target_os = "macos")]
+fn resolve_primary_lan_ipv4() -> Option<Ipv4Addr> {
+    use std::process::Command;
+
+    let output = Command::new("ifconfig").output().ok()?;
+    select_primary_lan_ipv4(parse_ifconfig_candidates(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// 其他非 Windows / 非 macOS 平台不提供局域网地址解析（静默降级）。
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn resolve_primary_lan_ipv4() -> Option<Ipv4Addr> {
     None
 }
@@ -2778,5 +2832,40 @@ mod tests {
         assert_eq!(manifest["accounts"][0]["planType"], "PRO");
         assert_eq!(manifest["accounts"][0]["remainingQuota"], 13);
         assert_eq!(manifest["apiKeys"][0]["key"], "sk-test");
+    }
+}
+
+/// macOS `ifconfig` 解析与首选地址选择。
+#[cfg(test)]
+mod lan_macos_tests {
+    use super::{parse_ifconfig_candidates, select_primary_lan_ipv4};
+
+    const IFCONFIG_SAMPLE: &str = r#"lo0: flags=8049<UP,LOOPBACK,RUNNING> mtu 16384
+	inet 127.0.0.1 netmask 0xff000000
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	inet 192.168.1.23 netmask 0xffffff00 broadcast 192.168.1.255
+utun3: flags=8051<UP,POINTOPOINT,RUNNING> mtu 1380
+	inet 10.8.0.6 --> 10.8.0.5 netmask 0xffffffff
+ap1: flags=8802<BROADCAST,LINK2> mtu 1480
+	inet6 fe80::1%ap1 prefixlen 64 scopeid 0x8
+"#;
+
+    #[test]
+    fn parses_inet_candidates_and_drops_loopback() {
+        let candidates = parse_ifconfig_candidates(IFCONFIG_SAMPLE);
+        let addrs: Vec<std::net::Ipv4Addr> = candidates.iter().map(|c| c.addr).collect();
+        // lo0 的 127.0.0.1（非私有段）必须被丢弃；en0 与 utun3 的私有地址保留。
+        assert!(!addrs.contains(&"127.0.0.1".parse().unwrap()));
+        assert!(addrs.contains(&"192.168.1.23".parse().unwrap()));
+        assert!(addrs.contains(&"10.8.0.6".parse().unwrap()));
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn prefers_physical_interface_over_tunnel() {
+        let candidates = parse_ifconfig_candidates(IFCONFIG_SAMPLE);
+        let primary = select_primary_lan_ipv4(candidates);
+        // en0（物理网卡，打分 0）优先于 utun3（隧道，关键词 utun 打分 2）。
+        assert_eq!(primary, Some("192.168.1.23".parse().unwrap()));
     }
 }
