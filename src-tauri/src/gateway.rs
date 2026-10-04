@@ -1843,8 +1843,13 @@ pub fn get_app_state(
 // export_accounts 将指定账号（含凭据 token）导出为 JSON，供备份与跨机器迁移。
 // 弹出系统「另存为」对话框由用户选择保存位置；用户取消时返回 None。
 // 返回 Some(实际保存路径) 表示成功。
+//
+// 【必须为 async + spawn_blocking】blocking_save_file 内部要在主线程跑模态保存
+// 面板：同步命令固定在主线程执行，在那里调用它会「等待自己」→ 主线程死锁
+// （另存为面板不出现，整个窗口冻结，实测 macOS 必现）。改为 async 命令后，
+// 对话框放到阻塞线程池等待。
 #[tauri::command]
-pub fn export_accounts(
+pub async fn export_accounts(
     app: AppHandle,
     runtime: State<'_, RuntimeState>,
     account_ids: Vec<String>,
@@ -1854,47 +1859,55 @@ pub fn export_accounts(
         return Err("没有选择要导出的账号".to_string());
     }
     // 1. 收集要导出的账号元数据（保持 account_ids 顺序）与对应凭据。
-    let accounts = locked(&runtime.inner.app, "应用")?.clone();
-    let credentials = locked(&runtime.inner.credentials, "凭据")?.clone();
+    let (payload, file_name) = {
+        let accounts = locked(&runtime.inner.app, "应用")?.clone();
+        let credentials = locked(&runtime.inner.credentials, "凭据")?.clone();
 
-    let mut export_items = Vec::new();
-    for id in &account_ids {
-        let Some(account) = accounts.accounts.iter().find(|a| a.id == *id) else {
-            continue;
-        };
-        let credential = credentials.get(id);
-        export_items.push(json!({
-            "id": account.id,
-            "email": account.email,
-            "region": account.region,
-            "plan": account.plan,
-            "status": account.status,
-            "quota": account.quota,
-            "quotaTotal": account.quota_total,
-            "uid": account.uid,
-            "enterpriseId": account.enterprise_id,
-            "domain": account.domain,
-            "accessToken": credential.map(|c| c.access_token.clone()).unwrap_or_default(),
-            "refreshToken": credential.and_then(|c| c.refresh_token.clone()).unwrap_or_default(),
-        }));
-    }
-    if export_items.is_empty() {
-        return Err("所选账号均已不存在".to_string());
-    }
+        let mut export_items = Vec::new();
+        for id in &account_ids {
+            let Some(account) = accounts.accounts.iter().find(|a| a.id == *id) else {
+                continue;
+            };
+            let credential = credentials.get(id);
+            export_items.push(json!({
+                "id": account.id,
+                "email": account.email,
+                "region": account.region,
+                "plan": account.plan,
+                "status": account.status,
+                "quota": account.quota,
+                "quotaTotal": account.quota_total,
+                "uid": account.uid,
+                "enterpriseId": account.enterprise_id,
+                "domain": account.domain,
+                "accessToken": credential.map(|c| c.access_token.clone()).unwrap_or_default(),
+                "refreshToken": credential.and_then(|c| c.refresh_token.clone()).unwrap_or_default(),
+            }));
+        }
+        if export_items.is_empty() {
+            return Err("所选账号均已不存在".to_string());
+        }
 
-    let payload = serde_json::to_vec_pretty(&json!({ "accounts": export_items }))
-        .map_err(|error| format!("序列化导出内容失败：{error}"))?;
+        let payload = serde_json::to_vec_pretty(&json!({ "accounts": export_items }))
+            .map_err(|error| format!("序列化导出内容失败：{error}"))?;
+        (payload, default_file_name.trim().to_string())
+    };
 
-    // 2. 弹「另存为」对话框，等待用户选择路径（阻塞式）。
-    let file_name = default_file_name.trim().to_string();
-    let mut builder = app.dialog().file().add_filter("JSON", &["json"]);
-    if !file_name.is_empty() {
-        builder = builder.set_file_name(&file_name);
-    }
-    let Some(path) = builder.blocking_save_file() else {
+    // 2. 在阻塞线程池弹「另存为」对话框，等待用户选择路径（用户取消 → None）。
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        let mut builder = app.dialog().file().add_filter("JSON", &["json"]);
+        if !file_name.is_empty() {
+            builder = builder.set_file_name(&file_name);
+        }
+        builder.blocking_save_file()
+    })
+    .await
+    .map_err(|error| format!("导出对话框执行失败：{error}"))?;
+
+    let Some(selected) = selected else {
         return Ok(None); // 用户取消
     };
-    let path = path.into_path().map_err(|_| "无法解析保存路径".to_string())?;
+    let path = selected.into_path().map_err(|_| "无法解析保存路径".to_string())?;
 
     // 3. 原子写入所选路径。
     atomic_write(&path, &payload)?;
