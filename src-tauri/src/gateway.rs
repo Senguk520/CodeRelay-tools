@@ -553,6 +553,11 @@ fn parse_ipconfig_candidates(output: &str) -> Vec<LanIpv4Candidate> {
 /// - **网卡头行**：不缩进、形如 `en0: flags=...`，冒号前是网卡名；
 /// - **地址行**：缩进的 `inet <addr> ...`（`inet6` 不是这个关键字，天然排除）；
 /// - 非私有地址（回环、169.254 链路本地、公网）由 is_lan_ipv4 丢弃。
+// 仅 macOS 的 resolve_primary_lan_ipv4 调用；非 macOS 平台保留编译，供 tests 模块的
+// 解析测试使用。这里刻意用 cfg_attr 而非 cfg 门：cfg 门会让 lan_macos_tests 在
+// Windows / Linux 上编译失败，而那两个用例是纯字符串解析，任何平台都能真跑。
+// 与 parse_ipconfig_candidates 上方的属性对称（那边屏蔽的是非 Windows 的 dead_code）。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_ifconfig_candidates(output: &str) -> Vec<LanIpv4Candidate> {
     let mut candidates = Vec::new();
     let mut current_interface = String::new();

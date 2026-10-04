@@ -10,12 +10,17 @@
 # working on every machine: the previous `F:/target` default was specific to one
 # machine and made `cargo check` fail outright on macOS/Linux with
 # "path segment contains separator `:`". Machines that want a dedicated cache
-# drive can override it per-invocation without touching this file:
+# drive can override it per-invocation without touching this file -- Cargo does
+# not expand environment variables inside config files, so the override lives in
+# the environment instead:
 #
-#   CARGO_TARGET_DIR=D:/target npm run tauri:build
+#   CARGO_TARGET_DIR=D:/target npm run tauri:build              # bash / cmd
+#   $env:CARGO_TARGET_DIR = 'D:/target'; npm run tauri:build    # PowerShell
+#   cargo check --target-dir D:/target                          # cargo's own flag
 #
-# Directory-scoped: applies only to cargo commands run inside `src-tauri/`, and
-# never to the cursor-bridge workspace under `sidecars/cursor-bridge/`. The two
-# builds have separate, heavy dependency graphs and must not evict each other's
-# artifacts from a shared target directory.
+# On Windows, the checkout's long-standing cache in `F:/target` is kept the same
+# way: set `CARGO_TARGET_DIR=F:/target` in the environment, no edit needed here.
+#
+# Removing this section entirely also works: the build then falls back to the
+# local `src-tauri/target/`, which `.gitignore` already covers.
 target-dir = "target"
