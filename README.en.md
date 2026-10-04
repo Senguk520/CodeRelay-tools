@@ -58,7 +58,7 @@ npm run tauri:build
 
 Build artifacts (NSIS installer and MSI) are output to the Cargo target directory's `release/bundle/` subdirectory.
 
-> Note: This project's Cargo target directory is configured separately (via `CARGO_TARGET_DIR` or `.cargo/config`) rather than the default `src-tauri/target`; the exact location depends on your build environment.
+> Note: the Cargo target directory defaults to `src-tauri/target/` (see `src-tauri/.cargo/config.toml`). To place it on another drive, override it with an environment variable: `CARGO_TARGET_DIR=F:/target npm run tauri:build` (in PowerShell: `$env:CARGO_TARGET_DIR = 'F:/target'; npm run tauri:build`).
 
 ---
 
@@ -127,7 +127,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | `src-tauri/src/update.rs` | GitHub Releases update check (version comparison, installer URL parsing) |
 | `src-tauri/src/models.rs` | Request log / statistics structures and app state model |
 | `sidecars/coderelay-proxy/` | Go sidecar main program (relay server, model sync, account pool scheduling) |
-| `scripts/` | `build-sidecar.ps1`, `sync-version.mjs` |
+| `scripts/` | `build-sidecar.mjs`, `build-cursor-bridge.mjs`, `sync-version.mjs` |
 | `.github/workflows/` | `codeql.yml` static analysis; `version-bump.yml` auto-increments the patch version on every push to main |
 
 ### Common Commands
@@ -136,6 +136,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 npm run typecheck          # Frontend TS type check
 npm run build              # Frontend production build
 npm run build:sidecar      # Build Go sidecar for Rust target triple
+npm run build:cursor-bridge # Build cursor-bridge for Rust target triple
 npm run sync-version       # Sync package.json version to the other 5 copies and both README badges
 cargo check --manifest-path src-tauri/Cargo.toml
 go build ./...             # under sidecars/coderelay-proxy

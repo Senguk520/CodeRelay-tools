@@ -1,5 +1,6 @@
 # Build output. This sidecar must never share a target directory with the
-# Tauri app in src-tauri/ (see src-tauri/.cargo/config.toml, target-dir F:/target).
+# Tauri app in src-tauri/ (see src-tauri/.cargo/config.toml; the two builds keep
+# separate Cargo target directories).
 /target/
 # Anchored: only the build output directory at the bridge root. An unanchored
 # `bin/` would also match `server/src/bin/`, which holds the binary entry point

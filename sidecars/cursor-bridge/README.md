@@ -26,13 +26,16 @@ npm run build:cursor-bridge
 Or directly:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/build-cursor-bridge.ps1
+node scripts/build-cursor-bridge.mjs
 ```
 
 The build uses its own Cargo target directory so it never contends with the Tauri
-build's target directory. `scripts/cursor-bridge-target-dir.ps1` resolves it, and
-the build script and every `scripts/verify-*.ps1` script share that one helper, so
-the binary that is built and the binary that is verified are always the same file:
+build's target directory. `scripts/cursor-bridge-target-dir.ps1` holds the
+authoritative resolution order, and every `scripts/verify-*.ps1` script reads it
+from there; `scripts/build-cursor-bridge.mjs` mirrors that same order in
+JavaScript (the build cannot call a PowerShell helper on macOS/Linux). Both
+sides must be changed together, so the binary that is built and the binary that
+is verified stay the same file:
 
 1. `CODERELAY_CURSOR_TARGET_DIR`, when set — an explicit choice always wins.
 2. `F:/target-cursor-bridge`, when an F: drive exists (the default here).

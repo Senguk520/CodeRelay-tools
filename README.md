@@ -58,7 +58,7 @@ npm run tauri:build
 
 打包产物（NSIS 安装包与 MSI）输出到 Cargo 目标目录的 `release/bundle/` 下。
 
-> 注意：本项目的 Cargo 目标目录通过 `CARGO_TARGET_DIR` 或 `.cargo/config` 单独配置，非默认的 `src-tauri/target`，具体位置以你的构建环境为准。
+> 注意：Cargo 目标目录默认是 `src-tauri/target/`（见 `src-tauri/.cargo/config.toml`）。想把它放到别的盘，用环境变量覆盖：`CARGO_TARGET_DIR=F:/target npm run tauri:build`（PowerShell 用 `$env:CARGO_TARGET_DIR = 'F:/target'; npm run tauri:build`）。
 
 ---
 
@@ -125,7 +125,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | `src-tauri/src/update.rs` | GitHub Releases 更新检查（版本比对、安装包地址解析） |
 | `src-tauri/src/models.rs` | 请求日志/统计结构与应用状态模型 |
 | `sidecars/coderelay-proxy/` | Go sidecar 主程序（relay 服务器、模型同步、账号池调度） |
-| `scripts/` | `build-sidecar.ps1`、`sync-version.mjs` |
+| `scripts/` | `build-sidecar.mjs`、`build-cursor-bridge.mjs`、`sync-version.mjs` |
 | `.github/workflows/` | `codeql.yml` 静态扫描；`version-bump.yml` 每次 push 到 main 自动递增 patch 版本号 |
 
 ### 常用命令
@@ -134,6 +134,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 npm run typecheck          # 前端 TS 类型检查
 npm run build              # 前端生产构建
 npm run build:sidecar      # 按 Rust target triple 编译 Go sidecar
+npm run build:cursor-bridge # 按 Rust target triple 编译 cursor-bridge
 npm run sync-version       # 把 package.json 版本同步到其余 5 个副本与两个 README 徽章
 cargo check --manifest-path src-tauri/Cargo.toml
 go build ./...             # 在 sidecars/coderelay-proxy 下

@@ -29,7 +29,7 @@ $ErrorActionPreference = 'Continue'
 
 $repo = Resolve-Path (Join-Path $PSScriptRoot '..')
 $exe = Join-Path $repo 'sidecars\cursor-bridge\bin\cursor-bridge-x86_64-pc-windows-msvc.exe'
-if (-not (Test-Path $exe)) { throw "release binary not found: $exe (run scripts/build-cursor-bridge.ps1)" }
+if (-not (Test-Path $exe)) { throw "release binary not found: $exe (run npm run build:cursor-bridge)" }
 $exeItem = Get-Item $exe
 $exeHash = (Get-FileHash $exe -Algorithm SHA256).Hash
 Write-Host "EXE=$exe"

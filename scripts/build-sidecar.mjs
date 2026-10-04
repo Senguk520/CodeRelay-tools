@@ -1,16 +1,15 @@
 #!/usr/bin/env node
-// 跨平台 sidecar 构建脚本。
-// 原仓库只提供 scripts/build-sidecar.ps1（PowerShell），在 macOS / Linux 上无法执行。
-// 本脚本用 Node 重写同一套逻辑，Windows / macOS / Linux 通用。
+// 跨平台 sidecar 构建脚本（Windows / macOS / Linux 通用）。
 //
-// 逻辑与 build-sidecar.ps1 完全等价：
+// 逻辑：
 //   1. 取 rustc 的 host target triple
 //   2. 输出到 sidecars/coderelay-proxy/bin/coderelay-proxy-<triple>[.exe]
 //   3. go mod download && go build -trimpath -ldflags "-s -w"
+//   4. best-effort 回收 bin/ 里 Go 链接器让位留下的 `<name>~` 残骸
 
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, existsSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
@@ -49,6 +48,33 @@ function resolveTargetTriple() {
   return fallback;
 }
 
+// best-effort 残骸清理。Go 链接器替换运行中的二进制时，会把它改名到固定的
+// `<name>~`：最多只留一个，但它会在目标名空闲时留下陈旧的那份，所以每次构建顺手
+// 回收。旧进程仍映射着的残骸根本删不掉，因此全程吞掉错误，绝不让构建失败。
+// 该模式匹配不到 canonical 二进制本身，它永远不是候选。
+//
+// 本文件是这段清理逻辑的唯一定义处（旧 PowerShell 构建脚本已删除）。
+function sweepDebris(binPath) {
+  const binDir = dirname(binPath);
+  const debrisName = `${basename(binPath)}~`;
+  let entries;
+  try {
+    entries = readdirSync(binDir);
+  } catch {
+    return; // 目录不存在或读不到：没有任何东西可回收。
+  }
+  for (const name of entries) {
+    if (name !== debrisName) {
+      continue;
+    }
+    try {
+      rmSync(join(binDir, name), { force: true });
+    } catch (error) {
+      console.warn(`[build-sidecar] 残骸回收跳过 ${name}（仍被占用）：${error.message}`);
+    }
+  }
+}
+
 const targetTriple = resolveTargetTriple();
 const extension = targetTriple.includes('windows') ? '.exe' : '';
 const bin = join(sidecarDir, 'bin', `coderelay-proxy-${targetTriple}${extension}`);
@@ -67,5 +93,7 @@ execFileSync('go', ['build', '-trimpath', '-ldflags', '-s -w', '-o', bin, '.'], 
   cwd: sidecarDir,
   stdio: 'inherit',
 });
+
+sweepDebris(bin);
 
 console.log(`[build-sidecar] built ${bin}`);
