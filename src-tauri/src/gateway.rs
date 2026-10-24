@@ -2320,15 +2320,43 @@ fn load_account_credential(inner: &Arc<RuntimeInner>, account_id: &str) -> Resul
     Ok((account, credential))
 }
 
+/// 把签到接口给出的账号级结论（Token 失效 / 被风控）落到账号状态，
+/// 避免调度器继续把请求打到一个已经被上游拒绝的账号上。
+fn mark_account_health(app: &AppHandle, inner: &Arc<RuntimeInner>, account_id: &str, status: &str) {
+    let changed = match inner.app.lock() {
+        Ok(mut state) => match state.accounts.iter_mut().find(|item| item.id == account_id) {
+            Some(account) if account.status != status => {
+                account.status = status.to_string();
+                account.failures = account.failures.saturating_add(1);
+                true
+            }
+            _ => false,
+        },
+        Err(_) => false,
+    };
+    if changed {
+        persist_and_emit(app, inner);
+    }
+}
+
 async fn checkin_account_inner(app: &AppHandle, inner: &Arc<RuntimeInner>, account_id: &str) -> Result<crate::codebuddy_oauth::CheckinResponse, String> {
     let (account, credential) = load_account_credential(inner, account_id)?;
-    let response = crate::codebuddy_oauth::perform_checkin(
+    let response = match crate::codebuddy_oauth::perform_checkin(
         &credential.access_token,
         account.uid.as_deref(),
         account.enterprise_id.as_deref(),
         account.domain.as_deref(),
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(failure) => {
+            if let Some(status) = failure.account_status() {
+                mark_account_health(app, inner, account_id, status);
+            }
+            return Err(failure.message);
+        }
+    };
     if response.success {
         let mut state = locked(&inner.app, "应用")?;
         if let Some(item) = state.accounts.iter_mut().find(|item| item.id == account_id) {
@@ -2346,18 +2374,28 @@ async fn checkin_account_inner(app: &AppHandle, inner: &Arc<RuntimeInner>, accou
 
 #[tauri::command]
 pub async fn codebuddy_checkin_status(
+    app: AppHandle,
     runtime: State<'_, RuntimeState>,
     account_id: String,
 ) -> Result<crate::codebuddy_oauth::CheckinStatusResponse, String> {
     let inner = runtime.inner.clone();
     let (account, credential) = load_account_credential(&inner, &account_id)?;
-    crate::codebuddy_oauth::get_checkin_status(
+    match crate::codebuddy_oauth::get_checkin_status(
         &credential.access_token,
         account.uid.as_deref(),
         account.enterprise_id.as_deref(),
         account.domain.as_deref(),
     )
     .await
+    {
+        Ok(status) => Ok(status),
+        Err(failure) => {
+            if let Some(status) = failure.account_status() {
+                mark_account_health(&app, &inner, &account_id, status);
+            }
+            Err(failure.message)
+        }
+    }
 }
 
 #[tauri::command]

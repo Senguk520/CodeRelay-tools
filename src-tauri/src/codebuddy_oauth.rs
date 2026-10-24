@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::{Mutex, OnceLock};
@@ -388,6 +388,129 @@ pub async fn refresh_quota(access_token: &str, refresh_token: Option<&str>, uid:
     Ok(outcome)
 }
 
+// ===== 上游响应解码（状态优先）=====
+//
+// 历史实现先 `response.json()` 再判 HTTP 状态。计费网关拒绝账号时返回的是
+// 空 body + `text/html`（401/403），reqwest 会把这种情况统一抛成
+// `error decoding response body`，于是「Token 已失效」「账号被风控」都被误报成
+// 「解析失败」，两种完全不同的原因在界面上长得一模一样。
+// 这里统一改成：先判状态码，再读文本，最后才 serde。
+
+/// 上游接口失败分类：决定错误文案与是否落账号状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiFailureKind {
+    /// 401：Token 失效或已被吊销。
+    TokenInvalid,
+    /// 403：账号被风控或无权访问。
+    Forbidden,
+    /// 404 / 204 / 空响应：该账号没有签到活动。
+    NoActivity,
+    /// 429 / 5xx / 网络错误：上游暂时不可用。
+    Upstream,
+    /// 2xx 但内容不是 JSON：上游接口形态可能已变化。
+    Decode,
+}
+
+/// 上游接口失败：`kind` 用于落账号状态，`message` 直接展示给用户。
+#[derive(Debug, Clone)]
+pub struct ApiFailure {
+    pub kind: ApiFailureKind,
+    pub message: String,
+}
+
+impl ApiFailure {
+    fn new(kind: ApiFailureKind, message: String) -> Self {
+        Self { kind, message }
+    }
+
+    /// 信息量排序，供回退接口二选一。账号级结论 > 无活动 > 上游异常 > 解析失败。
+    fn rank(&self) -> u8 {
+        match self.kind {
+            ApiFailureKind::TokenInvalid | ApiFailureKind::Forbidden => 4,
+            ApiFailureKind::NoActivity => 3,
+            ApiFailureKind::Upstream => 2,
+            ApiFailureKind::Decode => 1,
+        }
+    }
+
+    /// 需要落库的账号状态；`None` 表示与账号本身无关，不该动账号健康度。
+    pub fn account_status(&self) -> Option<&'static str> {
+        match self.kind {
+            ApiFailureKind::TokenInvalid => Some("needs_auth"),
+            ApiFailureKind::Forbidden => Some("restricted"),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ApiFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+/// 压缩并截断响应体，避免把整页 HTML 或超长报文塞进界面。
+fn body_snippet(text: &str) -> String {
+    let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.chars().count() <= 200 {
+        return flattened;
+    }
+    let mut snippet: String = flattened.chars().take(200).collect();
+    snippet.push('…');
+    snippet
+}
+
+/// 尽力从响应体里取业务提示（`msg` / `message`），取不到就退回截断原文。
+fn body_message(text: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        if let Some(message) = string_field(&value, &["msg", "message"]) {
+            return Some(message);
+        }
+    }
+    let snippet = body_snippet(text);
+    if snippet.is_empty() { None } else { Some(snippet) }
+}
+
+/// 业务码转失败分类：签到接口的 401/403/404 与 HTTP 语义一致。
+fn business_failure_kind(code: i64) -> Option<ApiFailureKind> {
+    match code {
+        401 => Some(ApiFailureKind::TokenInvalid),
+        403 => Some(ApiFailureKind::Forbidden),
+        404 => Some(ApiFailureKind::NoActivity),
+        _ => None,
+    }
+}
+
+/// 按 HTTP 状态给出可读结论。`empty_hint` 承载「没有活动」的上下文文案。
+fn classify_http_failure(status: StatusCode, body: &str, empty_hint: &str) -> ApiFailure {
+    let detail = body_message(body).map(|message| format!("：{message}")).unwrap_or_default();
+    let code = status.as_u16();
+    match code {
+        401 => ApiFailure::new(ApiFailureKind::TokenInvalid, format!("Token 已失效或已被吊销，请重新登录该账号（HTTP 401）{detail}")),
+        403 => ApiFailure::new(ApiFailureKind::Forbidden, format!("账号被风控或无权访问该接口，请更换账号（HTTP 403）{detail}")),
+        404 => ApiFailure::new(ApiFailureKind::NoActivity, format!("{empty_hint}（HTTP 404）{detail}")),
+        429 => ApiFailure::new(ApiFailureKind::Upstream, format!("上游限流，请稍后重试（HTTP 429）{detail}")),
+        _ if status.is_server_error() => ApiFailure::new(ApiFailureKind::Upstream, format!("上游服务异常，请稍后重试（HTTP {code}）{detail}")),
+        _ => ApiFailure::new(ApiFailureKind::Upstream, format!("上游返回异常状态（HTTP {code}）{detail}")),
+    }
+}
+
+/// 读取响应：先判状态码，再解析 JSON。
+async fn decode_api_response(response: reqwest::Response, label: &str, empty_hint: &str) -> Result<Value, ApiFailure> {
+    let status = response.status();
+    let text = response.text().await.map_err(|error| ApiFailure::new(ApiFailureKind::Decode, format!("{label}：读取响应失败：{error}")))?;
+    let trimmed = text.trim();
+    if !status.is_success() {
+        return Err(classify_http_failure(status, trimmed, empty_hint));
+    }
+    if trimmed.is_empty() {
+        return Err(ApiFailure::new(ApiFailureKind::NoActivity, format!("{label}：{empty_hint}（HTTP {} 空响应）", status.as_u16())));
+    }
+    serde_json::from_str(trimmed).map_err(|error| {
+        ApiFailure::new(ApiFailureKind::Decode, format!("{label}：上游返回非 JSON 内容（HTTP {}）：{}（{error}）", status.as_u16(), body_snippet(trimmed)))
+    })
+}
+
 // ===== 每日签到（CodeBuddy CN daily checkin）=====
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -502,56 +625,53 @@ fn parse_checkin_status(data: &Value) -> CheckinStatusResponse {
     }
 }
 
-async fn fetch_checkin_status_from(path: &str, access_token: &str, uid: Option<&str>, enterprise_id: Option<&str>, domain: Option<&str>) -> Result<CheckinStatusResponse, String> {
-    let client = client()?;
+async fn fetch_checkin_status_from(path: &str, access_token: &str, uid: Option<&str>, enterprise_id: Option<&str>, domain: Option<&str>) -> Result<CheckinStatusResponse, ApiFailure> {
+    let client = client().map_err(|error| ApiFailure::new(ApiFailureKind::Upstream, error))?;
     let response = checkin_request(&client, path, access_token, uid, enterprise_id, domain)
         .json(&json!({}))
         .send()
         .await
-        .map_err(|error| format!("请求签到状态失败：{error}"))?;
-    let status = response.status();
-    let body: Value = response.json().await.map_err(|error| format!("解析签到状态响应失败：{error}"))?;
-    if !status.is_success() {
-        let message = string_field(&body, &["message", "msg"]).unwrap_or_else(|| "未知错误".to_string());
-        return Err(format!("查询签到状态失败（HTTP {}）：{message}", status.as_u16()));
-    }
+        .map_err(|error| ApiFailure::new(ApiFailureKind::Upstream, format!("请求签到状态失败：{error}")))?;
+    let body = decode_api_response(response, "查询签到状态失败", "该账号暂无签到活动").await?;
     if let Some(code) = body.get("code").and_then(Value::as_i64) {
         if code != 0 && code != 200 {
             let message = string_field(&body, &["message", "msg"]).unwrap_or_else(|| "未知错误".to_string());
-            return Err(format!("查询签到状态失败（code={code}）：{message}"));
+            let kind = business_failure_kind(code).unwrap_or(ApiFailureKind::Upstream);
+            return Err(ApiFailure::new(kind, format!("查询签到状态失败（code={code}）：{message}")));
         }
     }
     let data = body.get("data").cloned().unwrap_or_else(|| json!({}));
     Ok(parse_checkin_status(&data))
 }
 
-pub async fn get_checkin_status(access_token: &str, uid: Option<&str>, enterprise_id: Option<&str>, domain: Option<&str>) -> Result<CheckinStatusResponse, String> {
+pub async fn get_checkin_status(access_token: &str, uid: Option<&str>, enterprise_id: Option<&str>, domain: Option<&str>) -> Result<CheckinStatusResponse, ApiFailure> {
     match fetch_checkin_status_from("/v2/billing/meter/checkin-activity-status", access_token, uid, enterprise_id, domain).await {
         Ok(status) => Ok(status),
         Err(activity_err) => match fetch_checkin_status_from("/v2/billing/meter/checkin-status", access_token, uid, enterprise_id, domain).await {
             Ok(status) => Ok(status),
-            Err(legacy_err) => Err(format!("查询签到状态失败：{activity_err}（回退接口：{legacy_err}）")),
+            // 两个接口都失败时只保留信息量更大的那条：账号级结论优先，
+            // 其次「无签到活动」，最后才是纯解析失败，避免两句「解析失败」互相淹没。
+            Err(legacy_err) => Err(if legacy_err.rank() > activity_err.rank() { legacy_err } else { activity_err }),
         },
     }
 }
 
-pub async fn perform_checkin(access_token: &str, uid: Option<&str>, enterprise_id: Option<&str>, domain: Option<&str>) -> Result<CheckinResponse, String> {
-    let client = client()?;
+pub async fn perform_checkin(access_token: &str, uid: Option<&str>, enterprise_id: Option<&str>, domain: Option<&str>) -> Result<CheckinResponse, ApiFailure> {
+    let client = client().map_err(|error| ApiFailure::new(ApiFailureKind::Upstream, error))?;
     let response = checkin_request(&client, "/v2/billing/meter/daily-checkin", access_token, uid, enterprise_id, domain)
         .json(&json!({}))
         .send()
         .await
-        .map_err(|error| format!("请求签到失败：{error}"))?;
-    let status = response.status();
-    let body: Value = response.json().await.map_err(|error| format!("解析签到响应失败：{error}"))?;
-    if !status.is_success() {
-        let message = string_field(&body, &["message", "msg"]).unwrap_or_else(|| "未知错误".to_string());
-        return Err(format!("请求签到失败（HTTP {}）：{message}", status.as_u16()));
-    }
+        .map_err(|error| ApiFailure::new(ApiFailureKind::Upstream, format!("请求签到失败：{error}")))?;
+    let body = decode_api_response(response, "请求签到失败", "该账号暂无签到活动").await?;
     let code = body.get("code").and_then(Value::as_i64).unwrap_or(-1);
     let api_msg = string_field(&body, &["message", "msg"]).unwrap_or_else(|| "未知错误".to_string());
     // 与官方一致：仅 code==0 视为成功；code!=0 为业务错误（如已签到），包装为 success=false 返回给前端展示。
+    // 但 401/403/404 属于账号级问题，必须抛出，才能落账号状态并阻止继续重试。
     if code != 0 {
+        if let Some(kind) = business_failure_kind(code) {
+            return Err(ApiFailure::new(kind, format!("请求签到失败（code={code}）：{api_msg}")));
+        }
         return Ok(CheckinResponse { success: false, message: Some(api_msg), ..CheckinResponse::default() });
     }
     let data = body.get("data").cloned().unwrap_or_else(|| json!({}));
@@ -605,5 +725,71 @@ mod tests {
         assert_eq!(total, 500.0);
         assert_eq!(remain, 380.0);
         assert_eq!(derive_plan(&wrapped, None), "ENTERPRISE");
+    }
+
+    #[test]
+    fn empty_401_is_reported_as_token_invalid_not_decode_failure() {
+        // 网关拒绝账号时返回空体 + text/html，历史上会被误报成「解析失败」。
+        let failure = classify_http_failure(StatusCode::from_u16(401).unwrap(), "", "该账号暂无签到活动");
+        assert_eq!(failure.kind, ApiFailureKind::TokenInvalid);
+        assert!(failure.message.contains("Token 已失效"), "message = {}", failure.message);
+        assert_eq!(failure.account_status(), Some("needs_auth"));
+    }
+
+    #[test]
+    fn empty_403_is_reported_as_forbidden_and_marks_restricted() {
+        let failure = classify_http_failure(StatusCode::from_u16(403).unwrap(), "", "该账号暂无签到活动");
+        assert_eq!(failure.kind, ApiFailureKind::Forbidden);
+        assert_eq!(failure.account_status(), Some("restricted"));
+    }
+
+    #[test]
+    fn not_found_uses_context_hint() {
+        let failure = classify_http_failure(StatusCode::from_u16(404).unwrap(), "", "该账号暂无签到活动");
+        assert_eq!(failure.kind, ApiFailureKind::NoActivity);
+        assert!(failure.message.contains("该账号暂无签到活动"), "message = {}", failure.message);
+        assert_eq!(failure.account_status(), None);
+    }
+
+    #[test]
+    fn server_error_is_upstream_failure_without_touching_account_status() {
+        let failure = classify_http_failure(StatusCode::from_u16(503).unwrap(), "", "该账号暂无签到活动");
+        assert_eq!(failure.kind, ApiFailureKind::Upstream);
+        assert_eq!(failure.account_status(), None);
+    }
+
+    #[test]
+    fn json_body_message_is_preferred_over_raw_snippet() {
+        let failure = classify_http_failure(StatusCode::from_u16(403).unwrap(), r#"{"code":403,"msg":"账号已被限制"}"#, "该账号暂无签到活动");
+        assert!(failure.message.contains("账号已被限制"), "message = {}", failure.message);
+        assert!(!failure.message.contains("{\"code\""), "message 不应回显原始 JSON：{}", failure.message);
+    }
+
+    #[test]
+    fn failure_rank_keeps_the_most_informative_fallback() {
+        let decode = ApiFailure::new(ApiFailureKind::Decode, "decode".to_string());
+        let upstream = ApiFailure::new(ApiFailureKind::Upstream, "upstream".to_string());
+        let no_activity = ApiFailure::new(ApiFailureKind::NoActivity, "no activity".to_string());
+        let forbidden = ApiFailure::new(ApiFailureKind::Forbidden, "forbidden".to_string());
+        assert!(decode.rank() < upstream.rank());
+        assert!(upstream.rank() < no_activity.rank());
+        assert!(no_activity.rank() < forbidden.rank());
+    }
+
+    #[test]
+    fn business_code_maps_only_account_level_codes() {
+        assert_eq!(business_failure_kind(401), Some(ApiFailureKind::TokenInvalid));
+        assert_eq!(business_failure_kind(403), Some(ApiFailureKind::Forbidden));
+        assert_eq!(business_failure_kind(404), Some(ApiFailureKind::NoActivity));
+        assert_eq!(business_failure_kind(14018), None);
+    }
+
+    #[test]
+    fn body_snippet_truncates_long_payloads() {
+        let long = "a".repeat(500);
+        let snippet = body_snippet(&long);
+        assert_eq!(snippet.chars().count(), 201);
+        assert!(snippet.ends_with('…'));
+        assert_eq!(body_snippet("  a \n b  "), "a b");
     }
 }
