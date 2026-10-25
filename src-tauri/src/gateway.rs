@@ -2320,23 +2320,39 @@ fn load_account_credential(inner: &Arc<RuntimeInner>, account_id: &str) -> Resul
     Ok((account, credential))
 }
 
-/// 把签到接口给出的账号级结论（Token 失效 / 被风控）落到账号状态，
-/// 避免调度器继续把请求打到一个已经被上游拒绝的账号上。
-fn mark_account_health(app: &AppHandle, inner: &Arc<RuntimeInner>, account_id: &str, status: &str) {
+/// 标签列由前端「编辑账号」维护，约定上限 6 条、单条 12 字；自动补写的标签必须遵守同一约束。
+const MAX_ACCOUNT_TAGS: usize = 6;
+
+/// 把签到接口给出的账号级结论（Token 失效 / 被风控）落到账号池：
+/// 健康状态改为「暂时冷却 / 需要重新认证」，并在标签里补上原因，方便用户一眼分辨。
+/// 标签只增不改、自动去重；状态未变化时不重复累加失败次数。
+fn mark_account_health(app: &AppHandle, inner: &Arc<RuntimeInner>, account_id: &str, status: &str, tag: &str) {
     let changed = match inner.app.lock() {
         Ok(mut state) => match state.accounts.iter_mut().find(|item| item.id == account_id) {
-            Some(account) if account.status != status => {
-                account.status = status.to_string();
-                account.failures = account.failures.saturating_add(1);
-                true
-            }
-            _ => false,
+            Some(account) => apply_account_health(account, status, tag),
+            None => false,
         },
         Err(_) => false,
     };
     if changed {
         persist_and_emit(app, inner);
     }
+}
+
+/// 纯函数部分：写健康状态并补标签，返回是否真的发生变化（用于决定是否落盘广播）。
+fn apply_account_health(account: &mut Account, status: &str, tag: &str) -> bool {
+    let mut changed = false;
+    if account.status != status {
+        account.status = status.to_string();
+        account.failures = account.failures.saturating_add(1);
+        changed = true;
+    }
+    // 只在有空位时补写：标签满了仍以健康状态表达结论，不去挤掉用户备注。
+    if account.tags.len() < MAX_ACCOUNT_TAGS && !account.tags.iter().any(|item| item == tag) {
+        account.tags.push(tag.to_string());
+        changed = true;
+    }
+    changed
 }
 
 async fn checkin_account_inner(app: &AppHandle, inner: &Arc<RuntimeInner>, account_id: &str) -> Result<crate::codebuddy_oauth::CheckinResponse, String> {
@@ -2351,8 +2367,8 @@ async fn checkin_account_inner(app: &AppHandle, inner: &Arc<RuntimeInner>, accou
     {
         Ok(response) => response,
         Err(failure) => {
-            if let Some(status) = failure.account_status() {
-                mark_account_health(app, inner, account_id, status);
+            if let Some((status, tag)) = failure.account_health() {
+                mark_account_health(app, inner, account_id, status, tag);
             }
             return Err(failure.message);
         }
@@ -2390,8 +2406,8 @@ pub async fn codebuddy_checkin_status(
     {
         Ok(status) => Ok(status),
         Err(failure) => {
-            if let Some(status) = failure.account_status() {
-                mark_account_health(&app, &inner, &account_id, status);
+            if let Some((status, tag)) = failure.account_health() {
+                mark_account_health(&app, &inner, &account_id, status, tag);
             }
             Err(failure.message)
         }
@@ -2888,6 +2904,45 @@ mod tests {
         assert_eq!(manifest["accounts"][0]["planType"], "PRO");
         assert_eq!(manifest["accounts"][0]["remainingQuota"], 13);
         assert_eq!(manifest["apiKeys"][0]["key"], "sk-test");
+    }
+
+    #[test]
+    fn apply_account_health_sets_status_and_appends_tag_once() {
+        let mut account = Account::default();
+        account.status = "available".to_string();
+        account.tags = vec!["主力".to_string()];
+
+        assert!(apply_account_health(&mut account, "cooling", "账号被风控"));
+        assert_eq!(account.status, "cooling");
+        assert_eq!(account.failures, 1);
+        assert_eq!(account.tags, vec!["主力".to_string(), "账号被风控".to_string()]);
+
+        // 重复命中同一结论：状态与标签都不再变化，失败次数也不该继续累加。
+        assert!(!apply_account_health(&mut account, "cooling", "账号被风控"));
+        assert_eq!(account.failures, 1);
+        assert_eq!(account.tags.len(), 2);
+    }
+
+    #[test]
+    fn apply_account_health_keeps_user_tags_when_full() {
+        let mut account = Account::default();
+        account.status = "available".to_string();
+        account.tags = (0..MAX_ACCOUNT_TAGS).map(|index| format!("标签{index}")).collect();
+
+        assert!(apply_account_health(&mut account, "needs_auth", "Token 已失效"));
+        // 标签已满：只改健康状态，不挤掉用户已写的备注。
+        assert_eq!(account.status, "needs_auth");
+        assert_eq!(account.tags.len(), MAX_ACCOUNT_TAGS);
+        assert!(!account.tags.iter().any(|tag| tag == "Token 已失效"));
+    }
+
+    #[test]
+    fn auto_health_tags_fit_the_editor_limits() {
+        // 前端「编辑账号」限制：单条 12 字、最多 6 条，自动标签必须能通过同一校验。
+        for tag in ["账号被风控", "Token 已失效"] {
+            assert!(tag.chars().count() <= 12, "{tag} 超过 12 字");
+        }
+        assert!(MAX_ACCOUNT_TAGS <= 6);
     }
 }
 

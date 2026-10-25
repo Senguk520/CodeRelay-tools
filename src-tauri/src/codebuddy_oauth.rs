@@ -433,11 +433,12 @@ impl ApiFailure {
         }
     }
 
-    /// 需要落库的账号状态；`None` 表示与账号本身无关，不该动账号健康度。
-    pub fn account_status(&self) -> Option<&'static str> {
+    /// 账号级失败要落到账号池的结果：`(健康状态, 标签)`。
+    /// `None` 表示与账号本身无关（上游抖动、报文变化），不该动账号健康度。
+    pub fn account_health(&self) -> Option<(&'static str, &'static str)> {
         match self.kind {
-            ApiFailureKind::TokenInvalid => Some("needs_auth"),
-            ApiFailureKind::Forbidden => Some("restricted"),
+            ApiFailureKind::TokenInvalid => Some(("needs_auth", "Token 已失效")),
+            ApiFailureKind::Forbidden => Some(("cooling", "账号被风控")),
             _ => None,
         }
     }
@@ -733,14 +734,14 @@ mod tests {
         let failure = classify_http_failure(StatusCode::from_u16(401).unwrap(), "", "该账号暂无签到活动");
         assert_eq!(failure.kind, ApiFailureKind::TokenInvalid);
         assert!(failure.message.contains("Token 已失效"), "message = {}", failure.message);
-        assert_eq!(failure.account_status(), Some("needs_auth"));
+        assert_eq!(failure.account_health(), Some(("needs_auth", "Token 已失效")));
     }
 
     #[test]
-    fn empty_403_is_reported_as_forbidden_and_marks_restricted() {
+    fn empty_403_is_reported_as_forbidden_and_cools_account() {
         let failure = classify_http_failure(StatusCode::from_u16(403).unwrap(), "", "该账号暂无签到活动");
         assert_eq!(failure.kind, ApiFailureKind::Forbidden);
-        assert_eq!(failure.account_status(), Some("restricted"));
+        assert_eq!(failure.account_health(), Some(("cooling", "账号被风控")));
     }
 
     #[test]
@@ -748,14 +749,14 @@ mod tests {
         let failure = classify_http_failure(StatusCode::from_u16(404).unwrap(), "", "该账号暂无签到活动");
         assert_eq!(failure.kind, ApiFailureKind::NoActivity);
         assert!(failure.message.contains("该账号暂无签到活动"), "message = {}", failure.message);
-        assert_eq!(failure.account_status(), None);
+        assert_eq!(failure.account_health(), None);
     }
 
     #[test]
     fn server_error_is_upstream_failure_without_touching_account_status() {
         let failure = classify_http_failure(StatusCode::from_u16(503).unwrap(), "", "该账号暂无签到活动");
         assert_eq!(failure.kind, ApiFailureKind::Upstream);
-        assert_eq!(failure.account_status(), None);
+        assert_eq!(failure.account_health(), None);
     }
 
     #[test]
