@@ -313,12 +313,12 @@ func TestApplyCodexClientModelMetadataPreservesMultiAgentVersionWhenDisabled(t *
 	entry := map[string]any{"multi_agent_version": "v1"}
 	model := map[string]any{"id": "custom-model"}
 
-	applyCodexClientModelMetadata(entry, "custom-model", model, false)
+	applyCodexClientModelMetadata(entry, "custom-model", model, false, "")
 	if got := entry["multi_agent_version"]; got != "v1" {
 		t.Fatalf("disabled multi_agent_version = %#v, want preserved v1", got)
 	}
 
-	applyCodexClientModelMetadata(entry, "custom-model", model, true)
+	applyCodexClientModelMetadata(entry, "custom-model", model, true, "")
 	if got := entry["multi_agent_version"]; got != "v2" {
 		t.Fatalf("enabled multi_agent_version = %#v, want v2", got)
 	}
