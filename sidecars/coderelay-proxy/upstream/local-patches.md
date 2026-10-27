@@ -260,3 +260,20 @@ git -C H:\CodeRelay\Independent_new_program ls-files -z -- sidecars/coderelay-pr
 - 结论：删除集与红线集**不相交**，无受保护测试文件被误删。
 
 **一句话结论**：按 43 个受保护包目录的包粒度豁免口径重算，可安全删除 **400 个文件 / 4.889 MiB**（CLIProxyAPI 396、cursor proto 4），CLIProxyAPI 保留 1075、cursor-bridge 保留 268、sidecars 合计保留 1343，整体体积降 23.29%，且与首版相比少删 170 个文件、少删 2.171 MiB —— 少删的部分正是此前会误伤的受保护包内测试。
+
+## 9. 2026-10-27 防封功能新增本地文件
+
+以下文件不属于上游 v7.2.140 快照，**禁止随上游同步删除**：
+
+- `internal/auth/codebuddy/client_profile.go`（local_added）
+- `internal/auth/codebuddy/client_profile_test.go`（local_added）
+- `internal/runtime/executor/helps/codebuddy_fallback.go`（local_added，11128 单次兼容 body 中和）
+- `internal/runtime/executor/codebuddy_retry_test.go`（local_added，11128 兼容重试回归测试）
+- ~~`internal/runtime/executor/helps/codebuddy_sanitize.go`（已删除：基于错误诊断的静态提示词表）~~
+- ~~`internal/runtime/executor/helps/codebuddy_sanitize_test.go`（已删除）~~
+- `internal/runtime/executor/helps/codebuddy_traffic.go`（local_added，账号级限速）
+- `internal/runtime/executor/helps/codebuddy_traffic_test.go`（local_added）
+- `internal/runtime/executor/codebuddy_client_test.go`（local_added，uTLS 选择测试）
+- `upstream/codebuddy-client-profile.md`（协议基线与字段可信度表）
+
+这些改动同时修改了 `internal/auth/codebuddy/codebuddy.go`、`internal/runtime/executor/codebuddy_executor.go`、`internal/runtime/executor/helps/utls_client.go`。它们不改变 Codex/Claude 链路；账号 profile 写入 auth 文件，代理字段只预留、不写入 auth 文件。
