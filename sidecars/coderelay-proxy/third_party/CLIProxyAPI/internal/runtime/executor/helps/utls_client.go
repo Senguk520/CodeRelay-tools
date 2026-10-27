@@ -409,3 +409,25 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 func NewUtlsStreamingHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
 	return NewUtlsHTTPClient(ctx, cfg, auth, timeout)
 }
+
+// NewChromeUtlsHTTPClient forces the Chrome uTLS profile for every HTTPS host.
+// It is used only by the opt-in CodeBuddy TLS experiment so the shared
+// provider-host selection in NewUtlsHTTPClient cannot silently fall back to the
+// standard Go transport.
+var chromeUtlsClientCache sync.Map
+
+func NewChromeUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+	var proxyURL string
+	if auth != nil {
+		proxyURL = strings.TrimSpace(auth.ProxyURL)
+	}
+	if proxyURL == "" && cfg != nil {
+		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+	}
+	actual, _ := chromeUtlsClientCache.LoadOrStore(proxyURL, &http.Client{Transport: newUtlsRoundTripper(proxyURL)})
+	base := actual.(*http.Client)
+	if timeout > 0 {
+		return &http.Client{Transport: base.Transport, Timeout: timeout}
+	}
+	return base
+}

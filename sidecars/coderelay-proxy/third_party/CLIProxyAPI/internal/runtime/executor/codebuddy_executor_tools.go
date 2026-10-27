@@ -9,6 +9,22 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+// normalizeCodebuddyDeveloperRoles maps OpenAI's `developer` role to the
+// `system` role used by the official CodeBuddy client. The upstream channel
+// check treats `developer` as a non-official client fingerprint (11128).
+func normalizeCodebuddyDeveloperRoles(body []byte) []byte {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body
+	}
+	for index, message := range messages.Array() {
+		if strings.EqualFold(strings.TrimSpace(message.Get("role").String()), "developer") {
+			body, _ = sjson.SetBytes(body, fmt.Sprintf("messages.%d.role", index), "system")
+		}
+	}
+	return body
+}
+
 // normalizeCodebuddyToolMessages repairs tool-related message fields that the
 // strict Tencent CodeBuddy backend rejects with `400 invalid_parameter_value`
 // (param left empty). Cursor and other OpenAI-compatible clients send tool
@@ -29,6 +45,10 @@ func normalizeCodebuddyToolMessages(body []byte) ([]byte, error) {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return body, nil
 	}
+	// CodeBuddy's official client uses `system`, not OpenAI's newer
+	// `developer` role. The backend's channel check rejects the latter with
+	// 11128 even when the body contains no competitor prompt.
+	body = normalizeCodebuddyDeveloperRoles(body)
 	messages := gjson.GetBytes(body, "messages")
 	if !messages.Exists() || !messages.IsArray() {
 		return body, nil

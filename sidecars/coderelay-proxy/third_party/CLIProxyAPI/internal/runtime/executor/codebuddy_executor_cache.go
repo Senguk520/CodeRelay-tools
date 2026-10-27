@@ -3,8 +3,8 @@ package executor
 import (
 	"strings"
 
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -48,4 +48,26 @@ func applyCodebuddyPromptCache(body []byte, sessionID string) []byte {
 		return body
 	}
 	return out
+}
+
+// stripCodebuddyPromptCache removes cache-routing fields that third-party
+// clients (and CodeRelay's own session derivation) attach to the body. The
+// official CodeBuddy client does not send these; upstream channel validation
+// can treat the derived `prompt_cache_key` value as an unapproved client
+// fingerprint (11128). Caching is an optimization, not a protocol requirement,
+// so drop the fields instead of forwarding a client-derived identity.
+func stripCodebuddyPromptCache(body []byte) []byte {
+	for _, field := range []string{"prompt_cache_key", "prompt_cache_retention", "store"} {
+		body, _ = sjson.DeleteBytes(body, field)
+	}
+	// DSH/OpenAI clients use max_completion_tokens while the CodeBuddy client
+	// path (and the successful Cursor probe) use max_tokens. Normalize the alias
+	// so the upstream sees the same field shape as an approved client.
+	if value := gjson.GetBytes(body, "max_completion_tokens"); value.Exists() {
+		if !gjson.GetBytes(body, "max_tokens").Exists() {
+			body, _ = sjson.SetBytes(body, "max_tokens", value.Value())
+		}
+		body, _ = sjson.DeleteBytes(body, "max_completion_tokens")
+	}
+	return body
 }

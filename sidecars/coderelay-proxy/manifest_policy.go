@@ -314,6 +314,13 @@ type accountSpec struct {
 	ImageGenerationPolicy string            `json:"imageGenerationPolicy,omitempty"`
 	QuotaReserve          *quotaReserveSpec `json:"quotaReserve,omitempty"`
 	ModelContextWindows   map[string]int64  `json:"modelContextWindows,omitempty"`
+	// ClientProfile is the per-account CodeBuddy client identity produced by the
+	// host. It is persisted in auth files as well; this field keeps the manifest
+	// contract forward-compatible for diagnostics/future executors.
+	ClientProfile any `json:"clientProfile,omitempty"`
+	// ProxyURL is reserved for per-account egress and is not wired to the
+	// transport in this release. Empty means the existing shared transport.
+	ProxyURL string `json:"proxyUrl,omitempty"`
 }
 
 type quotaReserveSpec struct {

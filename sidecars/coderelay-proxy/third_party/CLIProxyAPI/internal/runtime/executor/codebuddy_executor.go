@@ -45,7 +45,7 @@ func (e *CodebuddyExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth
 		return nil
 	}
 	creds := codebuddy.CredsFromAuth(auth)
-	applyCodebuddyHeaders(req, creds)
+	applyCodebuddyHeaders(req, creds, codebuddy.NewRequestHeaders())
 	return nil
 }
 
@@ -99,6 +99,7 @@ func (e *CodebuddyExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	// Prompt cache: inject a stable session-bound key so repeated turns in the
 	// same conversation hit the backend prefix cache (lower credit).
 	body = applyCodebuddyPromptCache(body, codebuddyExecutionSessionID(req, opts))
+	body = stripCodebuddyPromptCache(body)
 
 	// The CodeBuddy backend only supports streaming.
 	body, err = sjson.SetBytes(body, "stream", true)
@@ -135,35 +136,61 @@ func (e *CodebuddyExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	body = clampCodebuddyMaxTokens(body, baseModel)
 
 	url := baseURL + codebuddy.ChatPath
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return resp, err
-	}
-	applyCodebuddyHeaders(httpReq, creds)
-	httpReq.Header.Set("Accept", "text/event-stream")
-	recordCodebuddyRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq, body)
+	requestHeaders := codebuddyRequestHeaders(req.Model, opts)
 
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := httpClient.Do(httpReq)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+	releaseTraffic, errTraffic := helps.AcquireCodebuddyTraffic(ctx, creds.AuthID, codebuddyTrafficProfileFor(creds.Profile))
+	if errTraffic != nil {
+		return resp, errTraffic
 	}
-	defer func() {
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("codebuddy executor: close response body error: %v", errClose)
+	defer releaseTraffic()
+	httpClient := codebuddyHTTPClient(ctx, e.cfg, auth, creds.Profile)
+
+	var httpResp *http.Response
+	for attempt := 0; ; attempt++ {
+		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if errReq != nil {
+			return resp, errReq
 		}
-	}()
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		applyCodebuddyHeaders(httpReq, creds, requestHeaders)
+		httpReq.Header.Set("Accept", "text/event-stream")
+		recordCodebuddyRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq, body)
+
+		httpResp, err = httpClient.Do(httpReq)
+		if err != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
+			return resp, err
+		}
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+			break
+		}
+
 		b, _ := io.ReadAll(httpResp.Body)
+		_ = httpResp.Body.Close()
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		// Diagnostic: dump the upstream error body (redacted) so the invalid
 		// field / param reported by the backend can be inspected.
 		helps.DumpCodebuddyDebugBody("error-response", b)
+		if attempt == 0 && isCodebuddyChannelBlockedResponse(b) {
+			body = helps.SanitizeCodebuddyFallbackPayload(body)
+			// Use a fresh request identity on the compatibility retry; the
+			// upstream echoes this ID in its 11128 response.
+			requestHeaders.RequestID = ""
+			requestHeaders.TraceID = ""
+			requestHeaders = requestHeaders.EnsureIDs()
+			log.Warnf("codebuddy executor: upstream returned 11128, retrying once with a fresh request identity")
+			continue
+		}
 		err = normalizeCodebuddyStatusErr(httpResp.StatusCode, b)
 		return resp, err
 	}
+	defer func() {
+		if httpResp != nil {
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("codebuddy executor: close response body error: %v", errClose)
+			}
+		}
+	}()
 
 	// Consume the forced upstream stream and aggregate into a non-stream response.
 	dataLines := make([][]byte, 0, 64)
@@ -231,6 +258,7 @@ func (e *CodebuddyExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	// Prompt cache: inject a stable session-bound key so repeated turns in the
 	// same conversation hit the backend prefix cache (lower credit).
 	body = applyCodebuddyPromptCache(body, codebuddyExecutionSessionID(req, opts))
+	body = stripCodebuddyPromptCache(body)
 
 	body, err = sjson.SetBytes(body, "stream", true)
 	if err != nil {
@@ -257,11 +285,21 @@ func (e *CodebuddyExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	body = clampCodebuddyMaxTokens(body, baseModel)
 
 	url := baseURL + codebuddy.ChatPath
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := codebuddyHTTPClient(ctx, e.cfg, auth, creds.Profile)
+	requestHeaders := codebuddyRequestHeaders(req.Model, opts)
 
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
+		releaseTraffic, errTraffic := helps.AcquireCodebuddyTraffic(ctx, creds.AuthID, codebuddyTrafficProfileFor(creds.Profile))
+		if errTraffic != nil {
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: errTraffic}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		defer releaseTraffic()
 		var param any
 		emit := func(line []byte) bool {
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, bytes.Clone(line), &param)
@@ -297,43 +335,53 @@ func (e *CodebuddyExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 		// upstream only adopts images carried by the LAST user message.
 		body = codebuddyBackfillReadToolImages(body)
 
-		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-		if errReq != nil {
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errReq}:
-			case <-ctx.Done():
+		var httpResp *http.Response
+		var errDo error
+		for attempt := 0; ; attempt++ {
+			httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+			if errReq != nil {
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: errReq}:
+				case <-ctx.Done():
+				}
+				return
 			}
-			return
-		}
-		applyCodebuddyHeaders(httpReq, creds)
-		httpReq.Header.Set("Accept", "text/event-stream")
-		httpReq.Header.Set("Cache-Control", "no-cache")
-		recordCodebuddyRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq, body)
-		// Diagnostic: dump the upstream request body (redacted) so the exact tools
-		// definition Cursor sent can be inspected.
-		helps.DumpCodebuddyDebugBody("upstream-request", body)
+			applyCodebuddyHeaders(httpReq, creds, requestHeaders)
+			httpReq.Header.Set("Accept", "text/event-stream")
+			httpReq.Header.Set("Cache-Control", "no-cache")
+			recordCodebuddyRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq, body)
+			// Diagnostic: dump the upstream request body (redacted) so the exact tools
+			// definition Cursor sent can be inspected.
+			helps.DumpCodebuddyDebugBody("upstream-request", body)
 
-		httpResp, errDo := httpClient.Do(httpReq)
-		if errDo != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errDo}:
-			case <-ctx.Done():
+			httpResp, errDo = httpClient.Do(httpReq)
+			if errDo != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: errDo}:
+				case <-ctx.Done():
+				}
+				return
 			}
-			return
-		}
-		defer func() {
-			if errClose := httpResp.Body.Close(); errClose != nil {
-				log.Errorf("codebuddy executor: close response body error: %v", errClose)
+			helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+			if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+				break
 			}
-		}()
-		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+
 			b, _ := io.ReadAll(httpResp.Body)
+			_ = httpResp.Body.Close()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 			// Diagnostic: dump the upstream error body (redacted) so the invalid
 			// field / param reported by the backend can be inspected.
 			helps.DumpCodebuddyDebugBody("error-response", b)
+			if attempt == 0 && isCodebuddyChannelBlockedResponse(b) {
+				body = helps.SanitizeCodebuddyFallbackPayload(body)
+				requestHeaders.RequestID = ""
+				requestHeaders.TraceID = ""
+				requestHeaders = requestHeaders.EnsureIDs()
+				log.Warnf("codebuddy executor: upstream returned 11128, retrying stream once with a fresh request identity")
+				continue
+			}
 			errNorm := normalizeCodebuddyStatusErr(httpResp.StatusCode, b)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errNorm}:
@@ -341,6 +389,13 @@ func (e *CodebuddyExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 			}
 			return
 		}
+		defer func() {
+			if httpResp != nil {
+				if errClose := httpResp.Body.Close(); errClose != nil {
+					log.Errorf("codebuddy executor: close response body error: %v", errClose)
+				}
+			}
+		}()
 
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
@@ -431,8 +486,9 @@ func (e *CodebuddyExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth
 	if creds.Domain != "" {
 		req.Header.Set("X-Domain", creds.Domain)
 	}
+	applyCodebuddyHeaders(req, creds, codebuddy.NewRequestHeaders())
 
-	client := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	client := codebuddyHTTPClient(ctx, e.cfg, auth, creds.Profile)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -515,11 +571,16 @@ func (e *CodebuddyExecutor) executeOpenAIImage(ctx context.Context, auth *clipro
 	if err != nil {
 		return resp, err
 	}
-	applyCodebuddyHeaders(httpReq, creds)
+	applyCodebuddyHeaders(httpReq, creds, codebuddyRequestHeaders(req.Model, opts))
 	httpReq.Header.Set("Accept", "application/json")
 	recordCodebuddyRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq, body)
 
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	releaseTraffic, errTraffic := helps.AcquireCodebuddyTraffic(ctx, creds.AuthID, codebuddyTrafficProfileFor(creds.Profile))
+	if errTraffic != nil {
+		return resp, errTraffic
+	}
+	defer releaseTraffic()
+	httpClient := codebuddyHTTPClient(ctx, e.cfg, auth, creds.Profile)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -673,6 +734,12 @@ func extractCodebuddyImageURL(img gjson.Result) string {
 // either a top-level `code` or a nested `error.data.code`.
 const codebuddyQuotaExhaustedCode = 14018
 
+// codebuddyChannelBlockedCode is the backend business error code for a request
+// body the upstream does not recognize as an approved client channel. It is
+// handled by one compatibility retry with a neutralized body, not by switching
+// accounts or rewriting prompts before the first attempt.
+const codebuddyChannelBlockedCode = "11128"
+
 // clampCodebuddyMaxTokens clamps the request's `max_tokens` (and its
 // `max_completion_tokens` alias) to the model's declared MaxCompletionTokens
 // ceiling. Third-party clients (Cursor, etc.) send oversized values such as
@@ -702,12 +769,26 @@ func clampCodebuddyMaxTokens(body []byte, model string) []byte {
 // cooldown rather than treating it as a generic 400 validation failure.
 func codebuddyEffectiveStatus(httpStatus int, body []byte) int {
 	if httpStatus < 200 || httpStatus >= 300 {
+		bizCode := gjson.GetBytes(body, "code").String()
+		if bizCode == "" {
+			bizCode = gjson.GetBytes(body, "error.data.code").String()
+		}
+		switch bizCode {
+		case "11128":
+			// 11128 is a request-body/channel mismatch. It must not cool the
+			// account, otherwise one bad client shape takes the whole pool down.
+			return http.StatusBadRequest
+		}
 		if gjson.GetBytes(body, "code").Int() == codebuddyQuotaExhaustedCode ||
 			gjson.GetBytes(body, "error.data.code").Int() == codebuddyQuotaExhaustedCode {
 			return http.StatusTooManyRequests
 		}
 	}
 	return httpStatus
+}
+
+func isCodebuddyChannelBlockedResponse(body []byte) bool {
+	return strings.TrimSpace(gjson.GetBytes(body, "code").String()) == codebuddyChannelBlockedCode
 }
 
 // normalizeCodebuddyStatusErr rewrites a CodeBuddy upstream business error into
@@ -760,27 +841,61 @@ func normalizeCodebuddyStatusErr(httpStatus int, body []byte) statusErr {
 	return statusErr{code: effective, msg: string(normalized)}
 }
 
-// applyCodebuddyHeaders sets the headers required by the CodeBuddy backend.
-func applyCodebuddyHeaders(r *http.Request, creds codebuddy.Creds) {
-	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Accept", "application/json")
-	if creds.AccessToken != "" {
-		r.Header.Set("Authorization", "Bearer "+creds.AccessToken)
+// applyCodebuddyHeaders delegates to the shared account-profile header builder
+// so chat, model-list, image and refresh requests keep one identity.
+func applyCodebuddyHeaders(r *http.Request, creds codebuddy.Creds, request codebuddy.RequestHeaders) {
+	codebuddy.ApplyHeadersForRequest(r, creds, request)
+}
+
+// codebuddyRequestHeaders derives per-request IDs from trusted request context.
+// Session/conversation values are copied only when the caller supplied them.
+func codebuddyRequestHeaders(model string, opts cliproxyexecutor.Options) codebuddy.RequestHeaders {
+	headers := codebuddy.NewRequestHeaders()
+	headers.ModelID = strings.TrimSpace(model)
+	if opts.Headers != nil {
+		headers.SessionID = firstNonEmptyHeader(opts.Headers, "X-Session-ID", "X-Session-Id", "Session_id")
+		headers.ConversationID = firstNonEmptyHeader(opts.Headers, "X-Conversation-ID", "X-Conversation-Id")
 	}
-	if creds.UID != "" {
-		r.Header.Set("X-User-Id", creds.UID)
+	if headers.SessionID == "" && opts.Metadata != nil {
+		for _, key := range []string{
+			cliproxyexecutor.ExecutionSessionMetadataKey,
+			cliproxyexecutor.DerivedSessionIDMetadataKey,
+			"session_id",
+		} {
+			if value, ok := opts.Metadata[key].(string); ok && strings.TrimSpace(value) != "" {
+				headers.SessionID = strings.TrimSpace(value)
+				break
+			}
+		}
 	}
-	if creds.EnterpriseID != "" {
-		r.Header.Set("X-Enterprise-Id", creds.EnterpriseID)
-		r.Header.Set("X-Tenant-Id", creds.EnterpriseID)
+	return headers.EnsureIDs()
+}
+
+func codebuddyTrafficProfileFor(profile codebuddy.ClientProfile) helps.CodebuddyTrafficProfile {
+	return helps.CodebuddyTrafficProfile{
+		RequestsPerMinute: profile.RequestsPerMin,
+		MaxConcurrent:     profile.MaxConcurrent,
+		MinIntervalMS:     profile.MinIntervalMS,
+		JitterPercent:     profile.JitterPercent,
 	}
-	if creds.Domain != "" {
-		r.Header.Set("X-Domain", creds.Domain)
+}
+
+func firstNonEmptyHeader(headers http.Header, names ...string) string {
+	for _, name := range names {
+		if value := strings.TrimSpace(headers.Get(name)); value != "" {
+			return value
+		}
 	}
-	r.Header.Set("X-Product", "SaaS")
-	r.Header.Set("X-IDE-Name", "CodeBuddyIDE")
-	r.Header.Set("X-Requested-With", "XMLHttpRequest")
-	r.Header.Set("User-Agent", "CodeBuddyIDE")
+	return ""
+}
+
+// codebuddyHTTPClient selects the default proxy-aware transport or the opt-in
+// uTLS experiment. The latter is off unless the account profile opts in.
+func codebuddyHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, profile codebuddy.ClientProfile) *http.Client {
+	if strings.EqualFold(strings.TrimSpace(profile.TLSMode), "experiment") {
+		return helps.NewChromeUtlsHTTPClient(ctx, cfg, auth, 0)
+	}
+	return helps.NewProxyAwareHTTPClient(ctx, cfg, auth, 0)
 }
 
 func recordCodebuddyRequest(ctx context.Context, cfg *config.Config, provider string, auth *cliproxyauth.Auth, url string, httpReq *http.Request, body []byte) {
@@ -795,9 +910,20 @@ func recordCodebuddyRequest(ctx context.Context, cfg *config.Config, provider st
 	}
 	// Diagnostic: correlate each upstream request with the auth account and wall-clock
 	// timestamp so 200-vs-400 pairs can be attributed to account switching vs upstream flakiness.
+	headerFields := []string{
+		"User-Agent", "X-Product", "X-IDE-Name", "X-IDE-Type", "X-IDE-Version",
+		"X-Product-Version", "X-Request-ID", "X-Trace-ID", "X-Session-ID",
+		"X-Conversation-ID", "X-Agent-Type", "X-Data-Tag",
+	}
+	headerSummary := make([]string, 0, len(headerFields))
+	for _, name := range headerFields {
+		if value := strings.TrimSpace(httpReq.Header.Get(name)); value != "" {
+			headerSummary = append(headerSummary, name+"="+value)
+		}
+	}
 	helps.DumpCodebuddyDebugBody("request-meta",
-		[]byte(fmt.Sprintf("url=%s authID=%s authLabel=%s authType=%s at=%s",
-			url, authID, authLabel, authType, time.Now().Format("15:04:05.000"))))
+		[]byte(fmt.Sprintf("url=%s authID=%s authLabel=%s authType=%s at=%s headers=%s",
+			url, authID, authLabel, authType, time.Now().Format("15:04:05.000"), strings.Join(headerSummary, "&"))))
 	helps.RecordAPIRequest(ctx, cfg, helps.UpstreamRequestLog{
 		URL:       url,
 		Method:    http.MethodPost,

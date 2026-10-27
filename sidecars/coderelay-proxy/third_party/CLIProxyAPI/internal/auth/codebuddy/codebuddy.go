@@ -1,7 +1,6 @@
 package codebuddy
 
 import (
-	"net/http"
 	"strings"
 
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -13,10 +12,10 @@ import (
 // routes inference to copilot.tencent.com while its OAuth endpoint stays on
 // www.codebuddy.cn; the international site uses www.codebuddy.ai for both.
 const (
-	IntlBaseURL    = "https://www.codebuddy.ai"
-	CNBaseURL      = "https://copilot.tencent.com"
-	ChatPath       = "/v2/chat/completions"
-	ModelsPath     = "/v2/enterprises/personal/models"
+	IntlBaseURL = "https://www.codebuddy.ai"
+	CNBaseURL   = "https://copilot.tencent.com"
+	ChatPath    = "/v2/chat/completions"
+	ModelsPath  = "/v2/enterprises/personal/models"
 	// Image endpoints are OpenAI Images API compatible (verified 2026-08-19:
 	// POST /v2/images/generations with model/prompt/n/size returns the standard
 	// "Image model [...] route config not found" error when the account lacks an
@@ -42,6 +41,8 @@ type Creds struct {
 	Domain       string
 	BaseURL      string
 	Region       string
+	AuthID       string
+	Profile      ClientProfile
 }
 
 // CredsFromAuth extracts CodeBuddy credentials from an auth record's metadata.
@@ -52,6 +53,7 @@ func CredsFromAuth(a *cliproxyauth.Auth) Creds {
 	if a == nil {
 		return c
 	}
+	c.AuthID = a.ID
 	if a.Metadata != nil {
 		c.AccessToken = metaString(a.Metadata, "access_token")
 		c.RefreshToken = metaString(a.Metadata, "refresh_token")
@@ -70,6 +72,7 @@ func CredsFromAuth(a *cliproxyauth.Auth) Creds {
 			c.BaseURL = strings.TrimSpace(a.Attributes["base_url"])
 		}
 	}
+	c.Profile = ProfileFromMetadata(a.ID, a.Metadata)
 	return c
 }
 
@@ -96,31 +99,6 @@ func (c Creds) ResolveRefreshURL() string {
 // when the base URL is unset.
 func (c Creds) ResolveModelsURL() string {
 	return c.ResolveBaseURL() + ModelsPath
-}
-
-// ApplyHeaders sets the headers required by the CodeBuddy backend on r.
-// It mirrors the header set used by the inference executor so the model-list
-// endpoint is authenticated identically to chat completions.
-func ApplyHeaders(r *http.Request, c Creds) {
-	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Accept", "application/json")
-	if c.AccessToken != "" {
-		r.Header.Set("Authorization", "Bearer "+c.AccessToken)
-	}
-	if c.UID != "" {
-		r.Header.Set("X-User-Id", c.UID)
-	}
-	if c.EnterpriseID != "" {
-		r.Header.Set("X-Enterprise-Id", c.EnterpriseID)
-		r.Header.Set("X-Tenant-Id", c.EnterpriseID)
-	}
-	if c.Domain != "" {
-		r.Header.Set("X-Domain", c.Domain)
-	}
-	r.Header.Set("X-Product", "SaaS")
-	r.Header.Set("X-IDE-Name", "CodeBuddyIDE")
-	r.Header.Set("X-Requested-With", "XMLHttpRequest")
-	r.Header.Set("User-Agent", "CodeBuddyIDE")
 }
 
 func metaString(meta map[string]any, key string) string {

@@ -64,6 +64,13 @@ func TestNormalizeCodebuddyStatusErrQuotaExhausted(t *testing.T) {
 	}
 }
 
+func TestCodebuddyEffectiveStatusChannelBlockedIsNotAccountFailure(t *testing.T) {
+	body := []byte(`{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`)
+	if got := codebuddyEffectiveStatus(http.StatusForbidden, body); got != http.StatusBadRequest {
+		t.Fatalf("11128 effective status = %d, want 400 so the account is not cooled", got)
+	}
+}
+
 func TestNormalizeCodebuddyStatusErrPassthroughNonJSON(t *testing.T) {
 	body := []byte("plain upstream error")
 	sErr := normalizeCodebuddyStatusErr(http.StatusBadGateway, body)
