@@ -2423,12 +2423,17 @@ function AccountEditModal({ account, siblings, onClose, onSave }: { account: Acc
       <Field label="备注" hint="用逗号分隔，最多 6 条、每条 12 个字符以内，显示在列表的「标签」列；重复项会自动合并。">
         <input value={note} onChange={(e) => { setNote(e.target.value); setError(null); }} placeholder="例如：主号，已充值" />
       </Field>
+      <Field label="账号代理（预留）" hint="字段已为后续按账号出口隔离预留；当前版本不生效，也不会写入 auth 文件。">
+        <input value={account.proxyUrl ?? ''} disabled placeholder="未配置（当前版本不生效）" />
+      </Field>
       {error && <div className="inline-error account-edit-alert"><AlertTriangle size={15} /><span>{error}</span></div>}
       <div className="account-edit-meta">
         <div><span>套餐</span><strong>{account.plan || '未知'}</strong></div>
         <div><span>健康状态</span><strong>{statusLabels[account.status]}</strong></div>
         <div><span>额度</span><strong>{formatNumber(account.quota)} / {formatNumber(account.quotaTotal)}</strong></div>
         <div><span>最近使用</span><strong>{formatDate(account.lastUsed)}</strong></div>
+        <div><span>客户端指纹</span><strong>{account.clientProfile ? `${account.clientProfile.productName} ${account.clientProfile.productVersion} · ${account.clientProfile.headerMode}${account.clientProfile.tlsMode === 'experiment' ? ' · uTLS 实验' : ''}` : '未生成'}</strong></div>
+        <div><span>代理</span><strong>{account.proxyUrl ? '已预留（当前版本不生效）' : '未启用（预留）'}</strong></div>
       </div>
     </div>
     <div className="modal-footer">

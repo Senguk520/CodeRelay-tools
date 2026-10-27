@@ -275,6 +275,13 @@ fn load_credentials(app: &AppHandle) -> Result<HashMap<String, AccountCredential
         .collect())
 }
 
+fn ensure_client_profile(account: &mut Account) {
+    match account.client_profile.as_mut() {
+        Some(profile) => profile.normalize(),
+        None => account.client_profile = Some(crate::models::ClientProfile::create(&account.id)),
+    }
+}
+
 pub fn initialize(app: &AppHandle, runtime: &RuntimeState) -> Result<(), String> {
     let mut state: AppState = load_json(&state_path(app)?);
     // 请求日志只保留当天（本地时区），跨天自动清零；统计与日志解耦，按天聚合持久化。
@@ -285,6 +292,7 @@ pub fn initialize(app: &AppHandle, runtime: &RuntimeState) -> Result<(), String>
     let mut migrated = false;
 
     for account in &mut state.accounts {
+        ensure_client_profile(account);
         let access_token = account
             .access_token
             .take()
@@ -872,6 +880,14 @@ fn auth_json(account: &Account, credential: &AccountCredential) -> Value {
         "plan_rank": plan_rank(&account.plan),
         "payment_type": account.plan,
         "quota_remain": account.quota,
+        // The sidecar reads this flag when it builds its auth pool. Cooling /
+        // needs_auth / restricted accounts must not stay selectable just because
+        // their token file is still present. Without this, the relay keeps
+        // choosing a rejected account after the UI has already cooled it.
+        "disabled": account.status != "available",
+        "client_profile": account.client_profile,
+        // proxy_url is intentionally not written to the auth file yet: the SDK
+        // would apply it immediately, while this release only reserves the field.
     });
     value
 }
@@ -932,6 +948,8 @@ fn build_runtime_payloads(
                 "authKind": "oauth",
                 "planType": account.plan,
                 "remainingQuota": account.quota.round() as i64,
+                "clientProfile": account.client_profile,
+                "proxyUrl": account.proxy_url,
             })
         })
         .collect();
@@ -2027,6 +2045,7 @@ pub fn save_accounts(
         if !ids.insert(account.id.clone()) {
             return Err(format!("账号 ID 重复：{}", account.id));
         }
+        ensure_client_profile(account);
     }
     let mut credentials = locked(&runtime.inner.credentials, "凭据")?;
     let mut next = HashMap::new();
@@ -2556,6 +2575,60 @@ mod tests {
         assert_eq!(value["access_token"], "access-secret");
         assert_eq!(value["base_url"], "https://copilot.tencent.com");
         assert_eq!(value["region"], "cn");
+    }
+
+    #[test]
+    fn auth_json_carries_client_profile_and_reserved_proxy() {
+        let mut account = Account {
+            id: "acc-profile".into(),
+            email: "profile@example.cn".into(),
+            status: "available".into(),
+            ..Account::default()
+        };
+        account.client_profile = Some(crate::models::ClientProfile::create(&account.id));
+        account.proxy_url = Some("socks5://127.0.0.1:1080".into());
+        let value = auth_json(
+            &account,
+            &AccountCredential {
+                account_id: "acc-profile".into(),
+                access_token: "access-secret".into(),
+                refresh_token: None,
+            },
+        );
+        assert_eq!(value["client_profile"]["productVersion"], "1.106.1");
+        assert_eq!(value["client_profile"]["headerMode"], "enforce");
+        assert_eq!(value["disabled"], false);
+        assert!(value.get("proxy_url").is_none(), "reserved proxy must not activate yet");
+        assert!(!value["client_profile"]["profileId"].as_str().unwrap_or("").is_empty());
+
+        account.status = "cooling".to_string();
+        let cooled = auth_json(
+            &account,
+            &AccountCredential {
+                account_id: "acc-profile".into(),
+                access_token: "access-secret".into(),
+                refresh_token: None,
+            },
+        );
+        assert_eq!(cooled["disabled"], true);
+    }
+
+    #[test]
+    fn legacy_account_profile_normalizes_idempotently() {
+        let first = crate::models::ClientProfile::create("acc-profile");
+        let second = crate::models::ClientProfile::create("acc-profile");
+        assert_eq!(first.profile_id, second.profile_id);
+        assert!(!first.profile_id.is_empty());
+
+        let mut profile = crate::models::ClientProfile::default();
+        assert!(profile.profile_id.is_empty());
+        profile.normalize();
+        let normalized = profile.profile_id.clone();
+        assert!(!normalized.is_empty());
+        profile.normalize();
+        assert_eq!(profile.profile_id, normalized);
+        assert_eq!(profile.product_version, "1.106.1");
+        assert_eq!(profile.header_mode, "enforce");
     }
 
     #[test]

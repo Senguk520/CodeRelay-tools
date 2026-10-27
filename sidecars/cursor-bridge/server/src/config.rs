@@ -105,17 +105,18 @@ pub fn managed_ca_dir() -> Result<PathBuf> {
             home_dir.join(CA_DIR_NAME)
         }
     };
-    let created = !ca_dir.is_dir();
     fs::create_dir_all(&ca_dir)?;
     #[cfg(unix)]
     fs::set_permissions(&ca_dir, fs::Permissions::from_mode(0o700))?;
     // On Windows the mode bits above are inert, so the directory would otherwise
-    // keep whatever the profile inherited. Only done at creation: re-running it
-    // on every access would spawn a process per call for no gain.
+    // keep whatever the profile inherited. Run this on every access, not only on
+    // creation: an older build wrote an ACL with the bare `USERNAME`, which
+    // `icacls` can resolve as `DOMAIN\` with an empty account name. That leaves
+    // the directory present but inaccessible to its own owner, and a subsequent
+    // CA generation fails with `os error 5`. Re-applying the grant repairs that
+    // state without deleting the existing CA.
     #[cfg(windows)]
-    if created {
-        restrict_directory_to_current_user(&ca_dir);
-    }
+    restrict_directory_to_current_user(&ca_dir);
     Ok(ca_dir)
 }
 
@@ -149,13 +150,24 @@ fn restrict_directory_to_current_user(dir: &std::path::Path) {
     if user.trim().is_empty() {
         return;
     }
+    // Passing a bare local account name to `icacls` is ambiguous: on this
+    // machine `Senguk` was parsed as domain `SENGUK` with an empty account,
+    // producing `SENGUK\` and denying the owner access. Always qualify the
+    // account with USERDOMAIN; fall back to the local-machine form if the
+    // environment does not expose a domain.
+    let domain = std::env::var("USERDOMAIN").unwrap_or_default();
+    let principal = if domain.trim().is_empty() {
+        format!(".\\{user}")
+    } else {
+        format!("{}\\{user}", domain.trim())
+    };
     // `*S-1-5-18` is SYSTEM by well-known SID: naming it as a literal would break
     // on a non-English Windows, where the account is not called "SYSTEM".
     let outcome = Command::new("icacls")
         .arg(dir)
         .arg("/inheritance:r")
         .arg("/grant:r")
-        .arg(format!("{user}:(OI)(CI)F"))
+        .arg(format!("{principal}:(OI)(CI)F"))
         .arg("*S-1-5-18:(OI)(CI)F")
         .stdin(Stdio::null())
         .stdout(Stdio::null())

@@ -22,6 +22,29 @@ export interface Account {
   domain?: string;
   lastCheckin?: number | null;
   checkinStreak?: number;
+  clientProfile?: ClientProfile | null;
+  proxyUrl?: string | null;
+}
+
+export interface ClientProfile {
+  profileId: string;
+  profileVersion: number;
+  platform: string;
+  platformVersion: string;
+  productName: string;
+  productVersion: string;
+  ideType: string;
+  ideName: string;
+  pluginName: string;
+  pluginVersion: string;
+  baseUserAgent: string;
+  headerMode: 'off' | 'shadow' | 'enforce';
+  tlsMode: 'off' | 'experiment';
+  headerPolicyVersion: number;
+  requestsPerMinute: number;
+  maxConcurrent: number;
+  minIntervalMs: number;
+  jitterPercent: number;
 }
 
 export interface ApiKey {

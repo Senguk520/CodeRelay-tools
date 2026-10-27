@@ -1,5 +1,6 @@
 use chrono::{Local, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// 小时桶数量：8 个桶，每桶覆盖 3 小时（00/03/.../21），合计 24 小时。
@@ -35,6 +36,139 @@ pub struct Account {
     pub access_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
+    /// Per-account CodeBuddy client identity. Generated once and persisted so a
+    /// token refresh never changes the upstream-visible profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_profile: Option<ClientProfile>,
+    /// Reserved for future per-account egress. Empty/none keeps the current
+    /// shared transport; no UI writes this field in the current release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ClientProfile {
+    pub profile_id: String,
+    pub profile_version: u32,
+    pub platform: String,
+    pub platform_version: String,
+    pub product_name: String,
+    pub product_version: String,
+    pub ide_type: String,
+    pub ide_name: String,
+    pub plugin_name: String,
+    pub plugin_version: String,
+    pub base_user_agent: String,
+    pub header_mode: String,
+    pub tls_mode: String,
+    pub header_policy_version: u32,
+    pub requests_per_minute: u32,
+    pub max_concurrent: u32,
+    pub min_interval_ms: u32,
+    pub jitter_percent: u32,
+}
+
+impl Default for ClientProfile {
+    fn default() -> Self {
+        Self {
+            profile_id: String::new(),
+            profile_version: 1,
+            platform: "CodeBuddyIDE".to_string(),
+            platform_version: String::new(),
+            product_name: "CodeBuddy".to_string(),
+            product_version: "1.106.1".to_string(),
+            ide_type: "CodeBuddyIDE".to_string(),
+            ide_name: "CodeBuddyIDE".to_string(),
+            plugin_name: "coding-copilot".to_string(),
+            plugin_version: "4.12.2".to_string(),
+            base_user_agent: "CodeBuddyIDE/1.106.1".to_string(),
+            header_mode: "enforce".to_string(),
+            tls_mode: "off".to_string(),
+            header_policy_version: 2,
+            requests_per_minute: 240,
+            max_concurrent: 4,
+            min_interval_ms: 250,
+            jitter_percent: 10,
+        }
+    }
+}
+
+impl ClientProfile {
+    /// Creates a profile with a stable ID derived from the account ID. This
+    /// matches the Go-side fallback so the same account never changes identity
+    /// when the sidecar loads an auth file before the host has migrated state.
+    pub fn create(account_id: &str) -> Self {
+        let mut profile = Self::default();
+        let digest = Sha256::digest(format!("codebuddy-client-profile:{account_id}"));
+        let encoded = format!("{digest:x}");
+        profile.profile_id = encoded[..32].to_string();
+        profile
+    }
+
+    /// Fills fields added after the profile was first persisted. Idempotent.
+    pub fn normalize(&mut self) {
+        if self.profile_id.trim().is_empty() {
+            self.profile_id = uuid::Uuid::new_v4().simple().to_string();
+        }
+        let defaults = Self::default();
+        if self.profile_version == 0 {
+            self.profile_version = defaults.profile_version;
+        }
+        if self.platform.trim().is_empty() {
+            self.platform = defaults.platform;
+        }
+        if self.product_name.trim().is_empty() {
+            self.product_name = defaults.product_name;
+        }
+        if self.product_version.trim().is_empty() {
+            self.product_version = defaults.product_version;
+        }
+        if self.ide_type.trim().is_empty() {
+            self.ide_type = defaults.ide_type;
+        }
+        if self.ide_name.trim().is_empty() {
+            self.ide_name = defaults.ide_name;
+        }
+        if self.plugin_name.trim().is_empty() {
+            self.plugin_name = defaults.plugin_name;
+        }
+        if self.plugin_version.trim().is_empty() {
+            self.plugin_version = defaults.plugin_version;
+        }
+        if self.base_user_agent.trim().is_empty() {
+            self.base_user_agent = format!("CodeBuddyIDE/{}", self.product_version);
+        }
+        match self.header_mode.trim() {
+            "off" => self.header_mode = "off".to_string(),
+            "shadow" => self.header_mode = "shadow".to_string(),
+            _ => self.header_mode = "enforce".to_string(),
+        }
+        if !self.tls_mode.eq_ignore_ascii_case("experiment") {
+            self.tls_mode = "off".to_string();
+        }
+        if self.header_policy_version == 0 {
+            self.header_policy_version = defaults.header_policy_version;
+        }
+        if self.requests_per_minute == 0 {
+            self.requests_per_minute = defaults.requests_per_minute;
+        }
+        if self.requests_per_minute > 6000 {
+            self.requests_per_minute = 6000;
+        }
+        if self.max_concurrent == 0 {
+            self.max_concurrent = defaults.max_concurrent;
+        }
+        if self.max_concurrent > 64 {
+            self.max_concurrent = 64;
+        }
+        if self.min_interval_ms > 60_000 {
+            self.min_interval_ms = 60_000;
+        }
+        if self.jitter_percent > 50 {
+            self.jitter_percent = 50;
+        }
+    }
 }
 
 impl Default for Account {
@@ -57,6 +191,8 @@ impl Default for Account {
             checkin_streak: 0,
             access_token: None,
             refresh_token: None,
+            client_profile: None,
+            proxy_url: None,
         }
     }
 }
