@@ -216,6 +216,5 @@ CodeRelay 是独立的第三方工具，与腾讯、CodeBuddy 官方无关。请
 
 ---
 
-## 交流群
-<img width="563" height="703" alt="image" src="https://github.com/user-attachments/assets/e7576847-2f6c-4dd0-a60b-68d2b4f9f3a6" />
+
 
