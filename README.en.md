@@ -1,3 +1,14 @@
+> [!IMPORTANT]
+> **A Note on the Future of This Project**
+>
+> After careful consideration, we have decided to pause all updates and maintenance for CodeRelay. No further releases will be published, and we will no longer be handling feature requests or issue reports.
+>
+> This decision was made primarily out of respect for the wishes of the official WorkBuddy team. CodeRelay has benefited from the WorkBuddy / CodeBuddy ecosystem since day one, and we have always hoped to contribute in a modest, restrained way without overstepping or causing trouble for the official team. Now that their position is clear, we believe the right thing to do is to step back and return the stage to them.
+>
+> Thank you to everyone who has used, reported on, or offered suggestions for this project — your support is what carried it this far. The existing code and documentation will remain here for learning and reference, but please do not rely on them in production, and please do not expect further fixes or updates.
+>
+> Finally, we sincerely encourage everyone to return to the products and channels officially provided by WorkBuddy, and to use them normally and with peace of mind — that is the sustainable choice in the long run. We wish WorkBuddy all the best, and all the best to you as well.
+
 # CodeRelay
 
 A **Windows desktop management tool** for power users: centrally manage CodeBuddy China account pools and run a local **OpenAI-compatible reverse proxy service**, letting clients such as Cursor and CodeBuddy IDE connect to multiple accounts through a single local address with policy-based load balancing, cooldown, and quota scheduling.
